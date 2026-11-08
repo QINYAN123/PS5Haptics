@@ -11,12 +11,12 @@ import pyaudiowpatch as pa
 RATE = 48000
 
 # PortAudio's global init / terminate (and opening streams around them) is not thread-safe: the
-# haptics engine and the audio mirror run in different threads of one process -> one lock for all.
+# haptics engine and helper threads (default-device watcher, pad-speaker tap) share one process -> one lock for all.
 PA_LOCK = threading.RLock()
 
 
 # PortAudio scans the audio devices only when the FIRST instance initialises. While any instance is
-# alive (e.g. the audio mirror, open all the time) new ones reuse that old list - a pad plugged in
+# alive (any long-lived holder) new ones reuse that old list - a pad plugged in
 # later is never found. rescan() asks long-lived holders to let go (they watch GEN) so the next
 # instance re-enumerates.
 _STATE = {'live': 0, 'gen': 0}

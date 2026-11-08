@@ -7,13 +7,17 @@ from __future__ import annotations
 import ctypes as C
 import ctypes
 import math
+import os
 import pathlib
 import about
+import i18n
+from i18n import tr
 import queue
 import random
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 
 from haptic_dsp import GRIP_PROFILES, TRIGGER_PROFILES, SPEAKER_MODES, SPEAKER_EQS, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
 
@@ -82,7 +86,8 @@ class Panel(tk.Frame):
 
 class NeonButton(tk.Canvas):
     def __init__(self, master, text, command, w=150, h=40, color=CYAN, bg=PANEL, size=11, filled=False):
-        super().__init__(master, width=px(w), height=px(h), bg=bg, highlightthickness=0, bd=0, cursor='hand2')
+        need = tkfont.Font(family=ZH, size=size, weight='bold').measure(tr(text)) + px(30)     # fits any language
+        super().__init__(master, width=max(px(w), need), height=px(h), bg=bg, highlightthickness=0, bd=0, cursor='hand2')
         self.text, self.command, self.color, self.bgc, self.size, self.filled = text, command, color, bg, size, filled
         self.hover = self.down = False; self.enabled = True
         self.bind('<Enter>', lambda e: self._set(hover=True)); self.bind('<Leave>', lambda e: self._set(hover=False, down=False))
@@ -123,7 +128,12 @@ class Segmented(tk.Canvas):
     """Option picker drawn as HUD cells (replaces OptionMenu)."""
 
     def __init__(self, master, var, options, cell=118, h=34, cols=None, bg=PANEL, color=CYAN, rec=None):
-        self.rec = rec; self.opts = list(options); self.var = var; self.cellw = px(cell); self.h = px(h); self.color = color
+        self.rec = rec; self.opts = list(options); self.var = var; self.h = px(h); self.color = color
+        # cell width fits the longest (translated) option and the "recommended" badge
+        fb = tkfont.Font(family=ZH, size=10, weight='bold'); ft = tkfont.Font(family=ZH, size=7, weight='bold')
+        self.bw = max(px(30), ft.measure(tr('推荐')) + px(8))
+        need = max(fb.measure(tr(o)) + px(26) + ((self.bw + px(8)) if o == rec else 0) for o in self.opts)
+        self.cellw = max(px(cell), need)
         self.cols = cols or len(self.opts); rows = math.ceil(len(self.opts) / self.cols)
         gap = px(6)
         super().__init__(master, width=self.cols * (self.cellw + gap), height=rows * (self.h + gap), bg=bg, highlightthickness=0, bd=0, cursor='hand2')
@@ -156,11 +166,11 @@ class Segmented(tk.Canvas):
                 self.create_rectangle(x + px(8), y + self.h - px(4), x + px(22), y + self.h - px(2), fill=self.color, outline='')
             tx = x + self.cellw // 2
             if o == self.rec:                                   # recommended option: green tag, like the mode cards
-                bw, bh = px(30), px(14)
+                bw, bh = self.bw, px(14)
                 self.create_rectangle(x + self.cellw - bw - px(4), y + px(3), x + self.cellw - px(4), y + px(3) + bh,
                                       fill=mix(self.bgc, GREEN, 0.15), outline=GREEN)
                 self.create_text(x + self.cellw - bw / 2 - px(4), y + px(3) + bh / 2, text='推荐', fill=GREEN, font=(ZH, 7, 'bold'))
-                tx -= px(14)
+                tx = x + (self.cellw - bw - px(8)) // 2
             self.create_text(tx, y + self.h // 2 + (px(3) if o == self.rec else 0), text=o, fill=TEXT if sel else DIM,
                              font=(ZH, 10, 'bold' if sel else 'normal'))
 
@@ -320,7 +330,7 @@ class ModeCards(tk.Frame):
             cv.create_polygon(chamfer(1, 1, w - 2, h - 2, px(12)), fill=mix(PANEL, CYAN, 0.12 if sel else 0.0), outline=col, width=px(2) if sel else 1)
             cv.create_text(px(16), px(22), text=title, anchor='w', fill=TEXT if sel else DIM, font=(ZH, 12, 'bold'))
             if tag:
-                tw = px(12) * len(tag) + px(14)
+                tw = tkfont.Font(family=ZH, size=8, weight='bold').measure(tr(tag)) + px(14)   # fits any language
                 cv.create_rectangle(w - tw - px(12), px(13), w - px(12), px(31), fill=mix(PANEL, GREEN, 0.15), outline=GREEN)
                 cv.create_text(w - tw / 2 - px(12), px(22), text=tag, fill=GREEN, font=(ZH, 8, 'bold'))
             cv.create_text(px(16), px(44), text=desc, anchor='nw', fill=TEXT if sel else DIM, font=(ZH, 9), width=w - px(32))
@@ -381,8 +391,8 @@ class Scope(tk.Canvas):
             self.create_line(w * i / 12, 0, w * i / 12, h, fill=mix(PANEL, LINE, 0.7), tags='grid')
         for i in range(1, 6):
             self.create_line(0, h * i / 6, w, h * i / 6, fill=mix(PANEL, LINE, 0.7) if i != 3 else LINE, tags='grid')
-        self.create_text(px(6), px(8), text='触感输出', anchor='nw', fill=CYAN, font=(ZH, 8), tags='grid')
-        self.create_text(px(70), px(8), text='游戏原生', anchor='nw', fill=AMBER, font=(ZH, 8), tags='grid')
+        lg = self.create_text(px(6), px(8), text='触感输出', anchor='nw', fill=CYAN, font=(ZH, 8), tags='grid')
+        self.create_text(max(px(70), self.bbox(lg)[2] + px(14)), px(8), text='游戏原生', anchor='nw', fill=AMBER, font=(ZH, 8), tags='grid')
         self.tag_lower('grid')
 
     def push(self, a, b, idle=False):
@@ -470,11 +480,12 @@ class SkillHex(tk.Canvas):
 class InfoRow(tk.Frame):
     def __init__(self, master, key, bg=PANEL):
         super().__init__(master, bg=bg)
-        tk.Label(self, text=key, bg=bg, fg=DIM, font=(ZH, 9), width=8, anchor='w').pack(side='left')
+        tk.Label(self, text=key, bg=bg, fg=DIM, font=(ZH, 9), width=8 if i18n.LANG == 'zh' else 13, anchor='w').pack(side='left')
         self.v = tk.Label(self, text='—', bg=bg, fg=TEXT, font=(ZH, 9), anchor='w', justify='left')
         self.v.pack(side='left', fill='x', expand=True)
 
     def set(self, text, color=TEXT):
+        text = tr(text)
         if self.v['text'] != text or self.v['fg'] != color:
             self.v.configure(text=text, fg=color)
 
@@ -510,9 +521,44 @@ def _dark_titlebar(root):
         pass
 
 
+def install_translation():
+    """Translate every text at the moment it reaches the screen (program values stay Chinese)."""
+    if i18n.LANG == 'zh' or getattr(tk, '_i18n_on', False):
+        return
+    tk._i18n_on = True
+
+    def fix(kw):
+        if 'text' in kw:
+            kw['text'] = tr(kw['text'])
+        return kw
+    ct = tk.Canvas.create_text
+    tk.Canvas.create_text = lambda self, *a, **kw: ct(self, *a, **fix(kw))
+    ic = tk.Canvas.itemconfigure
+
+    def itemconfigure(self, tagOrId, cnf=None, **kw):
+        if isinstance(cnf, dict):
+            cnf = fix(dict(cnf))
+        return ic(self, tagOrId, cnf, **fix(kw))
+    tk.Canvas.itemconfigure = tk.Canvas.itemconfig = itemconfigure
+    li = tk.Label.__init__
+    tk.Label.__init__ = lambda self, master=None, cnf={}, **kw: li(self, master, cnf, **fix(kw))
+    lc = tk.Label.configure
+
+    def lconf(self, cnf=None, **kw):
+        if isinstance(cnf, dict):
+            cnf = fix(dict(cnf))
+        return lc(self, cnf, **fix(kw))
+    tk.Label.configure = tk.Label.config = lconf
+    ti = tk.Text.insert
+    tk.Text.insert = lambda self, index, chars, *args: ti(self, index, tr(chars), *args)
+    wt = tk.Wm.wm_title
+    tk.Wm.wm_title = tk.Wm.title = lambda self, string=None: wt(self, tr(string) if string else string)
+
+
 def other_fullscreen(own_hwnd=0):
-    """True while another program is fullscreen: exclusive fullscreen (D3D) or a borderless window
-    covering its whole monitor. The dashboard then stops drawing so the game keeps every frame."""
+    """True while ANOTHER program is fullscreen: exclusive fullscreen (D3D), or a window whose content
+    area (client rect, no title bar) covers its whole monitor - a borderless fullscreen game. A normal
+    maximized window always keeps its title bar, so it never counts. The dashboard then stops drawing."""
     try:
         u = ctypes.windll.user32
         st = ctypes.c_int(0)
@@ -522,26 +568,32 @@ def other_fullscreen(own_hwnd=0):
         h = u.GetForegroundWindow()
         if not h:
             return False
-        u.GetAncestor.restype = ctypes.c_void_p
-        root_h = u.GetAncestor(ctypes.c_void_p(h), 2)    # GA_ROOT
-        if own_hwnd and root_h == u.GetAncestor(ctypes.c_void_p(own_hwnd), 2):
+        pid = ctypes.c_ulong(0); u.GetWindowThreadProcessId(ctypes.c_void_p(h), ctypes.byref(pid))
+        if pid.value == os.getpid():
             return False                                  # that's us
         cls = ctypes.create_unicode_buffer(64); u.GetClassNameW(ctypes.c_void_p(h), cls, 64)
         if cls.value in ('Progman', 'WorkerW', 'Shell_TrayWnd'):
             return False                                  # the desktop itself
-        r = (ctypes.c_long * 4)(); u.GetWindowRect(ctypes.c_void_p(h), r)
+        cr = (ctypes.c_long * 4)()
+        if not u.GetClientRect(ctypes.c_void_p(h), cr):
+            return False
+        tl = (ctypes.c_long * 2)(cr[0], cr[1]); br = (ctypes.c_long * 2)(cr[2], cr[3])
+        u.ClientToScreen(ctypes.c_void_p(h), tl); u.ClientToScreen(ctypes.c_void_p(h), br)
         u.MonitorFromWindow.restype = ctypes.c_void_p
         mon = u.MonitorFromWindow(ctypes.c_void_p(h), 2)
         mi = (ctypes.c_ulong * 10)(); mi[0] = 40          # MONITORINFO: cbSize, rcMonitor, rcWork, dwFlags
         if not u.GetMonitorInfoW(ctypes.c_void_p(mon), mi):
             return False
         ml, mt, mr, mb = (ctypes.c_long * 4).from_buffer(mi, 4)
-        return r[0] <= ml and r[1] <= mt and r[2] >= mr and r[3] >= mb
+        return tl[0] <= ml and tl[1] <= mt and br[0] >= mr and br[1] >= mb
     except Exception:
         return False
 
 
 def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
+    global ZH
+    ZH = i18n.ui_font()                    # Korean / Japanese / English need fonts with their glyphs
+    install_translation()
     global S
     try: C.windll.shcore.SetProcessDpiAwareness(1)          # crisp on 4K instead of bitmap-stretched
     except Exception: pass
@@ -573,7 +625,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         'rumble_gain': tk.DoubleVar(value=cfg['rumble_gain'] * 100), 'speaker_mode': tk.StringVar(value={'仅大招/特殊技': '仅关键事件', '智能增强': '全部游戏声音'}.get(cfg['speaker_mode'], cfg['speaker_mode'])),
         'speaker_volume': tk.DoubleVar(value=cfg['speaker_volume'] * 100), 'record_native': tk.BooleanVar(value=cfg.get('record_native', True)),
         'event_fx': tk.BooleanVar(value=cfg.get('event_fx', True)), 'ww_vision': tk.BooleanVar(value=cfg.get('ww_vision', True)),
-        'ww_click_gate': tk.BooleanVar(value=cfg.get('ww_click_gate', True)), 'game_profiles': tk.BooleanVar(value=cfg.get('game_profiles', True)), 'capture': tk.StringVar(value=cfg.get('capture', '自动')), 'speaker_scene': tk.BooleanVar(value=cfg.get('speaker_scene', True)), 'pbz_log_dir': tk.StringVar(value=cfg.get('pbz_log_dir', '')), 'mirror': tk.BooleanVar(value=cfg.get('mirror', False)),
+        'ww_click_gate': tk.BooleanVar(value=cfg.get('ww_click_gate', True)), 'game_profiles': tk.BooleanVar(value=cfg.get('game_profiles', True)), 'capture': tk.StringVar(value=cfg.get('capture', '自动')), 'speaker_scene': tk.BooleanVar(value=cfg.get('speaker_scene', True)), 'pbz_log_dir': tk.StringVar(value=cfg.get('pbz_log_dir', '')),
     }
     PCT = ('grip_gain', 'trigger_gain', 'rumble_gain', 'speaker_volume', 'cinema_rumble', 'cinema_kick', 'cinema_trigger',
            'music_kick', 'music_tick', 'music_trigger')
@@ -713,8 +765,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 a = math.radians(60 * j); pts += [cx + rr * math.cos(a), cy + rr * math.sin(a)]
             head.create_polygon(pts, fill='' if rr > r else mix(BG, CYAN, 0.12), outline=col, width=px(2) if rr == r else 1)
         head.create_line(cx - px(10), cy + px(6), cx - px(4), cy - px(8), cx + px(2), cy + px(4), cx + px(8), cy - px(4), cx + px(12), cy + px(2), fill=CYAN, width=px(2))
-        head.create_text(px(80), px(28), text='声音触感', anchor='w', fill=TEXT, font=(ZH, 18, 'bold'))
-        head.create_text(px(200), px(31), text='HAPTIC  LINK', anchor='w', fill=CYAN, font=(NUMB, 13))
+        tt = head.create_text(px(80), px(28), text='声音触感', anchor='w', fill=TEXT, font=(ZH, 18, 'bold'))
+        head.create_text(max(px(200), head.bbox(tt)[2] + px(18)), px(31), text='HAPTIC  LINK', anchor='w', fill=CYAN, font=(NUMB, 13))
         head.create_text(px(81), px(56), text=f'PS5 手柄触感中枢  ·  V{VERSION}  ·  USB 有线', anchor='w', fill=DIM, font=(ZH, 9))
         head.create_line(0, px(77), w, px(77), fill=LINE)
         head.create_line(0, px(77), px(240), px(77), fill=CYAN, width=px(2))
@@ -847,18 +899,45 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         bx = side.bbox(gx)
         side.create_text(bx[2] + px(6), y - px(20), text='·', anchor='w', fill=FAINT, font=(NUM, 8))
         side.create_text(bx[2] + px(16), y - px(20), text='哔哩哔哩', anchor='w', fill=CYAN if hv == 'bili' else DIM, font=(ZH, 8), tags='lnk_bili')
+        lx = px(6)                                          # language: 中 / EN / 日 / 한 (restarts the app)
+        lt = side.create_text(lx, y - px(84), text='语言', anchor='w', fill=FAINT, font=(ZH, 8))
+        lx = max(px(52), side.bbox(lt)[2] + px(10))
+        for code, name in i18n.LANGS:
+            it = side.create_text(lx, y - px(84), text=name, anchor='w', fill=CYAN if code == i18n.LANG else DIM,
+                                  font=(ZH, 8, 'bold' if code == i18n.LANG else 'normal'), tags=('lang', 'lang_' + code))
+            lx = side.bbox(it)[2] + px(9)
         side.create_text(px(6), y - px(60), text=f'v{about.VERSION}', anchor='w', fill=FAINT, font=(NUM, 8))
         side.create_text(px(52), y - px(60), text='检查更新', anchor='w', fill=CYAN if hv == 'upd' else DIM, font=(ZH, 8), tags='lnk_upd')
         side.create_line(px(4), y, px(150), y, fill=LINE)
-        side.create_text(px(6), y + px(16), text='SYS', anchor='w', fill=FAINT, font=(NUM, 8))
-        side.create_text(px(6), y + px(38), text='', anchor='w', fill=DIM, font=(MONO, 8), tags='clock')
-        side.create_text(px(6), y + px(58), text='', anchor='w', fill=DIM, font=(MONO, 8), tags='up')
-        side.create_text(px(6), y + px(78), text='', anchor='w', fill=DIM, font=(MONO, 8), tags='mode')
+        side.create_text(px(6), y + px(16), text='系统', anchor='w', fill=FAINT, font=(ZH, 8))
+        side.create_text(px(6), y + px(38), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='clock')
+        side.create_text(px(6), y + px(58), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='up')
+        side.create_text(px(6), y + px(78), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='mode')
     side.bind('<Configure>', draw_side)
 
     def open_link(url):
         import webbrowser
         webbrowser.open(url)
+    def set_language(code):
+        """Save the language and restart the app (the whole UI is built in that language)."""
+        if code == i18n.LANG:
+            return
+        cfg['lang'] = code; save_cfg(cfg)
+        msgs.put('切换语言后软件会自动重启。')
+
+        def relaunch():
+            import subprocess, sys as _s
+            stop()
+            if runner['t']:
+                runner['t'].join(8)                  # takeover: give the real pad back first
+            cmd = [_s.executable] + _s.argv[1:] if getattr(_s, 'frozen', False) else [_s.executable, os.path.abspath(_s.argv[0])] + _s.argv[1:]
+            subprocess.Popen(cmd, cwd=os.getcwd())
+            root.destroy()
+        root.after(300, relaunch)
+    for code, _n in i18n.LANGS:
+        side.tag_bind('lang_' + code, '<Button-1>', lambda e, c=code: set_language(c))
+    side.tag_bind('lang', '<Enter>', lambda e: side.configure(cursor='hand2'))
+    side.tag_bind('lang', '<Leave>', lambda e: side.configure(cursor=''))
     for tag, key, url in (('lnk_gh', 'gh', about.GITHUB_URL), ('lnk_bili', 'bili', about.BILIBILI_URL), ('lnk_upd', 'upd', None)):
         side.tag_bind(tag, '<Button-1>', (lambda e: check_update(manual=True)) if url is None else (lambda e, u=url: open_link(u)))
         # recolour only (a full redraw would recreate the item under the pointer -> Enter/Leave loop)
@@ -892,7 +971,14 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
         def sync(e=None):
             cv.itemconfigure(win, width=cv.winfo_width())
-            cv.configure(scrollregion=(0, 0, cv.winfo_width(), inner.winfo_reqheight())); draw_bar()
+            ch, vh = inner.winfo_reqheight(), max(1, cv.winfo_height())
+            cv.configure(scrollregion=(0, 0, cv.winfo_width(), ch))
+            # content got shorter / window got taller: never leave the view scrolled past the content
+            if ch <= vh:
+                cv.yview_moveto(0)
+            elif cv.canvasy(0) + vh > ch:
+                cv.yview_moveto(max(0.0, (ch - vh) / ch))
+            draw_bar()
 
         def wheel(e):
             if inner.winfo_reqheight() > cv.winfo_height():
@@ -953,6 +1039,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         grid_view.pack_forget()
         for f in details.values(): f.pack_forget()
         details[key].pack(fill='x')
+    root._detail = show_detail              # (scripted screenshots)
 
     pg = None
 
@@ -993,7 +1080,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def pbz_browse():
         from tkinter import filedialog
-        d = filedialog.askdirectory(title='选择 PS5EventLog 的 logs 文件夹')
+        d = filedialog.askdirectory(title=tr('选择 PS5EventLog 的 logs 文件夹'))
         if d: V['pbz_log_dir'].set(d)
     NeonButton(fr, '自动查找', pbz_auto, w=96, h=30, size=9).pack(side='left')
     NeonButton(fr, '浏览…', pbz_browse, w=80, h=30, size=9).pack(side='left', padx=px(6))
@@ -1098,10 +1185,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         Toggle(pnl.body, '忽略中置声道', sv['skip_center'], '5.1/7.1 时对白（中置）不触发震动', wrap=300).pack(fill='x', pady=px(4))
         pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
-        tk.Label(fr, text='播放', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6, anchor='w').pack(side='left')
+        tk.Label(fr, text='播放', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
         Segmented(fr, sv['speaker_mode'], SPEAKER_MODES, cell=124, color=BLUE, rec='原声').pack(side='left')
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(px(8), 0))
-        tk.Label(fr, text='音色', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6, anchor='w').pack(side='left')
+        tk.Label(fr, text='音色', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
         Segmented(fr, sv['speaker_eq'], SPEAKER_EQS, cell=124, color=BLUE, rec='原味' if sc == '游戏' else '低音饱满').pack(side='left')
         Slider(pnl.body, '扬声器音量', sv['speaker_volume'], 0, 100, color=BLUE).pack(fill='x', pady=(px(8), 0))
         tk.Label(pnl.body, justify='left', anchor='w', bg=PANEL, fg=DIM, font=(ZH, 9), wraplength=px(900), text=(
@@ -1193,34 +1280,6 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     threading.Thread(target=watch_games, daemon=True).start()
     pg = grid_view
 
-    p = Panel(pg, '联动其他软件 · 音频镜像', 'MIRROR', accent=GREEN); p.pack(fill='x', pady=(0, px(10)))
-    Toggle(p.body, '音频镜像（给键盘 / 灯带的音乐律动用）', V['mirror'],
-           '开着杜比全景声时，XsEngine（EchoRGB）等灯效软件的音乐律动听不到声音。打开后，正在播放的声音（游戏、音乐、视频）会复制一份到'
-           '「Steam Streaming Speakers」（听不到的虚拟设备）；再在灯效软件的设置里把音频设备选成「Steam Streaming Speakers」即可。'
-           '不需要点「启动」，打开本软件就在工作。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
-    mirror_lb = tk.Label(p.body, text='', bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w'); mirror_lb.pack(fill='x', pady=(px(4), 0))
-    mirror = {'m': None}
-
-    def mirror_sync(*_a):
-        from mirror import AudioMirror
-        on = V['mirror'].get(); m = mirror['m']
-        if on and (m is None or not m.is_alive()):
-            mirror['m'] = AudioMirror(msgs.put); mirror['m'].start()
-        elif not on and m is not None:
-            m.stop(); mirror['m'] = None; msgs.put('音频镜像已关闭。')
-
-    def mirror_status():
-        m = mirror['m']
-        if m is None:
-            mirror_lb.configure(text='未开启', fg=FAINT)
-        elif m.error:
-            mirror_lb.configure(text='出错：' + m.error, fg=MAG)
-        else:
-            mirror_lb.configure(text=f"镜像中 · 来源 {m.source or '等待有程序发声'} · 电平 {m.level:.2f}", fg=GREEN if m.level > 0.01 else DIM)
-        root.after(500, mirror_status)
-    V['mirror'].trace_add('write', mirror_sync)
-    root.after(1000, mirror_sync); root.after(1500, mirror_status)
-
     p = Panel(pg, '系统检查', 'SYSTEM', accent=AMBER); p.pack(fill='x')
     dep_lb = tk.Label(p.body, text='检查中…', bg=PANEL, fg=TEXT, font=(ZH, 10), justify='left', anchor='w'); dep_lb.pack(fill='x')
     fr = tk.Frame(p.body, bg=PANEL); fr.pack(fill='x', pady=(px(8), 0))
@@ -1272,6 +1331,26 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     NeonButton(fr, '一键安装依赖', install_deps, w=130, h=32, size=10, color=AMBER).pack(side='left')
     NeonButton(fr, '重新检查', check_system, w=100, h=32, size=10).pack(side='left', padx=px(8))
     NeonButton(fr, '关闭英特尔USB音频', intel_off, w=170, h=32, size=10, color=AMBER).pack(side='left', padx=px(8))
+
+    def repair_pad_ui():
+        """Crash left the controller hidden / unrecognised: stop, undo every hide, close a leftover virtual pad."""
+        msgs.put('正在修复手柄…')
+        if running():
+            stop()
+
+        def work():
+            try:
+                if runner['t']:
+                    runner['t'].join(10)                         # takeover gives the real pad back first
+                from takeover import repair_pad
+                res = repair_pad(msgs.put)
+                msgs.put('修复手柄完成：' + res + '。如果游戏已经开着，请把手柄拔掉重插或重启游戏。')
+            except Exception as exc:
+                msgs.put('修复手柄失败：' + str(exc))
+        threading.Thread(target=work, daemon=True).start()
+    NeonButton(fr, '修复手柄', repair_pad_ui, w=110, h=32, size=10, color=GREEN).pack(side='left', padx=px(8))
+    tk.Label(p.body, text='崩溃后手柄插上去电脑或游戏识别不到时，点「修复手柄」：取消对游戏的隐藏、关闭残留的虚拟手柄。软件每次打开也会自动检查一次。',
+             bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(8), 0))
     intel_lb.pack(fill='x', pady=(px(8), 0))
 
     # ---- 日志
@@ -1341,10 +1420,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         d = px(5) + (px(2) * pulse if run else 0); x, y = w - px(196), px(48)
         head.coords('dot', x - d, y - d, x + d, y + d); head.itemconfigure('dot', fill=mix(BG, col, 0.5 + 0.5 * pulse) if run else FAINT)
         # side panel clock
-        side.itemconfigure('clock', text=time.strftime('%H:%M:%S'))
+        side.itemconfigure('clock', text=tr('当前时间') + '  ' + time.strftime('%H:%M:%S'))
         up = int(time.time() - t_start['t']) if t_start['t'] else 0
-        side.itemconfigure('up', text=f'UP  {up // 3600:02d}:{up // 60 % 60:02d}:{up % 60:02d}' if run else 'UP  --:--:--')
-        side.itemconfigure('mode', text='MODE ' + MODE_EN.get(r.start_cfg.get('mode', '') if run else SC('mode'), ''))
+        side.itemconfigure('up', text=tr('运行时长') + '  ' + (f'{up // 3600:02d}:{up // 60 % 60:02d}:{up % 60:02d}' if run else '--:--:--'))
+        side.itemconfigure('mode', text=tr('模式') + '  ' + tr(r.start_cfg.get('mode', '') if run else SC('mode')))
         # dashboard
         try:
             fg = root.state() != 'iconic'               # minimised: nothing to draw
@@ -1410,8 +1489,6 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def close():
         stop()
-        if mirror['m'] is not None:
-            mirror['m'].stop()
         if runner['t']:
             runner['t'].join(8)          # takeover needs a moment to un-hide the real pad
         root.destroy()

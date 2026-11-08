@@ -198,6 +198,34 @@ class Isolation:
             self.log('已恢复真手柄的可见性')
 
 
+def repair_pad(log=print):
+    """「修复手柄」: after a crash the real DualSense can stay hidden from every program (HidHide) or a
+    leftover virtual pad can confuse games. Undo all of it. Only touches PS5 controllers; other tools'
+    HidHide entries stay as they are. Returns a short summary."""
+    done = []
+    iso = Isolation(log)
+    rp = iso.path
+    if rp.exists():                                         # 1) exactly what we changed last time
+        try:
+            iso.restore_receipt(json.loads(rp.read_text('utf8'))); done.append('已撤销上次的隐藏记录')
+        except Exception as exc:
+            log('撤销隐藏记录失败：' + str(exc))
+    if iso.cli.exists():                                    # 2) any PS5 controller still hidden (record lost)
+        out = iso.hh('--dev-list')
+        hidden = [m.group(1) for m in re.finditer(r'--dev-hide "([^"]+)"', out)]
+        pads = [d for d in hidden if re.search(r'VID_054C&PID_(0CE6|0DF2)', d, re.I)]     # DualSense / DualSense Edge
+        for d in pads:
+            iso.hh('--dev-unhide', d)
+        if pads:
+            done.append(f'取消隐藏 {len(pads)} 个手柄接口')
+        if not [d for d in hidden if d not in pads]:           # 3) cloak off only if nothing else is hidden
+            iso.hh('--cloak-off')
+    r = subprocess.run(['taskkill', '/F', '/IM', 'VIIPERHost.exe'], capture_output=True, text=True, creationflags=NOWIN)
+    if r.returncode == 0:                                   # 4) leftover virtual-pad host from a crash
+        done.append('关闭了残留的虚拟手柄')
+    return '、'.join(done) if done else '没有发现需要修复的地方'
+
+
 class RumbleCoil:
     """Xbox/DS4-style two-motor rumble -> voice-coil waveforms.
     Large (left) motor -> 55 Hz body, small (right) motor -> 160 Hz buzz; each grip gets

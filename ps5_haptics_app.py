@@ -624,6 +624,8 @@ def main():
     if CONFIG.exists():
         try: cfg.update(json.loads(CONFIG.read_text('utf-8-sig')))
         except Exception: pass
+    import i18n                            # interface language: saved choice, else the Windows display language
+    i18n.set_lang(cfg.get('lang') or i18n.system_lang())
     import ui_scifi
 
     def save(c):
