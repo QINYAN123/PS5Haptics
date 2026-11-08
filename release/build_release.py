@@ -107,6 +107,10 @@ def main():
             if f.is_file():
                 zf.write(f, f.relative_to(OUT))
     print('update package:', u, f'{u.stat().st_size / 1e6:.1f} MB')
+    gh = OUT.parent / 'GitHub上传'                                     # ASCII names for the release assets
+    gh.mkdir(exist_ok=True)
+    shutil.copy2(u, gh / about.UPDATE_ASSET.format(VER))
+    shutil.copy2(OUT.parent / (OUT.name + '.zip'), gh / about.FULL_ASSET.format(VER)) if (OUT.parent / (OUT.name + '.zip')).exists() else None
     print('release folder:', OUT)
     print('zip:', z, f'{z.stat().st_size / 1e6:.1f} MB')
     print('installers bundled:', [f.name for f in found] or 'NONE - download them into ' + str(INSTALLERS))

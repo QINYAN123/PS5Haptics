@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -38,15 +39,48 @@ def _get(url, timeout=8):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _pick(names, version):
+    """The update package if present, else the full zip (prepare() finds the program inside either)."""
+    want = about.UPDATE_ASSET.format(version)
+    for n in names:
+        if n == want:
+            return n
+    for n in names:
+        if 'update' in n.lower() or about.UPDATE_ASSET_HINT in n:
+            return n
+    return names[0] if names else None
+
+
+def _check_web(timeout):
+    """No API (rate limit / blocked): the github.com page that redirects to the newest release tag."""
+    req = urllib.request.Request(about.RELEASES_URL + '/latest', headers={'User-Agent': UA}, method='HEAD')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        final = r.geturl()                                   # .../releases/tag/v2.1.0
+    tag = final.rstrip('/').rsplit('/', 1)[-1]
+    if '/tag/' not in final or not tag:
+        raise RuntimeError('没有找到发布版本')
+    ver = tag.lstrip('vV')
+    base = f'{about.GITHUB_URL}/releases/download/{tag}/'
+    return {'version': ver, 'notes': '', 'page': final, 'url': base + about.UPDATE_ASSET.format(ver),
+            'name': about.UPDATE_ASSET.format(ver), 'size': 0}
+
+
 def check(api=None, local=about.VERSION, timeout=8):
     """{'version', 'notes', 'page', 'url', 'name', 'size'} of a newer release, or None."""
-    with _get(api or about.RELEASES_API, timeout) as r:
-        rel = json.loads(r.read().decode('utf8'))
+    try:
+        with _get(api or about.RELEASES_API, timeout) as r:
+            rel = json.loads(r.read().decode('utf8'))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429) and api is None:          # anonymous API limit (60 / hour / IP)
+            info = _check_web(timeout)
+            return info if newer(info['version'], local) else None
+        raise
     tag = rel.get('tag_name') or rel.get('name') or ''
     if not newer(tag, local):
         return None
-    zips = [a for a in rel.get('assets', []) if a.get('name', '').lower().endswith('.zip')]
-    pick = next((a for a in zips if about.UPDATE_ASSET_HINT in a['name']), zips[0] if zips else None)
+    zips = {a['name']: a for a in rel.get('assets', []) if a.get('name', '').lower().endswith('.zip')}
+    name = _pick(list(zips), tag.lstrip('vV'))
+    pick = zips.get(name)
     return {'version': tag.lstrip('vV'), 'notes': (rel.get('body') or '').strip(), 'page': rel.get('html_url') or about.RELEASES_URL,
             'url': pick and pick.get('browser_download_url'), 'name': pick and pick.get('name'), 'size': pick and pick.get('size', 0)}
 
