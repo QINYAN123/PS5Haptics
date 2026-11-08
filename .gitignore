@@ -1,0 +1,23 @@
+# environment / build output
+.venv/
+__pycache__/
+*.pyc
+build/
+build_host/
+dist/
+dist_deps/
+dist_host/
+
+# runtime data (personal settings, logs, downloaded cover art)
+config.json
+event_fx.json
+event_fx.*.json
+isolation-restore.json
+last-error.txt
+selftest.log
+traces/
+covers/
+*.tsv
+
+# old internal notes
+PS5声音触感说明-早期.md

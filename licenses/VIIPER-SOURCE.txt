@@ -1,0 +1,12 @@
+﻿These VIIPER release payloads were built reproducibly for ApexSenseBridge.
+
+Upstream: https://github.com/Alia5/VIIPER.git
+Base tag: v0.7.0
+Base commit: 6b71b148a2243fab77ee1a46f4e22e00bd7d5a04
+Integrated library version: v0.7.0-asb13
+Fallback sidecar version: v0.7.0-asb11
+Patch: third_party/viiper-patches/viiper-v0.7.0-asb.patch
+Patch SHA-256: B543791D53D2803602DD13E81F2C0C1D391A001B521250010A1E61772CB18333
+Go toolchain: 1.26.5 (97E6B2A833B6D89F9FF17D25419AC0A7E3B482A044E9AB18CDEF834BD834FD38)
+LLVM-MinGW toolchain: 20260826 (AE601F4E0F72BBDF441AD2DF8BB16F037E2E9251559EA6B37B4057AEF39C06C3)
+Virtual DualSense firmware feature report: 0x0630
