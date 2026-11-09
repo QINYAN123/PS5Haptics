@@ -395,6 +395,44 @@ def test_hidhide_inverse():
         assert any('反向' in m for m in logs) == restored
 
 
+def test_receiver_paths():
+    import ds_hid, re as _re
+    from takeover import collection_paths, DEV_PATTERN
+    guid = '{4d1e55b2-f16f-11cf-88cb-001111000030}'
+    col1 = rf'\\?\hid#vid_054c&pid_0ce6&mi_03&col01#8&2f3a&0&0000#{guid}'
+    col2 = rf'\\?\hid#vid_054c&pid_0ce6&mi_03&col02#8&2f3a&0&0001#{guid}'
+    kbd = rf'\\?\hid#vid_054c&pid_0ce6&mi_05#8&aa&0&0000#{guid}'
+    bt = rf'\\?\hid#{{00001124-0000-1000-8000-00805f9b34fb}}_vid&0002054c_pid&0ce6#8&1&0&0000#{guid}'
+    plain = rf'\\?\hid#vid_054c&pid_0ce6#7&1&0&0000#{guid}'
+    assert instance_path(col1) == r'HID\VID_054C&PID_0CE6&MI_03&COL01\8&2f3a&0&0000'
+    assert instance_path(plain) == r'HID\VID_054C&PID_0CE6\7&1&0&0000' and instance_path(bt) is None
+    rows = [dict(product_id=0x0CE6, interface_number=3, usage_page=0xFF00, usage=1, path=col2.encode()),
+            dict(product_id=0x0CE6, interface_number=5, usage_page=1, usage=6, path=kbd.encode()),
+            dict(product_id=0x0CE6, interface_number=-1, usage_page=1, usage=5, path=bt.encode()),
+            dict(product_id=0x0CE6, interface_number=3, usage_page=1, usage=5, path=col1.encode())]
+    keep = ds_hid.hid.enumerate
+    try:
+        ds_hid.hid.enumerate = lambda v, p: rows
+        assert ds_hid.find_path() == (col1.encode(), 0x0CE6)                # gamepad, not the vendor channel, Bluetooth or keyboard
+        ds_hid.hid.enumerate = lambda v, p: [rows[2], rows[0]]
+        assert ds_hid.find_path()[0] == col2.encode()                       # a receiver beats Bluetooth
+        ds_hid.hid.enumerate = lambda v, p: [rows[2]]
+        assert ds_hid.is_bluetooth(ds_hid.find_path()[0])
+        ds_hid.hid.enumerate = lambda v, p: [dict(product_id=0x0CE6, interface_number=2, usage_page=1, usage=5, path=b'other')]
+        assert ds_hid.find_path()[0] == b'other'                            # another interface number, still a gamepad
+        ds_hid.hid.enumerate = lambda v, p: [dict(product_id=0x0CE6, interface_number=0, path=b'audio')]
+        assert ds_hid.find_path() == (None, None)
+    finally:
+        ds_hid.hid.enumerate = keep
+    both = collection_paths(col1.encode(), rows)
+    assert sorted(both) == sorted([instance_path(col1), instance_path(col2)])     # both collections, no keyboard
+    assert collection_paths(bt.encode(), rows) == []
+    for good in (instance_path(col1), instance_path(plain), PAD, r'USB\VID_054C&PID_0CE6&MI_03\7&1'):
+        assert _re.match(DEV_PATTERN, good, _re.I), good
+    for bad in (r'USB\VID_054C&PID_0CE6\7&1', r'HID\VID_054C&PID_09CC&MI_03\7&1', r'HID\VID_054C&PID_0CE6&MI_05\7&1'):
+        assert not _re.match(DEV_PATTERN, bad, _re.I), bad
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -454,7 +492,7 @@ def test_live():
 
 
 if __name__ == '__main__':
-    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse()
+    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths()
     print('offline tests ok')
     if '--live' in sys.argv:
         test_live()

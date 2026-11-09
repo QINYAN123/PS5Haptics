@@ -371,6 +371,7 @@ T = [
     ('发现上次未恢复的隐藏记录，先恢复…', 'Found an unrestored hide record from last time, restoring first…', '前回戻されなかった非表示の記録があるため、先に戻します…', '복구되지 않은 숨김 기록이 있어 먼저 복구합니다…'),
     ('没有安装 HidHide，无法接管', 'HidHide is not installed - cannot take over', 'HidHide がないためテイクオーバーできません', 'HidHide가 없어 테이크오버할 수 없음'),
     ('HidHide 处于反向模式：运行期间临时关闭，停止后恢复', 'HidHide is in inverse mode: turned off while running, restored when stopped', 'HidHide が反転モードです：実行中だけオフにし、停止後に戻します', 'HidHide가 반전 모드입니다: 실행 중에만 끄고 중지하면 복구합니다'),
+    ('手柄现在是电脑蓝牙连接，不支持：请用 USB 线或 DS5Dongle 接收器', 'The controller is connected over PC Bluetooth, which is not supported: use a USB cable or a DS5Dongle receiver', 'コントローラーは PC の Bluetooth 接続で、非対応です：USB ケーブルか DS5Dongle レシーバーを使ってください', '컨트롤러가 PC 블루투스로 연결되어 있어 지원되지 않습니다: USB 케이블이나 DS5Dongle 수신기를 사용하세요'),
     ('没找到 USB 连接的 PS5 手柄 HID 设备', 'No USB-connected PS5 controller (HID) found', 'USB 接続の PS5 コントローラー（HID）が見つかりません', 'USB로 연결된 PS5 컨트롤러(HID)를 찾지 못함'),
     ('已恢复真手柄的可见性', 'The real controller is visible again', '本物のコントローラーの表示を戻しました', '실제 컨트롤러를 다시 보이게 했습니다'),
     ('ViGEm 初始化失败', 'ViGEm initialisation failed', 'ViGEm の初期化に失敗', 'ViGEm 초기화 실패'),

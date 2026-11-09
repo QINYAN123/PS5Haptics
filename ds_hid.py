@@ -38,11 +38,31 @@ def parse_firmware_info(b):
             'fw': int.from_bytes(b[28:32], 'little'), 'update': int.from_bytes(b[44:46], 'little')}
 
 
+def is_bluetooth(path):
+    path = path if isinstance(path, bytes) else str(path or '').encode()
+    return b'00001124' in path.lower()                   # the Bluetooth HID service id
+
+
+def _rank(d):
+    '''Which HID entry is the pad: lower is better, None = not the pad. Receivers can split the interface into
+    several collections (a vendor channel next to the gamepad) or use another interface number.'''
+    if d['product_id'] not in PIDS:
+        return None
+    if is_bluetooth(d.get('path')):
+        return 9                                         # only if nothing else is connected
+    page, usage = d.get('usage_page'), d.get('usage')
+    gamepad = page == 1 and usage in (4, 5)
+    if d.get('interface_number', 3) in (3, -1):
+        return 0 if gamepad else 1 if not page else 2
+    return 3 if gamepad else None
+
+
 def find_path():
-    for d in hid.enumerate(VID, 0):
-        if d['product_id'] in PIDS and d.get('interface_number', 3) in (3, -1):
-            return d['path'], d['product_id']
-    return None, None
+    rows = [(r, i, d) for i, d in enumerate(hid.enumerate(VID, 0)) for r in [_rank(d)] if r is not None]
+    if not rows:
+        return None, None
+    d = min(rows, key=lambda x: x[:2])[2]
+    return d['path'], d['product_id']
 
 
 def effect_off():

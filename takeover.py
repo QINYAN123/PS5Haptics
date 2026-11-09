@@ -191,7 +191,8 @@ class VirtualX360(VirtualDS4):
         super().close()
 
 
-DEV_PATTERN = r'^(HID|USB)\\VID_054C&PID_(0CE6|0DF2)&MI_03\\'
+# Receivers may add a collection suffix (&COL01) or be a plain HID device with no interface number.
+DEV_PATTERN = r'^(HID\\VID_054C&PID_(0CE6|0DF2)(&MI_03)?(&COL[0-9A-F]{2})?|USB\\VID_054C&PID_(0CE6|0DF2)&MI_03)\\'
 
 
 def _decode_cli(raw):
@@ -224,8 +225,18 @@ def instance_path(hid_path):
     r"""hidapi path \\?\hid#vid_054c&pid_0ce6&mi_03#7&3a227958&0&0000#{guid} -> HID\VID_054C&PID_0CE6&MI_03\7&3a227958&0&0000"""
     if isinstance(hid_path, bytes):
         hid_path = hid_path.decode('ascii', 'ignore')
-    m = re.match(r'^\\\\\?\\(hid)#(vid_054c&pid_[0-9a-f]{4}(?:&mi_[0-9a-f]{2})?)#([^#]+)#', hid_path or '', re.I)
+    m = re.match(r'^\\\\\?\\(hid)#(vid_054c&pid_[0-9a-f]{4}(?:&[a-z0-9_]+)*)#([^#]+)#', hid_path or '', re.I)
     return f'{m.group(1).upper()}\\{m.group(2).upper()}\\{m.group(3).lower()}' if m else None
+
+
+def collection_paths(pad_path, rows):
+    '''Every HID collection of the interface we opened: a game must not reach the pad through a sibling one.'''
+    own = instance_path(pad_path)
+    if not own:
+        return []
+    base = lambda p: re.sub(r'&COL[0-9A-F]+', '', p.split('\\')[1], flags=re.I).upper()
+    found = [p for p in (instance_path(r.get('path')) for r in rows) if p and base(p) == base(own)]
+    return found if own in found else found + [own]
 
 
 class Isolation:
@@ -266,10 +277,15 @@ class Isolation:
         before = self.hh('--inv-state', '--cloak-state', '--dev-list', '--app-list')
         inverse = '--inv-on' in before                               # listed apps are blocked, everything else sees the pad
         devs = gaming_pad_paths(self.hh('--dev-gaming'))             # HidHide's own device list: fast
-        own_path = instance_path(pad_path)
-        if own_path and own_path.lower() not in (d.lower() for d in devs):
-            devs.append(own_path)
+        import hid
+        from ds_hid import VID, is_bluetooth
+        for own_path in collection_paths(pad_path, hid.enumerate(VID, 0)):
+            if own_path.lower() not in (d.lower() for d in devs):
+                devs.append(own_path)
         if not any(d.upper().startswith('HID\\') for d in devs):
+            self.log('HID path: ' + repr(pad_path))              # for bug reports: the receiver's real path
+            if pad_path and is_bluetooth(pad_path):
+                raise RuntimeError('手柄现在是电脑蓝牙连接，不支持：请用 USB 线或 DS5Dongle 接收器')
             raise RuntimeError('没找到 USB 连接的 PS5 手柄 HID 设备')
         apps = []
         for exe in {sys.executable, getattr(sys, '_base_executable', sys.executable)}:

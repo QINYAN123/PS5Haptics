@@ -175,19 +175,13 @@ def bind_presets(preset, sv):
 
 def pad_status():
     """How the controller is connected right now: 'usb', 'edge', 'bluetooth' or None."""
-    import hid
-    from ds_hid import VID, PIDS
-    found = None
-    for d in hid.enumerate(VID, 0):
-        if d['product_id'] not in PIDS:
-            continue
-        path = d.get('path') or b''
-        path = path.lower() if isinstance(path, bytes) else str(path).lower().encode()
-        if b'00001124' in path:                          # the Bluetooth HID service id
-            found = found or 'bluetooth'
-        elif d.get('interface_number', 3) in (3, -1):
-            return 'edge' if d['product_id'] == 0x0DF2 else 'usb'
-    return found
+    from ds_hid import find_path, is_bluetooth
+    path, pid = find_path()
+    if path is None:
+        return None
+    if is_bluetooth(path):
+        return 'bluetooth'
+    return 'edge' if pid == 0x0DF2 else 'usb'
 
 
 def next_step(run, pad, missing):
