@@ -10,5 +10,6 @@ foreach ($device in $receipt.devices) {
 }
 foreach ($app in $receipt.apps) { & $receipt.cli --app-unreg $app; if ($LASTEXITCODE -ne 0) { throw 'Whitelist restoration failed' } }
 if ($receipt.restore_cloak_off) { & $receipt.cli --cloak-off; if ($LASTEXITCODE -ne 0) { throw 'Cloak restoration failed' } }
+if ($receipt.restore_inv_on) { & $receipt.cli --inv-on; if ($LASTEXITCODE -ne 0) { throw 'Inverse mode restoration failed' } }
 Remove-Item -LiteralPath $receiptPath
 Write-Host 'Session-owned visibility changes restored.'

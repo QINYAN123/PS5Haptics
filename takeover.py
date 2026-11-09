@@ -264,8 +264,7 @@ class Isolation:
         if not self.cli.exists():
             raise RuntimeError('没有安装 HidHide，无法接管')
         before = self.hh('--inv-state', '--cloak-state', '--dev-list', '--app-list')
-        if '--inv-on' in before:
-            raise RuntimeError('HidHide 处于反向模式，不支持；未做任何修改')
+        inverse = '--inv-on' in before                               # listed apps are blocked, everything else sees the pad
         devs = gaming_pad_paths(self.hh('--dev-gaming'))             # HidHide's own device list: fast
         own_path = instance_path(pad_path)
         if own_path and own_path.lower() not in (d.lower() for d in devs):
@@ -278,9 +277,12 @@ class Isolation:
             if p.lower() not in before.lower():
                 apps.append(p)
         own = [d for d in devs if d.lower() not in before.lower()]
-        self.receipt = {'cli': str(self.cli), 'devices': own, 'apps': apps, 'restore_cloak_off': '--cloak-off' in before}
+        self.receipt = {'cli': str(self.cli), 'devices': own, 'apps': apps, 'restore_cloak_off': '--cloak-off' in before, 'restore_inv_on': inverse}
         self.path.write_text(json.dumps(self.receipt, ensure_ascii=False, indent=2), 'utf8')
         args = []
+        if inverse:                                                  # we can't list every game, so switch it off for this session
+            self.log('HidHide 处于反向模式：运行期间临时关闭，停止后恢复')
+            args += ['--inv-off']
         for a in apps:
             args += ['--app-reg', a]
         for d in own:
@@ -296,6 +298,8 @@ class Isolation:
             args += ['--app-unreg', a]
         if rc.get('restore_cloak_off'):
             args += ['--cloak-off']
+        if rc.get('restore_inv_on'):
+            args += ['--inv-on']
         if args:
             self.hh(*args)
         self.path.unlink(missing_ok=True)

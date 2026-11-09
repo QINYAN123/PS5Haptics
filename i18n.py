@@ -370,7 +370,7 @@ T = [
     ('还没有安装 UE4SS：请先按说明安装 UE4SS，再点一键安装。', 'UE4SS is not installed yet: install it as described, then press Install.', 'UE4SS がまだありません：手順どおり UE4SS を入れてからインストールしてください。', 'UE4SS가 아직 없습니다: 안내대로 UE4SS를 설치한 뒤 설치를 누르세요.'),
     ('发现上次未恢复的隐藏记录，先恢复…', 'Found an unrestored hide record from last time, restoring first…', '前回戻されなかった非表示の記録があるため、先に戻します…', '복구되지 않은 숨김 기록이 있어 먼저 복구합니다…'),
     ('没有安装 HidHide，无法接管', 'HidHide is not installed - cannot take over', 'HidHide がないためテイクオーバーできません', 'HidHide가 없어 테이크오버할 수 없음'),
-    ('HidHide 处于反向模式，不支持；未做任何修改', 'HidHide is in inverse mode (not supported); nothing was changed', 'HidHide が反転モードのため非対応。何も変更していません', 'HidHide가 반전 모드라 지원되지 않음. 아무것도 변경하지 않음'),
+    ('HidHide 处于反向模式：运行期间临时关闭，停止后恢复', 'HidHide is in inverse mode: turned off while running, restored when stopped', 'HidHide が反転モードです：実行中だけオフにし、停止後に戻します', 'HidHide가 반전 모드입니다: 실행 중에만 끄고 중지하면 복구합니다'),
     ('没找到 USB 连接的 PS5 手柄 HID 设备', 'No USB-connected PS5 controller (HID) found', 'USB 接続の PS5 コントローラー（HID）が見つかりません', 'USB로 연결된 PS5 컨트롤러(HID)를 찾지 못함'),
     ('已恢复真手柄的可见性', 'The real controller is visible again', '本物のコントローラーの表示を戻しました', '실제 컨트롤러를 다시 보이게 했습니다'),
     ('ViGEm 初始化失败', 'ViGEm initialisation failed', 'ViGEm の初期化に失敗', 'ViGEm 초기화 실패'),

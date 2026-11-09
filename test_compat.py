@@ -368,6 +368,33 @@ def test_fine_profile():
     assert fine > S0[f >= 90].sum() / S0.sum()                                                  # more of it above the body than 均衡
 
 
+def test_hidhide_inverse():
+    import json, tempfile, pathlib
+    from takeover import Isolation
+    pad = r'HID\VID_054C&PID_0CE6&MI_03\7&1&0&0000'
+    for state, restored in (('--inv-on', True), ('--inv-off', False)):
+        iso = Isolation.__new__(Isolation); logs = []; calls = []
+        iso.log = logs.append; iso.receipt = None
+        iso.path = pathlib.Path(tempfile.mkdtemp()) / 'r.json'
+        iso.cli = pathlib.Path(__file__)                       # "installed"
+
+        def hh(*args, st=state):
+            calls.append(args)
+            if '--inv-state' in args:
+                return st + '\n--cloak-off\n'
+            if '--dev-gaming' in args:
+                return json.dumps([{'devices': [{'present': True, 'deviceInstancePath': pad}]}])
+            return ''
+        iso.hh = hh
+        iso.open()
+        change = calls[-1]
+        assert ('--inv-off' in change) == restored and '--cloak-on' in change and '--dev-hide' in change
+        assert json.loads(iso.path.read_text('utf8'))['restore_inv_on'] is restored      # survives a crash
+        iso.close()
+        assert ('--inv-on' in calls[-1]) == restored and '--dev-unhide' in calls[-1] and not iso.path.exists()
+        assert any('反向' in m for m in logs) == restored
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -427,7 +454,7 @@ def test_live():
 
 
 if __name__ == '__main__':
-    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile()
+    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse()
     print('offline tests ok')
     if '--live' in sys.argv:
         test_live()
