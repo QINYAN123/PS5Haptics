@@ -33,7 +33,7 @@ def main():
     OUT.mkdir(parents=True)
     app = OUT / 'PS5声音触感'
     copytree(SRC / 'dist' / 'PS5Haptics', app,
-             ignore=shutil.ignore_patterns('traces', 'covers', 'config.json', 'event_fx*.json', 'selftest.log', 'last-error.txt',
+             ignore=shutil.ignore_patterns('traces', 'covers', 'config.json', 'event_fx*.json', 'selftest.log', 'last-error.txt', 'game_caps.json',
                                            'isolation-restore.json'))
     copytree(SRC / 'licenses', app / 'licenses')
     mod_src = TOP / '影之刃零事件记录mod' / 'PS5EventLog' / 'Scripts'

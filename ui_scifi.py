@@ -19,6 +19,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 
+from takeover import FUSION_ALIAS
 from haptic_dsp import GRIP_PROFILES, TRIGGER_PROFILES, SPEAKER_MODES, SPEAKER_EQS, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
 
 VERSION = about.VERSION
@@ -122,6 +123,84 @@ class NeonButton(tk.Canvas):
         self.create_polygon(chamfer(px(2), px(2), w - px(3), h - px(3), c - px(1)), fill=fill, outline=col, width=1)
         self.create_line(w - px(16), h - px(6), w - px(8), h - px(6), fill=fg if self.filled else col, width=px(2))
         self.create_text(w // 2, h // 2, text=self.text, fill=fg, font=(ZH, self.size, 'bold'))
+
+
+# one-click combinations for the game scene; anything else is the player's own 自定义 combination
+PRESETS = {'声感': dict(fusion='替换', trigger_mode='替换', speaker_mode='全部游戏声'),
+           '全感': dict(fusion='叠加', trigger_mode='自动', speaker_mode='特殊事件')}
+PRESET_KEYS = tuple(PRESETS['全感'])
+
+
+def preset_of(fusion, trigger_mode, speaker_mode):
+    now = dict(fusion=fusion, trigger_mode=trigger_mode, speaker_mode=speaker_mode)
+    return next((name for name, vals in PRESETS.items() if vals == now), '自定义')
+
+
+def bind_presets(preset, sv):
+    """preset: the StringVar of the picker; sv: the scene's settings. Picking 自定义 brings back the
+    player's own combination, which is remembered whenever the settings match no preset."""
+    busy = {'on': False}
+
+    def current():
+        return preset_of(*(sv[k].get() for k in PRESET_KEYS))
+
+    def remember():
+        if current() == '自定义':
+            for k in PRESET_KEYS:
+                sv['custom_' + k].set(sv[k].get())
+
+    def choose(*_a):
+        if busy['on']:
+            return
+        name = preset.get()
+        vals = PRESETS.get(name) or {k: sv['custom_' + k].get() for k in PRESET_KEYS}
+        busy['on'] = True
+        for k, v in vals.items():
+            sv[k].set(v)
+        if sv['mode'].get() == '普通':                    # no game effects reach us without a virtual pad
+            sv['mode'].set('原生透传')
+        busy['on'] = False
+
+    def follow(*_a):                                     # changed by hand
+        if busy['on']:
+            return
+        busy['on'] = True
+        remember(); preset.set(current())
+        busy['on'] = False
+    remember(); preset.set(current())
+    preset.trace_add('write', choose)
+    for k in PRESET_KEYS:
+        sv[k].trace_add('write', follow)
+
+
+def pad_status():
+    """How the controller is connected right now: 'usb', 'edge', 'bluetooth' or None."""
+    import hid
+    from ds_hid import VID, PIDS
+    found = None
+    for d in hid.enumerate(VID, 0):
+        if d['product_id'] not in PIDS:
+            continue
+        path = d.get('path') or b''
+        path = path.lower() if isinstance(path, bytes) else str(path).lower().encode()
+        if b'00001124' in path:                          # the Bluetooth HID service id
+            found = found or 'bluetooth'
+        elif d.get('interface_number', 3) in (3, -1):
+            return 'edge' if d['product_id'] == 0x0DF2 else 'usb'
+    return found
+
+
+def next_step(run, pad, missing):
+    """What a person should do next: (message, action), or None while running."""
+    if run:
+        return None
+    if missing:
+        return '还缺驱动：' + '、'.join(missing) + '。装好才能用当前的连接方式。', 'deps'
+    if pad is None:
+        return '没检测到手柄：请用 USB 线或 DS5Dongle 接收器（测试版）连接。已经插着还认不到，就点「修复手柄」。', 'repair'
+    if pad == 'bluetooth':
+        return '手柄现在是蓝牙连接，音圈和扬声器用不了：请改用 USB 线或 DS5Dongle 接收器（测试版）。', None
+    return '手柄已就绪：点右上角「启动」，再打开游戏。游戏已经开着的话，要重启游戏才能认到虚拟手柄。', 'start'
 
 
 class Segmented(tk.Canvas):
@@ -627,25 +706,25 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         'swap_grips': tk.BooleanVar(value=cfg.get('swap_grips', False)), 'volume_comp': tk.BooleanVar(value=cfg.get('volume_comp', False)),
         'grip_gain': tk.DoubleVar(value=cfg['grip_gain'] * 100), 'trigger_gain': tk.DoubleVar(value=cfg['trigger_gain'] * 100),
         'skip_center': tk.BooleanVar(value=cfg['skip_center']), 'foreground_exe': tk.StringVar(value=cfg['foreground_exe']),
-        'mode': tk.StringVar(value=cfg['mode']), 'fusion': tk.StringVar(value=cfg['fusion']),
+        'mode': tk.StringVar(value=cfg['mode']), 'fusion': tk.StringVar(value=FUSION_ALIAS.get(cfg['fusion'], cfg['fusion'])),
         'rumble_gain': tk.DoubleVar(value=cfg['rumble_gain'] * 100), 'speaker_mode': tk.StringVar(value={'仅大招/特殊技': '仅关键事件', '智能增强': '全部游戏声音'}.get(cfg['speaker_mode'], cfg['speaker_mode'])),
         'speaker_volume': tk.DoubleVar(value=cfg['speaker_volume'] * 100), 'record_native': tk.BooleanVar(value=cfg.get('record_native', True)),
         'event_fx': tk.BooleanVar(value=cfg.get('event_fx', True)), 'ww_vision': tk.BooleanVar(value=cfg.get('ww_vision', True)),
         'ww_click_gate': tk.BooleanVar(value=cfg.get('ww_click_gate', True)), 'game_profiles': tk.BooleanVar(value=cfg.get('game_profiles', True)), 'capture': tk.StringVar(value=cfg.get('capture', '自动')), 'speaker_scene': tk.BooleanVar(value=cfg.get('speaker_scene', True)), 'pbz_log_dir': tk.StringVar(value=cfg.get('pbz_log_dir', '')),
     }
     PCT = ('grip_gain', 'trigger_gain', 'rumble_gain', 'speaker_volume', 'cinema_rumble', 'cinema_kick', 'cinema_trigger',
-           'music_kick', 'music_tick', 'music_trigger', 'button_gain', 'stick_dz_l', 'stick_dz_r')
+           'music_kick', 'music_tick', 'music_trigger', 'button_gain', 'stick_dz_l', 'stick_dz_r', 'grip_left_gain', 'grip_right_gain', 'trigger_left_gain', 'trigger_right_gain')
 
     # ---- scenes: every usage scenario keeps its own complete setup
     SCENES = ('游戏', '影院', '音乐')
     STYLE_OF = {'游戏': '游戏', '影院': '影院', '音乐': '律动'}
     SCENE_DEF = {
-        '游戏': dict(mode='原生透传', fusion='融合', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
-                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='原味', speaker_volume=0.6, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器'),
-        '影院': dict(mode='普通', fusion='融合', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=0.8,
-                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='低音饱满', speaker_volume=0.7, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器'),
-        '音乐': dict(mode='普通', fusion='融合', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
-                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='低音饱满', speaker_volume=0.6, capture='自动', skip_center=False, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器'),
+        '游戏': dict(mode='原生透传', voice_gate=True, fusion='叠加', trigger_mode='自动', custom_fusion='叠加', custom_trigger_mode='叠加', custom_speaker_mode='全部游戏声', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
+                   rumble_gain=1.0, speaker_mode='特殊事件', speaker_eq='原味', speaker_volume=0.6, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
+        '影院': dict(mode='普通', voice_gate=False, fusion='叠加', trigger_mode='自动', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=0.8,
+                   rumble_gain=1.0, speaker_mode='全部游戏声', speaker_eq='低音饱满', speaker_volume=0.7, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
+        '音乐': dict(mode='普通', voice_gate=False, fusion='叠加', trigger_mode='自动', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
+                   rumble_gain=1.0, speaker_mode='全部游戏声', speaker_eq='低音饱满', speaker_volume=0.6, capture='自动', skip_center=False, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
     }
     saved = dict(cfg.get('scenes') or {})
     if '游戏' not in saved:                                   # first run of the scene system: keep the user's old setup
@@ -655,7 +734,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     for sc in SCENES:
         vals = dict(SCENE_DEF[sc]); vals.update(saved.get(sc, {}))
         vals['speaker_mode'] = SPEAKER_MODE_ALIAS.get(vals['speaker_mode'], vals['speaker_mode'])
-        if vals['speaker_mode'] not in SPEAKER_MODES: vals['speaker_mode'] = '原声'
+        if vals.get('fusion') == '仅游戏震动' and 'trigger_mode' not in saved.get(sc, {}):
+            vals['trigger_mode'] = '纯用游戏'                 # that old choice also left the triggers to the game
+        vals['fusion'] = FUSION_ALIAS.get(vals.get('fusion'), vals.get('fusion', '叠加'))
+        if vals['speaker_mode'] not in SPEAKER_MODES: vals['speaker_mode'] = '全部游戏声'
         if vals.get('speaker_eq') not in SPEAKER_EQS: vals['speaker_eq'] = '原味'
         SV[sc] = {k: (tk.DoubleVar(value=v * 100) if k in PCT else tk.BooleanVar(value=v) if isinstance(v, bool) else tk.StringVar(value=v))
                   for k, v in vals.items()}
@@ -669,6 +751,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         for sc in SCENES:
             for v in SV[sc].values():
                 v.trace_add('write', lambda *a: apply_live())
+
+    demo_mode = runner_cls.__name__ == 'DemoRunner'
+    pad = {'state': 'usb' if demo_mode else None, 'known': demo_mode, 'demo': demo_mode}
 
     def running():
         return bool(runner['t'] and runner['t'].is_alive())
@@ -685,6 +770,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def start():
         if running(): return
+        hide_error()
+        if not pad['demo'] and pad['state'] in (None, 'bluetooth') and pad['known']:
+            show_error(next_step(False, pad['state'], [])[0]); return
         try:
             import deps
             miss = [m for m in deps.missing() if m[0] in NEEDS.get(SC('mode'), ())]
@@ -698,7 +786,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 import sysfix
                 st = sysfix.pbz_status()
                 if st['game'] and (not st['ue4ss'] or st['mod'] != 'ok'):
-                    msgs.put('提示：影之刃零的事件特调缺少 UE4SS 或事件 mod（适配库 → 影之刃零卡片的齿轮里有安装说明）。其他功能照常启动。')
+                    msgs.put('提示：影之刃零的事件特调缺少 UE4SS 或事件 mod（游戏适配 → 影之刃零的齿轮里有安装说明）。其他功能照常启动。')
             except Exception:
                 pass
         collect()
@@ -747,10 +835,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def switch_scene(sc):
         """Scene card clicked: switch live - haptics, speaker and style change at once, no restart."""
-        if V['scene'].get() == sc:
-            return
         V['scene'].set(sc)
-        msgs.put(f'已切换到「{sc}」场景' + ('（已实时生效）' if running() else '，点右上角「启动」开始。'))
 
     def test():
         if running():
@@ -760,6 +845,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     # ---- header
     head = tk.Canvas(root, height=px(78), bg=BG, highlightthickness=0, bd=0); head.pack(fill='x')
     bigbtn = NeonButton(root, '▶  启动', toggle, w=170, h=46, color=CYAN, bg=BG, size=13, filled=True)
+    scene_sw = Segmented(root, V['scene'], SCENES, cell=72, h=34, bg=BG)       # always one click away, on every page
     hstate = {'w': 0}
 
     def draw_head(e=None):
@@ -773,16 +859,17 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         head.create_line(cx - px(10), cy + px(6), cx - px(4), cy - px(8), cx + px(2), cy + px(4), cx + px(8), cy - px(4), cx + px(12), cy + px(2), fill=CYAN, width=px(2))
         tt = head.create_text(px(80), px(28), text='声音触感', anchor='w', fill=TEXT, font=(ZH, 18, 'bold'))
         head.create_text(max(px(200), head.bbox(tt)[2] + px(18)), px(31), text='HAPTIC  LINK', anchor='w', fill=CYAN, font=(NUMB, 13))
-        head.create_text(px(81), px(56), text=f'PS5 手柄触感中枢  ·  V{VERSION}  ·  USB / DS5Dongle（测试版）', anchor='w', fill=DIM, font=(ZH, 9))
+        head.create_text(px(81), px(56), text=f'V{VERSION}  ·  USB / DS5Dongle（测试版）', anchor='w', fill=DIM, font=(ZH, 9))
         head.create_line(0, px(77), w, px(77), fill=LINE)
         head.create_line(0, px(77), px(240), px(77), fill=CYAN, width=px(2))
         for i in range(24):
             x = px(250) + i * px(9)
             head.create_line(x, px(77), x + px(4), px(77), fill=mix(BG, CYAN, 0.6 - i * 0.025), width=px(2))
-        head.create_text(w - px(208), px(30), text='STATUS', anchor='e', fill=FAINT, font=(NUM, 8), tags='st')
+        head.create_text(w - px(208), px(29), text='', anchor='e', fill=FAINT, font=(ZH, 9), tags='pad')
         head.create_oval(0, 0, 0, 0, tags='dot', outline='')
         head.create_text(w - px(208), px(48), text='', anchor='e', font=(ZH, 11, 'bold'), tags='stt')
-        head.coords(head.create_window(w - px(20), px(39), window=bigbtn, anchor='e'), w - px(20), px(39))
+        head.create_window(w - px(20), px(39), window=bigbtn, anchor='e')
+        head.create_window(w - px(400), px(39), window=scene_sw, anchor='e')
     head.bind('<Configure>', draw_head)
 
     # ---- restart-needed banner (no pop-up): shown while some changed settings wait for a restart
@@ -798,6 +885,24 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 banner.pack(fill='x', padx=px(14), pady=(px(8), 0), after=head)
         elif banner.winfo_ismapped():
             banner.pack_forget()
+
+    # ---- error bar: a failure must not hide in the log; it says what happened and offers the fix
+    EB = mix(BG, MAG, 0.16)
+    errbar = tk.Frame(root, bg=EB, highlightthickness=1, highlightbackground=MAG)
+    err_lb = tk.Label(errbar, text='', bg=EB, fg=TEXT, font=(ZH, 10, 'bold'), anchor='w', justify='left')
+    err_lb.pack(side='left', padx=px(14), pady=px(6), fill='x', expand=True)
+
+    def hide_error():
+        if errbar.winfo_ismapped():
+            errbar.pack_forget()
+
+    def show_error(text):
+        err_lb.configure(text=text, wraplength=max(px(300), root.winfo_width() - px(520)))
+        if not errbar.winfo_ismapped():
+            errbar.pack(fill='x', padx=px(14), pady=(px(8), 0), after=head)
+    NeonButton(errbar, '关闭', hide_error, w=70, h=30, size=10, color=MAG, bg=EB).pack(side='right', padx=(0, px(8)), pady=px(4))
+    NeonButton(errbar, '查看日志', lambda: show('日志'), w=100, h=30, size=10, color=MAG, bg=EB).pack(side='right', padx=(0, px(8)), pady=px(4))
+    NeonButton(errbar, '修复手柄', lambda: repair_pad_ui(), w=100, h=30, size=10, color=MAG, bg=EB, filled=True).pack(side='right', padx=(0, px(8)), pady=px(4))
 
     # ---- update banner (no pop-up): a newer release on GitHub -> online update or manual download
     UB = mix(BG, GREEN, 0.14)
@@ -883,7 +988,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     main = tk.Frame(root, bg=BG); main.pack(fill='both', expand=True, padx=px(14), pady=(px(10), 0))
     side = tk.Canvas(main, width=px(160), bg=BG, highlightthickness=0, bd=0); side.pack(side='left', fill='y')
     pages_host = tk.Frame(main, bg=BG); pages_host.pack(side='left', fill='both', expand=True, padx=(px(12), 0))
-    NAV = [('总览', 'DASHBOARD', '◈'), ('适配库', 'LIBRARY', '⬢'), ('日志', 'LOG', '≡')]
+    NAV = [('总览', 'DASHBOARD', '◈'), ('设置', 'SETTINGS', '⚙'), ('游戏适配', 'GAMES', '⬢'), ('系统', 'SYSTEM', '✚'), ('日志', 'LOG', '≡')]
     cur = {'p': '总览', 'hover': None}; pages = {}
 
     def draw_side(e=None):
@@ -897,29 +1002,17 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             side.create_text(px(24), y + px(29), text=ic, fill=CYAN if sel else FAINT, font=('Segoe UI Symbol', 14))
             side.create_text(px(50), y + px(21), text=n, anchor='w', fill=TEXT if sel else DIM, font=(ZH, 11, 'bold'))
             side.create_text(px(50), y + px(40), text=en, anchor='w', fill=CYAN if sel else FAINT, font=(NUM, 7))
-        y = h - px(130)
-        # author + project links: quiet, but always there (click opens the browser)
-        side.create_text(px(6), y - px(40), text='作者  ' + about.AUTHOR, anchor='w', fill=FAINT, font=(ZH, 8))
-        hv = cur.get('link')
-        gx = side.create_text(px(6), y - px(20), text='GitHub', anchor='w', fill=CYAN if hv == 'gh' else DIM, font=(NUM, 8), tags='lnk_gh')
-        bx = side.bbox(gx)
-        side.create_text(bx[2] + px(6), y - px(20), text='·', anchor='w', fill=FAINT, font=(NUM, 8))
-        side.create_text(bx[2] + px(16), y - px(20), text='哔哩哔哩', anchor='w', fill=CYAN if hv == 'bili' else DIM, font=(ZH, 8), tags='lnk_bili')
-        lx = px(6)                                          # language: 中 / EN / 日 / 한 (restarts the app)
-        lt = side.create_text(lx, y - px(84), text='语言', anchor='w', fill=FAINT, font=(ZH, 8))
-        lx = max(px(52), side.bbox(lt)[2] + px(10))
-        for code, name in i18n.LANGS:
-            it = side.create_text(lx, y - px(84), text=name, anchor='w', fill=CYAN if code == i18n.LANG else DIM,
-                                  font=(ZH, 8, 'bold' if code == i18n.LANG else 'normal'), tags=('lang', 'lang_' + code))
-            lx = side.bbox(it)[2] + px(9)
-        side.create_text(px(6), y - px(60), text=f'v{about.VERSION}', anchor='w', fill=FAINT, font=(NUM, 8))
-        side.create_text(px(52), y - px(60), text='检查更新', anchor='w', fill=CYAN if hv == 'upd' else DIM, font=(ZH, 8), tags='lnk_upd')
+        y = h - px(92)
+        # status that matters while playing, then author + project links: quiet, but always there
         side.create_line(px(4), y, px(150), y, fill=LINE)
-        side.create_text(px(6), y + px(16), text='系统', anchor='w', fill=FAINT, font=(ZH, 8))
-        side.create_text(px(6), y + px(38), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='clock')
-        side.create_text(px(6), y + px(58), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='up')
-        side.create_text(px(6), y + px(78), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='mode')
-        side.create_text(px(6), y + px(98), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='battery')
+        side.create_text(px(6), y + px(18), text=cur.get('up_t', ''), anchor='w', fill=DIM, font=(ZH, 8), tags='up')
+        side.create_text(px(6), y + px(38), text=cur.get('bat_t', ''), anchor='w', fill=cur.get('bat_c', DIM), font=(ZH, 8), tags='battery')
+        side.create_text(px(6), y + px(58), text='作者  ' + about.AUTHOR, anchor='w', fill=FAINT, font=(ZH, 8))
+        hv = cur.get('link')
+        gx = side.create_text(px(6), y + px(78), text='GitHub', anchor='w', fill=CYAN if hv == 'gh' else DIM, font=(NUM, 8), tags='lnk_gh')
+        bx = side.bbox(gx)
+        side.create_text(bx[2] + px(6), y + px(78), text='·', anchor='w', fill=FAINT, font=(NUM, 8))
+        side.create_text(bx[2] + px(16), y + px(78), text='哔哩哔哩', anchor='w', fill=CYAN if hv == 'bili' else DIM, font=(ZH, 8), tags='lnk_bili')
     side.bind('<Configure>', draw_side)
 
     def open_link(url):
@@ -941,12 +1034,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             subprocess.Popen(cmd, cwd=os.getcwd())
             root.destroy()
         root.after(300, relaunch)
-    for code, _n in i18n.LANGS:
-        side.tag_bind('lang_' + code, '<Button-1>', lambda e, c=code: set_language(c))
-    side.tag_bind('lang', '<Enter>', lambda e: side.configure(cursor='hand2'))
-    side.tag_bind('lang', '<Leave>', lambda e: side.configure(cursor=''))
-    for tag, key, url in (('lnk_gh', 'gh', about.GITHUB_URL), ('lnk_bili', 'bili', about.BILIBILI_URL), ('lnk_upd', 'upd', None)):
-        side.tag_bind(tag, '<Button-1>', (lambda e: check_update(manual=True)) if url is None else (lambda e, u=url: open_link(u)))
+    for tag, key, url in (('lnk_gh', 'gh', about.GITHUB_URL), ('lnk_bili', 'bili', about.BILIBILI_URL)):
+        side.tag_bind(tag, '<Button-1>', lambda e, u=url: open_link(u))
         # recolour only (a full redraw would recreate the item under the pointer -> Enter/Leave loop)
         side.tag_bind(tag, '<Enter>', lambda e, k=key, t=tag: (cur.update(link=k), side.configure(cursor='hand2'), side.itemconfigure(t, fill=CYAN)))
         side.tag_bind(tag, '<Leave>', lambda e, t=tag: (cur.update(link=None), side.configure(cursor=''), side.itemconfigure(t, fill=DIM)))
@@ -954,6 +1043,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     side.bind('<Leave>', lambda e: (cur.update(hover=None), draw_side()))
 
     def show(name):
+        name = {'适配库': '游戏适配'}.get(name, name)
         cur['p'] = name
         for n, f in pages.items():
             f.pack_forget()
@@ -961,6 +1051,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     side.bind('<Button-1>', lambda e: show(NAV[e.y // px(62)][0]) if e.y < len(NAV) * px(62) else None)
     root._show = show                       # page switch hook (screenshots / scripted demos)
     root._start = start; root._switch_scene = switch_scene
+    root._hooks = {}                        # (scripted checks)
+    root._pages = [n for n, _e, _i in NAV]
 
     def page(name, scroll=False):
         if not scroll:
@@ -1002,13 +1094,37 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     # ---- 总览
     pg = page('总览')
+    NB = mix(BG, CYAN, 0.08)
+    nextbar = tk.Frame(pg, bg=NB, highlightthickness=1, highlightbackground=LINE2)
+    next_lb = tk.Label(nextbar, text='', bg=NB, fg=TEXT, font=(ZH, 10), anchor='w', justify='left')
+    next_lb.pack(side='left', padx=px(14), pady=px(8), fill='x', expand=True)
+    next_btn = {'act': None}
+    next_buttons = {'deps': NeonButton(nextbar, '一键安装依赖', lambda: install_deps(), w=130, h=30, size=10, color=AMBER, bg=NB),
+                    'repair': NeonButton(nextbar, '修复手柄', lambda: repair_pad_ui(), w=110, h=30, size=10, color=AMBER, bg=NB)}
     row1 = tk.Frame(pg, bg=BG); row1.pack(fill='both', expand=True)
+
+    def update_next(run):
+        need = NEEDS.get(SC('mode'), ())
+        step = next_step(run, pad['state'], [m[1] for m in sysstate['missing'] if m[0] in need]) if (pad['known'] or run) else None
+        if not step or errbar.winfo_ismapped():
+            if nextbar.winfo_ismapped():
+                nextbar.pack_forget()
+            return
+        next_lb.configure(text=step[0], wraplength=max(px(300), nextbar.winfo_width() - px(170)))
+        if next_btn['act'] != step[1]:
+            for b in next_buttons.values():
+                b.pack_forget()
+            if step[1] in next_buttons:                    # 'start' already has the big button at the top right
+                next_buttons[step[1]].pack(side='right', padx=px(10), pady=px(4))
+            next_btn['act'] = step[1]
+        if not nextbar.winfo_ismapped():
+            nextbar.pack(fill='x', pady=(0, px(10)), before=row1)
     p_grip = Panel(row1, '握把音圈', 'GRIP COILS'); p_grip.pack(side='left', fill='y')
     gm = GripMeter(p_grip.body); gm.pack(padx=px(6), pady=px(4), expand=True)
     p_scope = Panel(row1, '触感波形', 'WAVEFORM'); p_scope.pack(side='left', fill='both', expand=True, padx=px(10))
     scope = Scope(p_scope.body); scope.pack(fill='both', expand=True, pady=px(4))
     sb = tk.Frame(p_scope.body, bg=PANEL); sb.pack(fill='x')
-    NeonButton(sb, '测试握把触感', test, w=140, h=32, size=10).pack(side='left')
+    test_btn = NeonButton(sb, '测试握把触感', test, w=140, h=32, size=10); test_btn.pack(side='left')
     lvl_lb = tk.Label(sb, text='', bg=PANEL, fg=DIM, font=(MONO, 9)); lvl_lb.pack(side='right')
     p_trig = Panel(row1, '自适应扳机', 'TRIGGERS', accent=MAG); p_trig.pack(side='left', fill='y')
     tg_row = tk.Frame(p_trig.body, bg=PANEL); tg_row.pack(pady=px(4), expand=True)
@@ -1016,25 +1132,26 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     tk.Label(p_trig.body, text='外圈 = 按压深度　内圈 = 扳机震动', bg=PANEL, fg=FAINT, font=(ZH, 8)).pack()
 
     row2 = tk.Frame(pg, bg=BG); row2.pack(fill='x', pady=(px(10), px(10)))
+    p_ev = Panel(row2, '事件特调', 'EVENT FX', accent=AMBER); p_ev.pack(side='right', fill='both', padx=(px(10), 0))
     p_info = Panel(row2, '链路状态', 'LINK'); p_info.pack(side='left', fill='both', expand=True)
     info = {k: InfoRow(p_info.body, k) for k in ('工作方式', '声源', '虚拟手柄', '扬声器', '场景', '游戏专属', '前台', '丢块')}
     for w_ in info.values(): w_.pack(fill='x', pady=px(3))
-    p_ww = Panel(row2, '鸣潮技能识别', 'WW VISION', accent=GREEN); p_ww.pack(side='left', fill='y', padx=px(10))
+    p_ww = Panel(row2, '鸣潮技能识别', 'WW VISION', accent=GREEN)
     hexes = SkillHex(p_ww.body); hexes.pack(pady=px(6))
-    p_ev = Panel(row2, '事件特调', 'EVENT FX', accent=AMBER); p_ev.pack(side='left', fill='both', expand=True)
     ev_box = tk.Text(p_ev.body, bg=PANEL, fg=TEXT, font=(ZH, 9), relief='flat', height=7, width=26, bd=0, highlightthickness=0, state='disabled', cursor='arrow')
-    ev_box.pack(fill='both', expand=True); ev_box.tag_configure('t', foreground=FAINT); ev_box.tag_configure('n', foreground=AMBER)
+    ev_box.configure(width=24); ev_box.pack(fill='both', expand=True); ev_box.tag_configure('t', foreground=FAINT); ev_box.tag_configure('n', foreground=AMBER)
     ev_state = {'last': None}
+    ev_box.configure(state='normal'); ev_box.insert('1.0', tr('影之刃零、鸣潮里触发的事件会显示在这里。'), 't'); ev_box.configure(state='disabled')
 
     # ---- 游戏: 鸣潮 / 影之刃零 / 通用 / 沉浸模式 / 系统检查
-    gp = page('适配库', scroll=True); lock_note(gp)
+    gp = page('游戏适配', scroll=True); lock_note(gp)
     grid_view = tk.Frame(gp, bg=BG); grid_view.pack(fill='x')
     details = {}
 
     def detail(key, title, accent):
         f = tk.Frame(gp, bg=BG); details[key] = f
         hd = tk.Frame(f, bg=BG); hd.pack(fill='x', pady=(0, px(8)))
-        NeonButton(hd, '‹  返回适配库', show_grid, w=140, h=34, size=10, bg=BG).pack(side='left')
+        NeonButton(hd, '‹  返回游戏适配', show_grid, w=150, h=34, size=10, bg=BG).pack(side='left')
         tk.Label(hd, text=title + '  ·  设置', bg=BG, fg=accent, font=(ZH, 13, 'bold')).pack(side='left', padx=px(14))
         return f
 
@@ -1046,7 +1163,13 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         grid_view.pack_forget()
         for f in details.values(): f.pack_forget()
         details[key].pack(fill='x')
-    root._detail = show_detail              # (scripted screenshots)
+
+    def open_detail(key):                   # (scripted screenshots)
+        if key in SCENES:
+            V['scene'].set(key); show('设置')
+        else:
+            show('游戏适配'); show_detail(key)
+    root._detail = open_detail; root._detail_keys = list(SCENES) + ['鸣潮', '影之刃零']
 
     pg = None
 
@@ -1060,7 +1183,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     Toggle(p.body, '鸣潮专属调校', V['game_profiles'], '在前台时自动切换：原生震动降到 60%、握把风格改为细节丰富', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '技能识别（读屏 + OCR）', V['ww_vision'], '识别手柄界面 L2 / R2 技能按钮的冷却数字：大招就绪时 R2 变成「咔哒」武器扳机，声骸就绪时 L2 有阻力', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '扳机按到咔哒点才释放', V['ww_click_gate'], '技能就绪时，扳机要按过咔哒点游戏才收到按键，不会误放技能（仅原生透传）', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
-    Toggle(p.body, '鸣潮事件特调', V['ww_fx'], '大招、声骸释放和共鸣回路特殊技时：握把专属震动（扬声器不做事件适配，按原声播放）', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
+    Toggle(p.body, '鸣潮事件特调', V['ww_fx'], '大招、声骸释放和共鸣回路特殊技时：握把专属震动（扬声器不做事件适配，按全部游戏声播放）', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
 
     p = module('影之刃零', 'PHANTOM BLADE ZERO', MAG, '需要另装事件记录 mod（PS5EventLog，发布包「影之刃零事件mod」文件夹）。mod 只记录事件，不改变游戏行为。')
     Toggle(p.body, '影之刃零事件特调', V['pbz_fx'], '格挡 / 精准格挡 / 完美格挡 / 完美闪避 / 受击 / 破防 / 处决分别给不同的握把、扳机和扬声器反馈', color=MAG, wrap=820).pack(fill='x', pady=px(4))
@@ -1140,18 +1263,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     root.after(1500, pbz_check)
     root.after(1200, lambda: threading.Thread(target=lambda: pbz_auto(quiet=True), daemon=True).start())
 
-    p = module('通用游戏', 'GENERAL', CYAN, '没有专门适配的游戏也能用：在「游戏」场景下自动截前台游戏的声音转成触感。下面是对所有游戏生效的设置。')
-    fr = tk.Frame(p.body, bg=PANEL); fr.pack(fill='x', pady=px(4))
-    tk.Label(fr, text='只在这个游戏在前台时工作', bg=PANEL, fg=TEXT, font=(ZH, 10)).pack(side='left')
-    tk.Entry(fr, textvariable=V['foreground_exe'], width=30, bg=PANEL2, fg=CYAN, insertbackground=CYAN, relief='flat', font=(MONO, 10),
-             highlightthickness=1, highlightbackground=LINE2, highlightcolor=CYAN).pack(side='left', padx=px(12), ipady=px(4))
-    tk.Label(fr, text='exe 名，留空 = 始终工作', bg=PANEL, fg=FAINT, font=(ZH, 9)).pack(side='left')
-    Toggle(p.body, '录制调校数据', V['record_native'], '原生透传时把游戏的音圈强度、扳机指令和鸣潮识别结果记到 traces 文件夹，反馈问题时附上它', wrap=820).pack(fill='x', pady=px(4))
-
     SCENE_INFO = {
         '游戏': (CYAN, 'impact', '玩游戏：只把打击、碰撞、爆炸变成触感；支持 PS5 手柄的游戏保留原生扳机和音圈；鸣潮、影之刃零有专属适配。'),
-        '影院': (AMBER, 'cinema', '看电影 / 剧集：低频隆隆、爆炸厚重；扬声器播放原声。不需要虚拟手柄，自动截播放器或浏览器的声音。'),
-        '音乐': (MAG, 'rhythm', '听音乐 / 音游：握把和扳机跟着鼓点律动；扬声器可播放原声。也适合给没有手柄震动的游戏「加氛围」。'),
+        '影院': (AMBER, 'cinema', '看电影 / 剧集：低频隆隆、爆炸厚重；扬声器播放全部声音。不需要虚拟手柄，自动截播放器或浏览器的声音。'),
+        '音乐': (MAG, 'rhythm', '听音乐 / 音游：握把和扳机跟着鼓点律动；扬声器可播放全部声音。也适合给没有手柄震动的游戏「加氛围」。'),
     }
     ROUTING = [('原生透传', '原生透传', '', '游戏看到虚拟PS5手柄：保留原生自适应扳机和音圈触感，再叠加声音触感。适合支持PS5手柄的游戏。'),
                ('接管', '接管', '', '游戏看到虚拟PS4手柄：游戏震动与声音触感融合。原生透传不可用时的备用。'),
@@ -1177,8 +1292,16 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 msgs.put('校准失败：没有收到足够的手柄数据。')
         root.after(2100, done)
 
-    def pad_panel():
-        f = details['游戏']
+    def reset_caps():
+        r = runner['r']
+        if running() and getattr(r, 'caps', None) is not None:
+            r.caps.reset()
+        else:
+            from game_caps import GameCaps
+            GameCaps().reset()
+        msgs.put('已清除让位记录，游戏用到时会重新记录。')
+
+    def pad_panel(f):
         pnl = Panel(f, '手柄输入', 'INPUT', accent=CYAN); pnl.pack(fill='x', pady=(0, px(10)))
         Slider(pnl.body, '左摇杆死区', V['stick_dz_l'], 0, 30).pack(fill='x', pady=px(2))
         Slider(pnl.body, '右摇杆死区', V['stick_dz_r'], 0, 30).pack(fill='x', pady=px(2))
@@ -1188,20 +1311,55 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         Toggle(pnl.body, '左右握把对调', V['swap_grips'], '觉得左右触感反了时打开', wrap=820).pack(fill='x', pady=px(3))
         Toggle(pnl.body, '触感不随系统音量变化', V['volume_comp'], '调低系统音量时补偿系统混音的触感（实验性，按进程截音不受音量影响）', wrap=820).pack(fill='x', pady=px(3))
 
+    settings_page = page('设置', scroll=True)
+    scene_frames = {}
+    adv_state = {'open': bool(cfg.get('adv_open', False)), 'views': []}
+
+    def set_advanced(opened):
+        adv_state['open'] = opened; cfg['adv_open'] = opened
+        for frame, btn in adv_state['views']:
+            btn.config_look(text='高级设置  ▴' if opened else '高级设置  ▾')
+            if opened:
+                frame.pack(fill='x', after=btn)
+            else:
+                frame.pack_forget()
+
+    def show_scene_settings(*_a):
+        for fr_ in scene_frames.values():
+            fr_.pack_forget()
+        scene_frames[V['scene'].get()].pack(fill='x')
+
+    def reset_scene(sc, btn, st={'armed': None}):
+        """Two clicks, no pop-up: the first one asks, the second one resets this scene."""
+        if st['armed'] != sc:
+            st['armed'] = sc; btn.config_look(text='再点一次确认', color=AMBER)
+            def disarm():
+                if st['armed'] == sc:
+                    st['armed'] = None; btn.config_look(text='恢复默认', color=CYAN)
+            root.after(3000, disarm)
+            return
+        st['armed'] = None; btn.config_look(text='恢复默认', color=CYAN)
+        for k, v in SCENE_DEF[sc].items():
+            if not k.startswith('custom_') and k in SV[sc]:
+                SV[sc][k].set(v * 100 if k in PCT else v)
+        msgs.put(f'「{sc}」场景已恢复默认设置。')
+
     def scene_settings(sc):
         acc, _art, tag = SCENE_INFO[sc]; sv = SV[sc]
-        f = detail(sc, sc + '场景', acc)
+        f = tk.Frame(settings_page, bg=BG); scene_frames[sc] = f
+        hd = tk.Frame(f, bg=BG); hd.pack(fill='x', pady=(0, px(4)))
+        tk.Label(hd, text=sc + '场景', bg=BG, fg=acc, font=(ZH, 13, 'bold')).pack(side='left')
+        rb = NeonButton(hd, '恢复默认', lambda: reset_scene(sc, rb), w=110, h=30, size=10, bg=BG); rb.pack(side='right')
         tk.Label(f, text=tag, bg=BG, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(940)).pack(fill='x', pady=(0, px(8)))
-        pnl = Panel(f, '连接方式', 'ROUTING', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
-        rec = '原生透传' if sc == '游戏' else '普通'
-        ModeCards(pnl.body, sv['mode'], [(v, t, '推荐' if v == rec else '', d) for v, t, _g, d in ROUTING]).pack(fill='x', pady=(px(4), px(8)))
         if sc == '游戏':
-            fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
-            tk.Label(fr, text='虚拟手柄时触感来源', bg=PANEL, fg=TEXT, font=(ZH, 10)).pack(side='left', padx=(0, px(14)))
-            Segmented(fr, sv['fusion'], ('融合', '仅游戏震动', '仅声音触感'), cell=124, rec='融合').pack(side='left')
-            tk.Label(pnl.body, text='仅游戏震动 = 完全用游戏自己设计的原生触感（索尼第一方游戏推荐）；融合 = 原生触感 + 声音触感。',
-                     bg=PANEL, fg=FAINT, font=(ZH, 9), anchor='w').pack(fill='x', pady=(px(4), 0))
+            pnl = Panel(f, '预设', 'PRESET', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
+            preset = tk.StringVar(); bind_presets(preset, sv)
+            Segmented(pnl.body, preset, ('声感', '全感', '自定义'), cell=124, rec='全感').pack(anchor='w')
+            tk.Label(pnl.body, text='声感 = 不用游戏的震动和扳机，只用本软件由声音生成的，扬声器放全部游戏声；全感 = 游戏效果和声音触感一起，游戏支持的扬声器和扳机交给游戏；自定义 = 你自己的组合，在扬声器和高级设置里调，会自动记住。',
+                     bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(4), 0))
+        # what people change most, first
         cols = tk.Frame(f, bg=BG); cols.pack(fill='x', pady=(0, px(10)))
+        style_pnl = Panel(cols, '风格', 'PROFILE', accent=acc); style_pnl.pack(side='right', fill='both', padx=(px(10), 0))
         pnl = Panel(cols, '触感', 'HAPTICS', accent=acc); pnl.pack(side='left', fill='both', expand=True)
         Slider(pnl.body, '握把强度', sv['grip_gain']).pack(fill='x', pady=px(2))
         Slider(pnl.body, '扳机强度', sv['trigger_gain'], color=MAG).pack(fill='x', pady=px(2))
@@ -1215,12 +1373,28 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             Slider(pnl.body, '鼓点（双手握把）', V['music_kick'], color=MAG).pack(fill='x', pady=px(2))
             Slider(pnl.body, '踩镲点触（右手轻快）', V['music_tick'], color=MAG).pack(fill='x', pady=px(2))
             Slider(pnl.body, '扳机律动（手指压着扳机才感觉得到）', V['music_trigger'], color=MAG).pack(fill='x', pady=px(2))
-        pnl = Panel(cols, '风格', 'PROFILE', accent=acc); pnl.pack(side='left', fill='both', expand=True, padx=(px(10), 0))
+        pnl = style_pnl
         tk.Label(pnl.body, text='握把风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['grip_profile'], GRIP_PROFILES, cell=116, rec='均衡').pack(anchor='w', pady=(px(4), px(10)))
         tk.Label(pnl.body, text='扳机风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['trigger_profile'], TRIGGER_PROFILES, cell=116, color=MAG, rec='均衡冲击').pack(anchor='w', pady=(px(4), px(10)))
         Toggle(pnl.body, '忽略中置声道', sv['skip_center'], '5.1/7.1 时对白（中置）不触发震动', wrap=300).pack(fill='x', pady=px(4))
+        Toggle(pnl.body, '纯人声时不震', sv['voice_gate'], '只有台词、旁白时压掉声音触感；同时有打击、爆炸就不压。不影响游戏原生震动', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
+        pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
+        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
+        tk.Label(fr, text='播放', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
+        Segmented(fr, sv['speaker_mode'], SPEAKER_MODES, cell=124, color=BLUE, rec='特殊事件' if sc == '游戏' else '全部游戏声').pack(side='left')
+        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(px(8), 0))
+        tk.Label(fr, text='音色', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
+        Segmented(fr, sv['speaker_eq'], SPEAKER_EQS, cell=124, color=BLUE, rec='原味' if sc == '游戏' else '低音饱满').pack(side='left')
+        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(px(8), 0))
+        tk.Label(fr, text='输出到', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
+        Segmented(fr, sv['speaker_output'], ('扬声器', '耳机孔'), cell=124, color=BLUE, rec='扬声器').pack(side='left')
+        Slider(pnl.body, '扬声器音量', sv['speaker_volume'], 0, 100, color=BLUE).pack(fill='x', pady=(px(8), 0))
+        tk.Label(pnl.body, justify='left', anchor='w', bg=PANEL, fg=DIM, font=(ZH, 9), wraplength=px(900), text=(
+            '全部游戏声：手柄扬声器播放完整的游戏声音，并且覆盖游戏自己发给手柄扬声器的声音。音色：原味 = 不改；低音饱满 = 用倍频补出小喇叭放不出的低音；人声清晰 = 突出人声和金属声。\n'
+            '特殊事件：不接管游戏自己的手柄扬声器，游戏发什么就原样播放什么（要用原生透传）；影之刃零同时保留事件适配。游戏第一次发声前无法判断，所以可能先放一下全部游戏声。没用手柄扬声器的游戏、电影、音乐会自动按全部游戏声播放。\n'
+            '手柄插了耳机时从耳机出声。')).pack(fill='x', pady=(px(8), 0))
         pnl = Panel(f, '操作触感', 'CONTROLS', accent=GREEN); pnl.pack(fill='x', pady=(0, px(10)))
         grid = tk.Frame(pnl.body, bg=PANEL); grid.pack(fill='x')
         for i, (text, key, sub_text) in enumerate((('按键', 'button_haptics', '按下和松开时，对应一侧的握把轻点一下'),
@@ -1230,31 +1404,50 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             grid.columnconfigure(i % 2, weight=1, uniform='ctl')
             Toggle(grid, text, sv[key], sub_text, wrap=380, color=GREEN).grid(row=i // 2, column=i % 2, sticky='ew', padx=(0, px(14)), pady=px(3))
         Slider(pnl.body, '操作触感强度', sv['button_gain'], color=GREEN).pack(fill='x', pady=(px(6), px(2)))
-        pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
-        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(0, px(8)))
-        tk.Label(fr, text='输出到', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
-        Segmented(fr, sv['speaker_output'], ('扬声器', '耳机孔'), cell=124, color=BLUE, rec='扬声器').pack(side='left')
-        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
-        tk.Label(fr, text='播放', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
-        Segmented(fr, sv['speaker_mode'], SPEAKER_MODES, cell=124, color=BLUE, rec='原声').pack(side='left')
-        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(px(8), 0))
-        tk.Label(fr, text='音色', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
-        Segmented(fr, sv['speaker_eq'], SPEAKER_EQS, cell=124, color=BLUE, rec='原味' if sc == '游戏' else '低音饱满').pack(side='left')
-        Slider(pnl.body, '扬声器音量', sv['speaker_volume'], 0, 100, color=BLUE).pack(fill='x', pady=(px(8), 0))
-        tk.Label(pnl.body, justify='left', anchor='w', bg=PANEL, fg=DIM, font=(ZH, 9), wraplength=px(900), text=(
-            '原声：手柄扬声器完整播放声音，不做动态处理，只按「音色」做 EQ。原味 = 不改；低音饱满 = 用倍频补出小喇叭放不出的低音；人声清晰 = 突出人声和金属声。\n'
-            '特殊事件：像索尼第一方游戏那样，平时安静，只在关键时刻出声。支持手柄扬声器的游戏（如影之刃零）在原生透传下直接播放游戏自带的手柄扬声器音效，和 PS5 上一样；'
-            '其他游戏、电影、音乐里会自动按「原声」播放。\n'
-            '两种模式下，关键时刻都会按事件换音色并放大一段。手柄插了耳机时从耳机出声。')).pack(fill='x', pady=(px(8), 0))
-        pnl = Panel(f, '声音来源', 'SOURCE', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
+        # rarely touched: folded away, the choice is remembered
+        adv_btn = NeonButton(f, '高级设置  ▾', lambda: set_advanced(not adv_state['open']), w=150, h=36, size=10, bg=BG)
+        adv_btn.pack(anchor='w', pady=(0, px(10)))
+        adv = tk.Frame(f, bg=BG); adv_state['views'].append((adv, adv_btn))
+        pnl = Panel(adv, '连接方式', 'ROUTING', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
+        rec = '原生透传' if sc == '游戏' else '普通'
+        ModeCards(pnl.body, sv['mode'], [(v, t, '推荐' if v == rec else '', d) for v, t, _g, d in ROUTING]).pack(fill='x', pady=(px(4), px(8)))
+        if sc == '游戏':
+            for label, key, values, rec_v, col in (('握把', 'fusion', ('叠加', '替换', '纯用游戏'), '叠加', CYAN),
+                                                   ('扳机', 'trigger_mode', ('自动', '叠加', '替换', '纯用游戏'), '自动', MAG)):
+                fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(0, px(6)))
+                tk.Label(fr, text=label, bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
+                Segmented(fr, sv[key], values, cell=124, color=col, rec=rec_v).pack(side='left')
+            tk.Label(pnl.body, text='叠加 = 游戏效果和本软件效果一起；替换 = 只用本软件的；纯用游戏 = 关掉本软件的，只用游戏自己的。握把选纯用游戏时，事件特调也一起关掉；扬声器选特殊事件时，游戏不发声手柄就安静。\n'
+                     '扳机同一时间只能跑一个效果，所以叠加时，游戏在用的那一侧归游戏，另一侧归本软件。自动 = 游戏发过扳机效果就交给游戏并记住，没发过就用本软件的。',
+                     bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(2), px(8)))
+            NeonButton(pnl.body, '重置让位记录', reset_caps, w=150, h=32, size=10).pack(anchor='w')
+        pnl = Panel(adv, '高级选项：左右强度', 'BALANCE', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
+        grid = tk.Frame(pnl.body, bg=PANEL); grid.pack(fill='x')
+        for i, (text, key, col) in enumerate((('左握把', 'grip_left_gain', CYAN), ('右握把', 'grip_right_gain', CYAN),
+                                              ('左扳机', 'trigger_left_gain', MAG), ('右扳机', 'trigger_right_gain', MAG))):
+            grid.columnconfigure(i % 2, weight=1, uniform='bal')
+            Slider(grid, text, sv[key], color=col).grid(row=i // 2, column=i % 2, sticky='ew', padx=(0, px(14)), pady=px(2))
+        tk.Label(pnl.body, text='握把滑块调这一侧的全部震动；扳机滑块只调本软件生成的扳机震动，游戏原生的扳机效果保持原样。',
+                 bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(4), 0))
+        pnl = Panel(adv, '声音来源', 'SOURCE', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
         Segmented(fr, sv['capture'], ('自动', '系统混音'), cell=124, rec='自动').pack(side='left')
         tk.Label(fr, text=('自动：先截已适配的游戏，其次截前台正在出声的程序' if sc == '游戏' else '自动：截当前正在出声的播放器 / 浏览器 / 音乐软件') +
                  '（按进程截音，开着杜比全景声也能用）；系统混音：截整个系统的声音。',
-                 bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(680)).pack(side='left', padx=px(14))
+                 bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(620)).pack(side='left', padx=px(14))
+        if sc == '游戏':
+            pad_panel(adv)
     for sc in SCENES:
         scene_settings(sc)
-    pad_panel()
+    set_advanced(adv_state['open'])
+    show_scene_settings()
+    root._hooks.update(set_advanced=set_advanced, show_error=show_error, hide_error=hide_error, scene_sw=scene_sw, side=side, nav_h=px(62),
+                       errbar=errbar, nextbar=lambda: nextbar, frames=scene_frames, adv=adv_state, pad=pad, bigbtn=bigbtn, stop=stop, running=running)
+
+    def scene_changed(*_a):
+        show_scene_settings()
+        msgs.put(f"已切换到「{V['scene'].get()}」场景" + ('（已实时生效）' if running() else '，点右上角「启动」开始。'))
+    V['scene'].trace_add('write', scene_changed)
 
     # ---- the library grid
     games_on = {'ww': False, 'pbz': False}
@@ -1269,15 +1462,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def toggle(var):
         var.set(not var.get())
-    row = section('使用场景', 'SCENES  ·  三选一，点击切换（运行中会自动重启），齿轮里是这个场景的全部设置')
     cards = {}
-    for key, sub in (('游戏', '触感 · 原生扳机 · 游戏专属'), ('影院', '低频隆隆 · 扬声器原声'), ('音乐', '鼓点律动 · 扬声器原声')):
-        acc, art, _t = SCENE_INFO[key]
-        cards[key] = GameCard(row, key + '场景', sub, art=art, accent=acc, on_text='使用中', off_text='点击切换',
-                              is_on=lambda k=key: V['scene'].get() == k,
-                              badge=(lambda k=key: ('运行中', GREEN) if (running() and V['scene'].get() == k) else None),
-                              on_click=lambda k=key: switch_scene(k), on_gear=lambda k=key: show_detail(k))
-        cards[key].pack(side='left', padx=(0, px(16)))
     row = section('游戏适配', 'ADAPTATIONS  ·  游戏场景下生效，点击开启 / 关闭，齿轮进入设置')
     cards['鸣潮'] = GameCard(row, '鸣潮', '读屏技能识别 · 自适应扳机 · 事件特调', art='impact', accent=GREEN,
                            is_on=lambda: V['ww_enabled'].get(), badge=lambda: ('运行中', GREEN) if games_on['ww'] else None,
@@ -1285,10 +1470,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     cards['影之刃零'] = GameCard(row, '影之刃零', '格挡 · 闪避 · 受击事件特调', art='impact', accent=MAG,
                              is_on=lambda: V['pbz_fx'].get(), badge=lambda: ('运行中', GREEN) if games_on['pbz'] else None,
                              on_click=lambda: toggle(V['pbz_fx']), on_gear=lambda: show_detail('影之刃零'))
-    cards['通用'] = GameCard(row, '通用游戏', '所有游戏 · 声音触感 · 原生透传', art='general', accent=CYAN,
-                           is_on=lambda: True, on_text='始终开启', on_click=lambda: show_detail('通用游戏'), on_gear=lambda: show_detail('通用游戏'))
-    for c in ('鸣潮', '影之刃零', '通用'):
+    for c in ('鸣潮', '影之刃零'):
         cards[c].pack(side='left', padx=(0, px(16)))
+    tk.Label(grid_view, text='其他游戏不用设置，打开就能用：在「游戏」场景下自动把前台游戏的声音转成触感，支持 PS5 手柄的游戏走原生透传。',
+             bg=BG, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(940)).pack(fill='x')
     def redraw_cards(*a):
         for c in cards.values(): c.redraw()
     for k in ('ww_enabled', 'pbz_fx', 'scene'):
@@ -1329,9 +1514,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 pass
             time.sleep(3)
     threading.Thread(target=watch_games, daemon=True).start()
-    pg = grid_view
+    pg = page('系统', scroll=True)
 
-    p = Panel(pg, '系统检查', 'SYSTEM', accent=AMBER); p.pack(fill='x')
+    p = Panel(pg, '系统检查', 'SYSTEM', accent=AMBER); p.pack(fill='x', pady=(0, px(10)))
     dep_lb = tk.Label(p.body, text='检查中…', bg=PANEL, fg=TEXT, font=(ZH, 10), justify='left', anchor='w'); dep_lb.pack(fill='x')
     fr = tk.Frame(p.body, bg=PANEL); fr.pack(fill='x', pady=(px(8), 0))
     intel_lb = tk.Label(p.body, text='', bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(900))
@@ -1358,7 +1543,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         dep_lb.configure(text='驱动依赖：' + txt, fg=TEXT if not miss else AMBER)
         intel_lb.configure(text=itxt, fg=AMBER if intel_on else DIM)
         if miss:
-            add_log('缺少依赖：' + '、'.join(m[1] for m in miss) + '。点「适配库」页的「一键安装依赖」，或运行软件旁边的「依赖.exe」。')
+            add_log('缺少依赖：' + '、'.join(m[1] for m in miss) + '。点「系统」页的「一键安装依赖」，或运行软件旁边的「依赖.exe」。')
             if auto and not sysstate['asked']:                 # first open: offer the install right away
                 sysstate['asked'] = True; install_deps()
 
@@ -1385,7 +1570,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def repair_pad_ui():
         """Crash left the controller hidden / unrecognised: stop, undo every hide, close a leftover virtual pad."""
-        msgs.put('正在修复手柄…')
+        msgs.put('正在修复手柄…'); hide_error()
         if running():
             stop()
 
@@ -1403,6 +1588,26 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     tk.Label(p.body, text='崩溃后手柄插上去电脑或游戏识别不到时，点「修复手柄」：取消对游戏的隐藏、关闭残留的虚拟手柄。软件每次打开也会自动检查一次。',
              bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(8), 0))
     intel_lb.pack(fill='x', pady=(px(8), 0))
+
+    p = Panel(pg, '语言与更新', 'GENERAL'); p.pack(fill='x', pady=(0, px(10)))
+    fr = tk.Frame(p.body, bg=PANEL); fr.pack(fill='x', pady=(0, px(8)))
+    tk.Label(fr, text='语言', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
+    lang_names = {code: name for code, name in i18n.LANGS}
+    lang_var = tk.StringVar(value=lang_names.get(i18n.LANG, ''))
+    Segmented(fr, lang_var, tuple(lang_names.values()), cell=64).pack(side='left')
+    lang_var.trace_add('write', lambda *a: set_language(next(c for c, n in lang_names.items() if n == lang_var.get())))
+    tk.Label(fr, text='切换后软件会自动重启', bg=PANEL, fg=FAINT, font=(ZH, 9)).pack(side='left', padx=px(10))
+    fr = tk.Frame(p.body, bg=PANEL); fr.pack(fill='x')
+    tk.Label(fr, text=f'当前版本 v{about.VERSION}', bg=PANEL, fg=TEXT, font=(ZH, 10)).pack(side='left', padx=(0, px(14)))
+    NeonButton(fr, '检查更新', lambda: check_update(manual=True), w=110, h=32, size=10).pack(side='left')
+
+    p = Panel(pg, '通用设置', 'GENERAL', accent=CYAN); p.pack(fill='x', pady=(0, px(10)))
+    fr = tk.Frame(p.body, bg=PANEL); fr.pack(fill='x', pady=px(4))
+    tk.Label(fr, text='只在这个游戏在前台时工作', bg=PANEL, fg=TEXT, font=(ZH, 10)).pack(side='left')
+    tk.Entry(fr, textvariable=V['foreground_exe'], width=30, bg=PANEL2, fg=CYAN, insertbackground=CYAN, relief='flat', font=(MONO, 10),
+             highlightthickness=1, highlightbackground=LINE2, highlightcolor=CYAN).pack(side='left', padx=px(12), ipady=px(4))
+    tk.Label(fr, text='exe 名，留空 = 始终工作', bg=PANEL, fg=FAINT, font=(ZH, 9)).pack(side='left')
+    Toggle(p.body, '录制调校数据', V['record_native'], '原生透传时把游戏的音圈强度、扳机指令和鸣潮识别结果记到 traces 文件夹，反馈问题时附上它', wrap=820).pack(fill='x', pady=px(4))
 
     # ---- 日志
     pg = page('日志')
@@ -1431,6 +1636,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         ts = time.strftime('%H:%M:%S')
         log.insert('end', ts + '  ', 't'); log.insert('end', m + '\n', 'e' if ('出错' in m or '失败' in m) else ''); log.see('end')
         fstate['msg'] = m.split('\n')[0][:120]; draw_foot()
+        if m.startswith('已停止。原因：'):
+            show_error(m.split('\n')[0])
         if log_path:                     # same log on disk (traces/app-log.txt) for diagnosis
             try:
                 with open(log_path, 'a', encoding='utf8') as f:
@@ -1438,6 +1645,15 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             except Exception:
                 pass
 
+    def watch_pad():
+        while True:
+            if not demo_mode and not running():
+                try:
+                    pad['state'] = pad_status(); pad['known'] = True
+                except Exception:
+                    pad['known'] = False           # can't tell: never block on that
+            time.sleep(2)
+    threading.Thread(target=watch_pad, daemon=True).start()
     show('总览'); t_start = {'t': None}; last = {'run': None}
     watch_vars()
     MODE_EN = {'原生透传': 'NATIVE', '接管': 'TAKEOVER', 'Xbox': 'XBOX', '普通': 'OVERLAY'}
@@ -1464,23 +1680,29 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 lb.configure(text='')
             if not run:
                 show_banner([])
+                test_btn.pack(side='left')
+            else:
+                test_btn.pack_forget()
         stopping = run and r.stop_ev.is_set()
         if stopping: bigbtn.config_look(text='…  停止中', color=AMBER)
         w = hstate['w']; pulse = 0.5 + 0.5 * math.sin(time.time() * 5)
         if not slow:
             return fast_part(run, s)
         col = AMBER if stopping else (GREEN if run else FAINT)
-        head.itemconfigure('stt', text='停止中' if stopping else (f"运行中 · {cfg.get('scene', '游戏')}场景" if run else f"待机 · {V['scene'].get()}场景"), fill=col)
+        head.itemconfigure('stt', text='停止中' if stopping else ('运行中' if run else '待机'), fill=col)
+        pad_txt = {'usb': '手柄已连接', 'edge': '手柄已连接（Edge）', 'bluetooth': '手柄：蓝牙（不支持）', None: '未检测到手柄'}[pad['state']] if pad['known'] else ''
+        head.itemconfigure('pad', text='手柄使用中' if run else pad_txt, fill=GREEN if run or pad['state'] in ('usb', 'edge') else AMBER)
+        update_next(run)
         d = px(5) + (px(2) * pulse if run else 0); x, y = w - px(196), px(48)
         head.coords('dot', x - d, y - d, x + d, y + d); head.itemconfigure('dot', fill=mix(BG, col, 0.5 + 0.5 * pulse) if run else FAINT)
         # side panel clock
-        side.itemconfigure('clock', text=tr('当前时间') + '  ' + time.strftime('%H:%M:%S'))
         up = int(time.time() - t_start['t']) if t_start['t'] else 0
-        side.itemconfigure('up', text=tr('运行时长') + '  ' + (f'{up // 3600:02d}:{up // 60 % 60:02d}:{up % 60:02d}' if run else '--:--:--'))
-        side.itemconfigure('mode', text=tr('模式') + '  ' + tr(r.start_cfg.get('mode', '') if run else SC('mode')))
+        cur['up_t'] = tr('运行时长') + '  ' + (f'{up // 3600:02d}:{up // 60 % 60:02d}:{up % 60:02d}' if run else '--:--:--')
+        side.itemconfigure('up', text=cur['up_t'])       # kept in cur: the sidebar redraws on every mouse move
         bat = s.get('battery')                              # (percent, state); the level moves in 10 % steps
         bat_txt = '--' if not bat else tr('已充满') if bat[1] == 'full' else f'{bat[0]}%' + ('  ' + tr('充电中') if bat[1] == 'charging' else '')
-        side.itemconfigure('battery', text=tr('手柄电量') + '  ' + bat_txt, fill=MAG if bat and bat[1] == 'discharging' and bat[0] <= 15 else DIM)
+        cur['bat_t'] = tr('手柄电量') + '  ' + bat_txt; cur['bat_c'] = MAG if bat and bat[1] == 'discharging' and bat[0] <= 15 else DIM
+        side.itemconfigure('battery', text=cur['bat_t'], fill=cur['bat_c'])
         # dashboard
         try:
             fg = root.state() != 'iconic'               # minimised: nothing to draw
@@ -1492,13 +1714,13 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             lvl_lb.configure(text=f"OUT {s.get('level', 0.0):4.2f}   NATIVE {max(rum):4.2f}" if run else 'STANDBY')
             m = r.start_cfg.get('mode', '') if run else SC('mode')
             info['工作方式'].set(m + ('（运行中）' if run else '（未启动）'), GREEN if run else DIM)
-            info['声源'].set(('⚠ 截不到游戏声音（关闭空间音效/独占模式）  ' if s.get('silent') else '') + (s.get('source') or '—'),
+            info['声源'].set(('⚠ 截不到游戏声音（关闭空间音效/独占模式）  ' if s.get('silent') else '') + (s.get('source') or '—') + ('  ·  人声中，声音触感已压低' if s.get('voice_closed') else ''),
                            MAG if s.get('silent') else TEXT)
             vp = s.get('vpad')
             info['虚拟手柄'].set(f'输入转发 {vp[0]}  ·  反馈包 {vp[1]}' if vp else '—', CYAN if vp else DIM)
             spv = s.get('speaker', 0.0)
             info['扬声器'].set(('关闭' if cfg.get('speaker_mode') == '关闭' else f"{s.get('spk_eff') or cfg.get('speaker_mode')}"
-                               f"{'（未适配游戏，自动原声）' if cfg.get('speaker_mode') == '特殊事件' and s.get('spk_eff') == '原声' else ''}  ·  电平 {'▮' * int(min(1, spv) * 12):<12} {spv:.2f}  ·  延迟 {s.get('lag_ms', 0)} ms  ·  断流 {s.get('xruns', 0)}") if run else '—',
+                               f"{'（游戏没用手柄扬声器，自动全部游戏声）' if cfg.get('speaker_mode') == '特殊事件' and s.get('spk_eff') == '全部游戏声' else ''}  ·  电平 {'▮' * int(min(1, spv) * 12):<12} {spv:.2f}  ·  延迟 {s.get('lag_ms', 0)} ms  ·  断流 {s.get('xruns', 0)}") if run else '—',
                              CYAN if spv > 0.02 else DIM)
             scn = cfg.get('scene', '游戏') if run else V['scene'].get()
             info['场景'].set(f"{scn}  ·  扬声器 {cfg.get('speaker_mode', '') if run else SC('speaker_mode')}"
@@ -1507,6 +1729,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             info['前台'].set(('工作中' if s.get('active') else '等待目标游戏到前台') if run else '—', TEXT if s.get('active') else AMBER)
             info['丢块'].set(str(s.get('late', 0)) if run else '—', MAG if s.get('late', 0) > 50 else TEXT)
             ww = s.get('ww')
+            if s.get('profile') and not p_ww.winfo_ismapped():     # only while that game is in front
+                p_ww.pack(side='right', fill='y', padx=(px(10), 0), after=p_ev)
+            elif not s.get('profile') and p_ww.winfo_ismapped():
+                p_ww.pack_forget()
             if s.get('profile') and ww:
                 note = f'截图 {ww[1]} 帧' + (f'  错误 {ww[2]}' if ww[2] else '')
                 hexes.update_vals(ww[0], note)
@@ -1514,6 +1740,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 hexes.update_vals(None, '切到鸣潮后自动识别技能栏' if run else '未启动')
             fxl = s.get('fx_last')
             if fxl and fxl != ev_state['last']:
+                if ev_state['last'] is None:
+                    ev_box.configure(state='normal'); ev_box.delete('1.0', 'end'); ev_box.configure(state='disabled')
                 ev_state['last'] = fxl; ev_box.configure(state='normal')
                 ev_box.insert('1.0', fxl + '\n', 'n'); ev_box.insert('1.0', time.strftime('%H:%M:%S  '), 't')
                 ev_box.delete('30.0', 'end'); ev_box.configure(state='disabled')

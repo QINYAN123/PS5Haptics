@@ -22,7 +22,7 @@ import zipfile
 import about
 
 UA = 'PS5Haptics-updater'
-KEEP = ['config.json', 'event_fx.json', 'isolation-restore.json', 'traces', 'covers']   # never overwritten
+KEEP = ['config.json', 'event_fx.json', 'game_caps.json', 'isolation-restore.json', 'traces', 'covers']   # never overwritten
 
 
 def vtuple(v):

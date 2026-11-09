@@ -194,6 +194,180 @@ def test_pad_commands():
     assert h.firmware_info() is None
 
 
+def test_game_caps():
+    import os, tempfile
+    from game_caps import GameCaps
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'caps.json')
+        c = GameCaps(path)
+        assert not c.has('game.exe', 'speaker')
+        assert c.note('game.exe', 'speaker') is True and c.note('game.exe', 'speaker') is False
+        assert c.note('', 'speaker') is False and c.note('explorer.exe', 'trigger') is False and c.note('ps5haptics.exe', 'trigger') is False
+        c.note('game.exe', 'trigger')
+        again = GameCaps(path)                                           # survives a restart
+        assert again.has('game.exe', 'speaker') and again.has('game.exe', 'trigger') and not again.has('other.exe', 'trigger')
+        again.reset()
+        assert not again.has('game.exe', 'speaker') and not os.path.exists(path)
+        with open(path, 'w') as f:
+            f.write('{broken')
+        assert GameCaps(path).data == {}                                 # damaged file: learn again
+
+
+def test_edge_is_found(monkey=None):
+    import ds_hid
+    keep = ds_hid.hid.enumerate
+    try:
+        ds_hid.hid.enumerate = lambda v, p: [{'product_id': 0x0DF2, 'interface_number': 0, 'path': b'audio'}, {'product_id': 0x0DF2, 'interface_number': 3, 'path': b'edge'}]
+        assert ds_hid.find_path() == (b'edge', 0x0DF2)
+        ds_hid.hid.enumerate = lambda v, p: [{'product_id': 0x09CC, 'interface_number': 3, 'path': b'ds4'}]
+        assert ds_hid.find_path() == (None, None)                        # PS4 controllers are not driven by this path
+    finally:
+        ds_hid.hid.enumerate = keep
+    assert gaming_pad_paths(listing([[device(r'HID\VID_054C&PID_0DF2&MI_03\7&1&0&0000')]])) == [r'HID\VID_054C&PID_0DF2&MI_03\7&1&0&0000']
+    assert instance_path(r'\\?\hid#vid_054c&pid_0df2&mi_03#7&1&0&0000#{g}') == r'HID\VID_054C&PID_0DF2&MI_03\7&1&0&0000'
+
+
+def test_tap_buffer():
+    from pad_speaker import PadSpeakerTap
+    t = PadSpeakerTap('x', print, threading.Event())
+    tone = np.full(480, 0.5, np.float32)
+    def push():
+        with t.lock:
+            t.buf.append(tone.copy()); t.n += 480
+    push(); assert not np.any(t.pull(480))                               # below the cushion: wait
+    push(); push(); out = t.pull(480)
+    assert out[0] == 0.0 and out[-1] == 0.5 and 0 < out[48] < 0.5        # starts with a short fade, no click
+    assert np.all(t.pull(480) == 0.5) and np.all(t.pull(480) == 0.5)
+    assert not np.any(t.pull(480)) and t.underruns == 1 and not t.primed  # ran dry: rebuild the cushion
+    for _ in range(300):
+        push()
+    assert t.n >= 480 * 300; t.primed = True; t.pull(480)
+    assert t.n <= 48000 * 0.04                                           # backlog trimmed, latency stays low
+
+
+def test_fuse_modes():
+    from takeover import fuse
+    a = np.full(8, 0.2, np.float32); g = np.full(8, 0.4, np.float32)
+    assert np.allclose(fuse(a, a, g, g, 0.0, '纯用游戏')[0], np.tanh(0.4))
+    assert np.allclose(fuse(a, a, g, g, 0.0, '替换')[0], np.tanh(0.2))
+    assert np.allclose(fuse(a, a, g, g, 0.0, '叠加')[0], np.tanh(0.6))
+    for old, new in (('仅游戏震动', '纯用游戏'), ('仅声音触感', '替换'), ('融合', '叠加')):         # saved settings keep working
+        assert np.allclose(fuse(a, a, g, g, 0.0, old)[0], fuse(a, a, g, g, 0.0, new)[0])
+
+
+def test_presets():
+    import tkinter as tk
+    from ui_scifi import PRESETS, preset_of, bind_presets
+    for name, vals in PRESETS.items():
+        assert preset_of(**vals) == name
+    assert preset_of('叠加', '替换', '特殊事件') == '自定义'
+    root = tk.Tk(); root.withdraw()
+    try:
+        v = lambda x: tk.StringVar(root, x)
+        sv = {'mode': v('普通'), 'fusion': v('叠加'), 'trigger_mode': v('自动'), 'speaker_mode': v('特殊事件'),
+              'custom_fusion': v('叠加'), 'custom_trigger_mode': v('叠加'), 'custom_speaker_mode': v('全部游戏声')}
+        p = tk.StringVar(root); bind_presets(p, sv)
+        now = lambda: (sv['fusion'].get(), sv['trigger_mode'].get(), sv['speaker_mode'].get())
+        assert p.get() == '全感'
+        p.set('声感'); assert now() == ('替换', '替换', '全部游戏声') and sv['mode'].get() == '原生透传'     # 普通 can't drop game effects
+        sv['trigger_mode'].set('纯用游戏'); assert p.get() == '自定义'                                       # changed by hand
+        assert sv['custom_trigger_mode'].get() == '纯用游戏' and sv['custom_fusion'].get() == '替换'
+        p.set('全感'); assert now() == ('叠加', '自动', '特殊事件')
+        assert sv['custom_trigger_mode'].get() == '纯用游戏'                                                 # a preset doesn't overwrite it
+        p.set('自定义'); assert now() == ('替换', '纯用游戏', '全部游戏声') and p.get() == '自定义'             # restored
+        sv['trigger_mode'].set('替换'); assert p.get() == '声感'                                             # happens to match again
+        sv2 = {k: v(x.get()) for k, x in sv.items()}; sv2.update(fusion=v('替换'), trigger_mode=v('叠加'), speaker_mode=v('特殊事件'))
+        p2 = tk.StringVar(root); bind_presets(p2, sv2)                                                      # saved non-preset setup
+        assert p2.get() == '自定义' and sv2['custom_trigger_mode'].get() == '叠加' and sv2['custom_fusion'].get() == '替换'
+    finally:
+        root.destroy()
+
+
+def test_next_step():
+    import hid
+    from ui_scifi import next_step, pad_status
+    assert next_step(True, None, ['x']) is None
+    assert next_step(False, 'usb', ['HidHide'])[1] == 'deps' and 'HidHide' in next_step(False, None, ['HidHide'])[0]
+    assert next_step(False, None, [])[1] == 'repair'
+    assert next_step(False, 'bluetooth', [])[1] is None
+    assert next_step(False, 'usb', [])[1] == 'start' and next_step(False, 'edge', [])[1] == 'start'
+    keep = hid.enumerate
+    try:
+        usb = {'product_id': 0x0CE6, 'interface_number': 3, 'path': b'\\\\?\\hid#vid_054c&pid_0ce6&mi_03#7&1#{g}'}
+        edge = dict(usb, product_id=0x0DF2)
+        bt = {'product_id': 0x0CE6, 'interface_number': -1, 'path': b'\\\\?\\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&0ce6#8#{g}'}
+        for rows, want in (([], None), ([usb], 'usb'), ([edge], 'edge'), ([bt], 'bluetooth'), ([bt, usb], 'usb'),
+                           ([{'product_id': 0x09CC, 'interface_number': 3, 'path': b'ds4'}], None)):
+            hid.enumerate = lambda v, p, r=rows: r
+            assert pad_status() == want, (rows, want)
+    finally:
+        hid.enumerate = keep
+
+
+class ScriptedDetector:
+    def __init__(self): self.p = 0.0
+    def feed(self, mono): return self.p
+
+
+def test_voice_gate():
+    from voice_gate import VoiceGate, VoiceDetector
+    hop = 480
+    quiet = np.full(hop, 0.01, np.float32)
+    t = np.arange(hop) / 48000
+    voice = (0.05 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    d = ScriptedDetector(); g = VoiceGate(d)
+    assert all(g.gain(voice, voice) == 1.0 for _ in range(20))            # no voice: untouched
+    d.p = 0.95
+    for _ in range(40):
+        v = g.gain(voice, voice)
+    assert g.closed and v < 0.15                                          # pure voice: down
+    loud = (0.2 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)        # a much louder sound joins in
+    v = g.gain(loud, loud); assert not g.closed
+    for _ in range(5):
+        v = g.gain(voice, voice)
+    assert v > 0.95 and not g.closed                                      # stays open for a moment
+    for _ in range(80):
+        v = g.gain(voice, voice)
+    assert g.closed                                                       # voice alone again
+    low = (0.05 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
+    g.gain(voice + low, voice + low); assert not g.closed                 # a low thump the voice does not have
+    d = ScriptedDetector(); g = VoiceGate(d); d.p = 0.95
+    for _ in range(40):
+        g.gain(voice, voice)
+    hi = (0.04 * np.sin(2 * np.pi * 8000 * t)).astype(np.float32)
+    g.gain(voice + hi, voice + hi); assert not g.closed                   # metal on metal
+    d = ScriptedDetector(); g = VoiceGate(d); d.p = 0.95
+    g.gain(voice, voice); assert not g.closed                             # one stray window is not speech
+    d.p = 0.0; g.gain(voice, voice); d.p = 0.95; g.gain(voice, voice); assert not g.closed
+    det = VoiceDetector()                                                 # the shipped model loads and runs in real time blocks
+    probs = [det.feed(np.zeros(hop)) for _ in range(20)]
+    assert all(0 <= x <= 1 for x in probs) and max(probs) < 0.5
+
+
+def test_fine_profile():
+    import haptic_dsp as D
+    assert len(D.GRIP_PROFILES['细腻']['bands']) == 6 and max(b[5] for b in D.GRIP_PROFILES['细腻']['bands']) <= 200
+    t = np.arange(48000 * 6) / 48000
+    notes = (0.15 * (np.sin(2 * np.pi * 220 * t) + 0.7 * np.sin(2 * np.pi * 277 * t) + 0.7 * np.sin(2 * np.pi * 330 * t))).astype(np.float32)
+    rng = np.random.default_rng(1)
+    hit = notes.copy()
+    burst = (0.8 * rng.standard_normal(4800) * np.exp(-np.arange(4800) / 480)).astype(np.float32)
+    hit[48000 * 4:48000 * 4 + 4800] += burst
+
+    def run(x, prof):
+        e = D.HapticEngine(prof, '均衡冲击', style='标准'); out = []
+        for i in range(0, len(x) - D.HOP, D.HOP):
+            b = x[i:i + D.HOP]; out.append(e.process(b, b)[0])
+        return np.concatenate(out)
+    y = run(notes, '细腻'); assert np.sqrt(np.mean(y[48000 * 2:] ** 2)) < 0.01                  # steady music stays out
+    y = run(hit, '细腻'); peak = np.max(np.abs(y[48000 * 4:48000 * 4 + 12000])); assert 0.2 < peak <= 1.0  # a hit comes through, within range
+    assert np.max(np.abs(y)) <= 1.0
+    S = np.abs(np.fft.rfft(y[48000 * 4:48000 * 4 + 12000])) ** 2; f = np.fft.rfftfreq(12000, 1 / 48000)
+    fine = S[f >= 90].sum() / S.sum()
+    y0 = run(hit, '均衡'); S0 = np.abs(np.fft.rfft(y0[48000 * 4:48000 * 4 + 12000])) ** 2
+    assert fine > S0[f >= 90].sum() / S0.sum()                                                  # more of it above the body than 均衡
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -253,7 +427,7 @@ def test_live():
 
 
 if __name__ == '__main__':
-    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume()
+    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile()
     print('offline tests ok')
     if '--live' in sys.argv:
         test_live()

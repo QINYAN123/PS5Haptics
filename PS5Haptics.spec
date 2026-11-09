@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = []
 hiddenimports += collect_submodules('scipy.ndimage')
-hiddenimports += collect_submodules('dxcam') + ['comtypes', 'comtypes.client', 'onnxruntime', 'ww_ocr', 'audio_default', 'ui_scifi', 'proc_loopback', 'deps', 'sysfix', 'covers', 'PIL.ImageTk', 'app_icon', 'audio_sessions', 'pad_speaker', 'about', 'updater', 'i18n', 'audio_volume', 'button_haptics', 'pad_input']
+hiddenimports += collect_submodules('dxcam') + ['comtypes', 'comtypes.client', 'onnxruntime', 'ww_ocr', 'audio_default', 'ui_scifi', 'proc_loopback', 'deps', 'sysfix', 'covers', 'PIL.ImageTk', 'app_icon', 'audio_sessions', 'pad_speaker', 'about', 'updater', 'i18n', 'audio_volume', 'button_haptics', 'pad_input', 'game_caps', 'voice_gate']
 import os, onnxocr
 _ocr = os.path.join(os.path.dirname(onnxocr.__file__), 'models', 'ppocrv5')
 ocr_datas = [(os.path.join(_ocr, 'rec', 'rec.onnx'), 'onnxocr/models/ppocrv5/rec'),
@@ -14,7 +14,7 @@ a = Analysis(
     ['ps5_haptics_app.py'],
     pathex=[],
     binaries=[],
-    datas=ocr_datas,
+    datas=ocr_datas + [('models/silero_vad.onnx', 'models')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

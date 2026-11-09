@@ -12,8 +12,10 @@ enumerates devices once.
 """
 import collections
 import ctypes
+import pathlib
 import threading
 import time
+import wave
 from ctypes import POINTER, Structure, byref, c_ushort, c_void_p, c_uint32, c_wchar_p
 from ctypes import wintypes as W
 
@@ -142,14 +144,57 @@ class EndpointLoopback:
         self.capture = None; self.client = None
 
 
+class SpeakerClip:
+    """Keeps a short recording of what the game sends to the pad speaker (for judging sound problems)."""
+    SECONDS = 60
+
+    def __init__(self, folder):
+        self.wav = None; self.left = self.SECONDS * 48000
+        self.folder = pathlib.Path(folder)
+
+    def feed(self, x):
+        if self.left <= 0 or not np.any(x):
+            return
+        if self.wav is None:
+            self.folder.mkdir(exist_ok=True)
+            old = sorted(self.folder.glob('padspk-*.wav'))
+            for f in old[:-2]:                               # keep the last three
+                try: f.unlink()
+                except OSError: pass
+            self.wav = wave.open(str(self.folder / time.strftime('padspk-%Y%m%d-%H%M%S.wav')), 'wb')
+            self.wav.setnchannels(1); self.wav.setsampwidth(2); self.wav.setframerate(48000)
+        part = x[:self.left]
+        self.wav.writeframes((np.clip(part, -1, 1) * 32767).astype(np.int16).tobytes())
+        self.left -= len(part)
+        if self.left <= 0:
+            self.close()
+
+    def close(self):
+        self.left = 0
+        if self.wav is not None:
+            self.wav.close(); self.wav = None
+
+
+def game_on_pad(exe):
+    """Is this program itself playing sound on a DualSense endpoint (the virtual pad's or the real one)?"""
+    from audio_sessions import playing
+    for name, dev in render_endpoints():
+        if 'DualSense' in name:
+            if any(peak > 0.01 and e.lower() == exe for peak, _pid, e in playing(dev)):
+                return True
+    return False
+
+
 class PadSpeakerTap(threading.Thread):
     """Follows the VIRTUAL DualSense's audio endpoint (any 'DualSense' render endpoint except the
     real pad's) and keeps its speaker channels (ch1/ch2 -> mono) in a small jitter buffer."""
+    PRIME = 1440           # 30 ms before playing: capture and the main loop run on separate clocks and stall by 20-30 ms
+    FADE = 96              # 2 ms in after a gap, so restarting does not click
 
     def __init__(self, real_name, log, stop_ev):
         super().__init__(daemon=True)
         self.real_name = real_name; self.log = log; self.stop_ev = stop_ev
-        self.buf = collections.deque(); self.lock = threading.Lock(); self.n = 0
+        self.buf = collections.deque(); self.lock = threading.Lock(); self.n = 0; self.primed = False; self.underruns = 0
         self.source = ''; self.peak = 0.0; self.last_sound = 0.0; self.error = None
 
     def sounding(self, within=1.0):
@@ -161,7 +206,13 @@ class PadSpeakerTap(threading.Thread):
             if self.n > 48000 * 0.12:                       # keep latency low: drop old audio
                 while self.n > 48000 * 0.04 and self.buf:
                     self.n -= len(self.buf.popleft())
-            if self.n < n:
+            fade = False
+            if not self.primed:
+                if self.n < max(n, self.PRIME):
+                    return np.zeros(n, np.float32)
+                self.primed = True; fade = True
+            if self.n < n:                                  # ran dry: wait for a full cushion instead of
+                self.primed = False; self.underruns += 1     # chopping the sound into 10 ms pieces (it buzzes)
                 return np.zeros(n, np.float32)
             parts = []; need = n
             while need:
@@ -171,7 +222,11 @@ class PadSpeakerTap(threading.Thread):
                 else:
                     parts.append(b[:need]); self.buf[0] = b[need:]; need = 0
             self.n -= n
-        return np.concatenate(parts)
+        out = np.concatenate(parts)
+        if fade:
+            k = min(self.FADE, len(out))
+            out = out.copy(); out[:k] *= np.linspace(0.0, 1.0, k, dtype=np.float32)
+        return out
 
     def run(self):
         try: comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)

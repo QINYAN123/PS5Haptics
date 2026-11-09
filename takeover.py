@@ -357,12 +357,16 @@ class RumbleCoil:
         return wl.astype(np.float32), wr.astype(np.float32)
 
 
+FUSION_ALIAS = {'融合': '叠加', '仅声音触感': '替换', '仅游戏震动': '纯用游戏'}    # names used before 2.1.2
+
+
 def fuse(audio_l, audio_r, rum_l, rum_r, level, mode, duck_depth=0.5):
-    """mode: 融合 / 仅游戏震动 / 仅声音触感. In fusion the game rumble leads and audio
+    """mode: 叠加 / 替换 (ours only) / 纯用游戏. When layering, the game rumble leads and audio
     haptics are ducked while it plays (native first)."""
-    if mode == '仅游戏震动':
+    mode = FUSION_ALIAS.get(mode, mode)
+    if mode == '纯用游戏':
         l, r = rum_l, rum_r
-    elif mode == '仅声音触感':
+    elif mode == '替换':
         l, r = audio_l, audio_r
     else:
         duck = 1.0 - duck_depth * min(1.0, level * 2)

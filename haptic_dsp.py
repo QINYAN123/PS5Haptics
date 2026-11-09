@@ -34,6 +34,11 @@ GRIP_PROFILES = {
                  bands=[(450, 2000, -39, 9, 42, 65), (2000, 4200, -40, 8, 20, 115), (4200, 11000, -43, 9, 11, 165)]),
     '干净': dict(floor_pct=35, floor_ms=320, span_hz=260, mask_floor=.25, onset=2.6, accent_db=3,
                bands=[(600, 2200, -31, 7, 32, 65), (2200, 4500, -32, 6, 14, 115), (4500, 11000, -35, 7, 7, 165)]),
+    # more bands and carriers, the top bands lifted so detail is not buried under the body; 'texture' adds the
+    # sound's own low end (only while it is an impact), so different hits differ in weight and not only in strength
+    '细腻': dict(floor_pct=30, floor_ms=280, span_hz=260, mask_floor=.35, onset=2.2, accent_db=5, level=.75, texture=.4,
+               bands=[(500, 1000, -36, 6, 45, 60), (1000, 2000, -37, 8, 34, 80), (2000, 3200, -38, 10, 22, 105),
+                      (3200, 5000, -39, 12, 14, 135), (5000, 8000, -41, 13, 10, 165), (8000, 12000, -42, 14, 7, 190)]),
 }
 TRIGGER_PROFILES = {
     '均衡冲击': dict(floor_pct=20, floor_ms=180, span_hz=260, mask_floor=.45, onset=2.0, accent_db=5,
@@ -228,6 +233,28 @@ class Groove:
         return gl.astype(np.float32), gr.astype(np.float32), tl, tr
 
 
+class TextureLayer:
+    """The sound's own 70-320 Hz waveform, let through only while the impact analysis sees a hit there."""
+    LO, HI = 70, 320
+
+    def __init__(self, amount):
+        self.amount = amount
+        self.sos = butter(2, (self.LO, self.HI), 'bandpass', fs=RATE, output='sos')
+        self.z = sosfilt_zi(self.sos) * 0.0
+        self.a, self.b = int(self.LO / BIN_HZ), max(int(self.LO / BIN_HZ) + 1, int(self.HI / BIN_HZ))
+        self.gate = 0.0; self.rel = math.exp(-HOP / RATE / 0.05)
+
+    def step(self, block, mag, perc, agc, impact):
+        y, self.z = sosfilt(self.sos, block.astype(np.float64), zi=self.z)
+        total = float(np.sum(mag[self.a:self.b] ** 2)) + 1e-12; hit = float(np.sum(perc[self.a:self.b] ** 2))
+        want = min(1.0, max(0.0, (hit / total - 0.25) / 0.5))           # how much of this band is above the sustain floor
+        want *= min(1.0, impact / 0.2)                                  # and the bands above must agree it is a hit: a bass note is not
+        start = self.gate
+        self.gate = want if want > self.gate else max(want, self.gate * self.rel)
+        ramp = np.linspace(start, self.gate, len(y))
+        return (y * ramp * agc * self.amount).astype(np.float32)
+
+
 class HapticEngine:
     """Stereo game audio -> (left wave, right wave, trigger_left 0..1, trigger_right 0..1)."""
 
@@ -240,6 +267,9 @@ class HapticEngine:
         self.ml, self.mr = BandMapper(gp['bands']), BandMapper(gp['bands'])
         self.tml, self.tmr = BandMapper(tp['bands']), BandMapper(tp['bands'])
         self.carriers = np.array([b[5] for b in gp['bands']], float)
+        self.level_scale = gp.get('level', 1.0)
+        self.tex_l = TextureLayer(gp['texture']) if gp.get('texture') else None
+        self.tex_r = TextureLayer(gp['texture']) if gp.get('texture') else None
         self.phase = np.zeros(len(self.carriers))
         self.prev_amp_l = np.zeros(len(self.carriers)); self.prev_amp_r = np.zeros(len(self.carriers))
         self.agc = AutoGain()
@@ -272,6 +302,11 @@ class HapticEngine:
         wl = np.sum(rl * np.sin(ph), axis=0)
         rr, _ = self._synth(ar, self.prev_amp_r)
         wr = np.sum(rr * np.sin(ph + np.pi), axis=0)          # right coil inverted (two hands, not one centred buzz)
+        if self.level_scale != 1.0:
+            wl = wl * self.level_scale; wr = wr * self.level_scale
+        if self.tex_l is not None:                             # the sound's own weight, same user gain and duck as the rest
+            wl = wl + self.tex_l.step(left, ml, sl, g, self.impact) * self.grip_gain * self.duck
+            wr = wr + self.tex_r.step(right, mr, sr, g, self.impact) * self.grip_gain * self.duck
         self.phase = (self.phase + 2 * np.pi * self.carriers * HOP / RATE) % (2 * np.pi)
         self.prev_amp_l, self.prev_amp_r = al, ar
         # trigger envelopes: mostly its own side, 30 % of the centre so centred hits reach both
@@ -289,10 +324,10 @@ class HapticEngine:
         return np.tanh(wl * 1.2).astype(np.float32), np.tanh(wr * 1.2).astype(np.float32), trig
 
 
-SPEAKER_MODES = ('关闭', '原声', '特殊事件')
+SPEAKER_MODES = ('关闭', '全部游戏声', '特殊事件')
 SPEAKER_EQS = ('原味', '低音饱满', '人声清晰')
-SPEAKER_MODE_ALIAS = {'全部游戏声音': '原声', '冲击声': '特殊事件', '仅关键事件': '特殊事件', '仅大招/特殊技': '特殊事件',
-                      '智能增强': '原声'}
+SPEAKER_MODE_ALIAS = {'全部游戏声音': '全部游戏声', '原声': '全部游戏声', '冲击声': '特殊事件', '仅关键事件': '特殊事件', '仅大招/特殊技': '特殊事件',
+                      '智能增强': '全部游戏声'}
 
 
 class RawSpeaker:

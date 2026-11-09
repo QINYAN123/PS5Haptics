@@ -88,11 +88,12 @@ def _proc_names():
 SKIP = {'ps5haptics.exe', 'viiperhost.exe', 'python.exe', 'pythonw.exe', 'audiodg.exe'}
 
 
-def playing():
-    """[(peak 0..1, pid, exe)] of programs with an audio session on the default output, loudest first.
-    Call from a thread with COM initialised."""
-    en = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_ALL)
-    dev = en.GetDefaultAudioEndpoint(0, 1)
+def playing(dev=None):
+    """[(peak 0..1, pid, exe)] of programs with an audio session on dev (default: the default output),
+    loudest first. Call from a thread with COM initialised."""
+    if dev is None:
+        en = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_ALL)
+        dev = en.GetDefaultAudioEndpoint(0, 1)
     unk = dev.Activate(byref(IAudioSessionManager2._iid_), comtypes.CLSCTX_ALL, None)
     mgr = unk.QueryInterface(IAudioSessionManager2)
     sessions = mgr.GetSessionEnumerator()
