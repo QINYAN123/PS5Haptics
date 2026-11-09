@@ -90,7 +90,7 @@ class HapticOut:
         self.dev = find_dualsense_output(self.p, name)
         if self.dev is None:
             if self.own: pa_end(self.p)
-            raise RuntimeError('没有找到有线连接的 DualSense 音频设备（需要 USB 连线）')
+            raise RuntimeError('没有找到 DualSense 音频设备（需要 USB 线或 DS5Dongle 接收器，普通蓝牙不行）')
         self.stream = pa_open(self.p, format=pa.paFloat32, channels=4, rate=RATE, output=True,
                                   output_device_index=self.dev['index'], frames_per_buffer=960)   # 20 ms periods: rides out short stalls of the main loop (10-20 ms gaps = crackle)
         self.lock = threading.Lock(); self.xruns = 0

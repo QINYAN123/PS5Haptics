@@ -315,7 +315,7 @@ class ModeCards(tk.Frame):
     def __init__(self, master, var, items, bg=PANEL):
         super().__init__(master, bg=bg); self.var = var; self.cards = []
         for i, (val, title, tag, desc) in enumerate(items):
-            cv = tk.Canvas(self, height=px(132), bg=bg, highlightthickness=0, bd=0, cursor='hand2')
+            cv = tk.Canvas(self, height=px(176), bg=bg, highlightthickness=0, bd=0, cursor='hand2')
             cv.grid(row=0, column=i, sticky='nsew', padx=(0 if i == 0 else px(10), 0))
             self.columnconfigure(i, weight=1, uniform='m')
             cv.bind('<Button-1>', lambda e, v=val: var.set(v)); cv.bind('<Configure>', lambda e: self.draw())
@@ -331,8 +331,12 @@ class ModeCards(tk.Frame):
             cv.create_text(px(16), px(22), text=title, anchor='w', fill=TEXT if sel else DIM, font=(ZH, 12, 'bold'))
             if tag:
                 tw = tkfont.Font(family=ZH, size=8, weight='bold').measure(tr(tag)) + px(14)   # fits any language
-                cv.create_rectangle(w - tw - px(12), px(13), w - px(12), px(31), fill=mix(PANEL, GREEN, 0.15), outline=GREEN)
-                cv.create_text(w - tw / 2 - px(12), px(22), text=tag, fill=GREEN, font=(ZH, 8, 'bold'))
+                title_w = tkfont.Font(family=ZH, size=12, weight='bold').measure(tr(title))
+                beside = px(16) + title_w + px(8) + tw + px(12) <= w     # narrow card: tag moves to the bottom left
+                ty = px(22) if beside else h - px(22)
+                x1 = w - px(12) if beside else px(16) + tw
+                cv.create_rectangle(x1 - tw, ty - px(9), x1, ty + px(9), fill=mix(PANEL, GREEN, 0.15), outline=GREEN)
+                cv.create_text(x1 - tw / 2, ty, text=tag, fill=GREEN, font=(ZH, 8, 'bold'))
             cv.create_text(px(16), px(44), text=desc, anchor='nw', fill=TEXT if sel else DIM, font=(ZH, 9), width=w - px(32))
             if sel:
                 cv.create_oval(w - px(26), h - px(24), w - px(14), h - px(12), outline=CYAN, width=px(2))
@@ -502,7 +506,7 @@ class DemoRunner:
         self.log('演示模式：数据是模拟的，没有连接手柄。'); t0 = time.time()
         while not self.stop_ev.is_set():
             t = time.time() - t0; hit = max(0.0, math.sin(t * 2.3)) ** 6
-            self.stats = {'level': hit, 'grip': (hit * 0.9 + random.random() * 0.1, hit * 0.7 + random.random() * 0.12),
+            self.stats = {'battery': (75, 'discharging'), 'level': hit, 'grip': (hit * 0.9 + random.random() * 0.1, hit * 0.7 + random.random() * 0.12),
                           'trigger': (0.2 * hit, 0.6 * hit), 'press': ((math.sin(t) + 1) / 2, max(0, math.sin(t * 0.7))),
                           'active': True, 'source': '扬声器 (Realtek)  2声道 48000Hz', 'late': 0,
                           'rumble': (max(0.0, math.sin(t * 1.3)) ** 4, 0.0), 'speaker': hit * 0.8, 'vpad': (int(t * 250), int(t * 1000)),
@@ -619,6 +623,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         'ww_enabled': tk.BooleanVar(value=cfg.get('ww_enabled', True)),
         **{k: tk.DoubleVar(value=cfg.get(k, 1.0) * 100) for k in ('cinema_rumble', 'cinema_kick', 'cinema_trigger', 'music_kick', 'music_tick', 'music_trigger')},
         'ww_fx': tk.BooleanVar(value=cfg.get('ww_fx', cfg.get('event_fx', True))),
+        'stick_dz_l': tk.DoubleVar(value=cfg.get('stick_dz_l', 0.0) * 100), 'stick_dz_r': tk.DoubleVar(value=cfg.get('stick_dz_r', 0.0) * 100),
+        'swap_grips': tk.BooleanVar(value=cfg.get('swap_grips', False)), 'volume_comp': tk.BooleanVar(value=cfg.get('volume_comp', False)),
         'grip_gain': tk.DoubleVar(value=cfg['grip_gain'] * 100), 'trigger_gain': tk.DoubleVar(value=cfg['trigger_gain'] * 100),
         'skip_center': tk.BooleanVar(value=cfg['skip_center']), 'foreground_exe': tk.StringVar(value=cfg['foreground_exe']),
         'mode': tk.StringVar(value=cfg['mode']), 'fusion': tk.StringVar(value=cfg['fusion']),
@@ -628,18 +634,18 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         'ww_click_gate': tk.BooleanVar(value=cfg.get('ww_click_gate', True)), 'game_profiles': tk.BooleanVar(value=cfg.get('game_profiles', True)), 'capture': tk.StringVar(value=cfg.get('capture', '自动')), 'speaker_scene': tk.BooleanVar(value=cfg.get('speaker_scene', True)), 'pbz_log_dir': tk.StringVar(value=cfg.get('pbz_log_dir', '')),
     }
     PCT = ('grip_gain', 'trigger_gain', 'rumble_gain', 'speaker_volume', 'cinema_rumble', 'cinema_kick', 'cinema_trigger',
-           'music_kick', 'music_tick', 'music_trigger')
+           'music_kick', 'music_tick', 'music_trigger', 'button_gain', 'stick_dz_l', 'stick_dz_r')
 
     # ---- scenes: every usage scenario keeps its own complete setup
     SCENES = ('游戏', '影院', '音乐')
     STYLE_OF = {'游戏': '游戏', '影院': '影院', '音乐': '律动'}
     SCENE_DEF = {
         '游戏': dict(mode='原生透传', fusion='融合', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
-                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='原味', speaker_volume=0.6, capture='自动', skip_center=True),
+                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='原味', speaker_volume=0.6, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器'),
         '影院': dict(mode='普通', fusion='融合', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=0.8,
-                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='低音饱满', speaker_volume=0.7, capture='自动', skip_center=True),
+                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='低音饱满', speaker_volume=0.7, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器'),
         '音乐': dict(mode='普通', fusion='融合', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
-                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='低音饱满', speaker_volume=0.6, capture='自动', skip_center=False),
+                   rumble_gain=1.0, speaker_mode='原声', speaker_eq='低音饱满', speaker_volume=0.6, capture='自动', skip_center=False, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器'),
     }
     saved = dict(cfg.get('scenes') or {})
     if '游戏' not in saved:                                   # first run of the scene system: keep the user's old setup
@@ -675,7 +681,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         cfg.update(cfg['scenes'][sc]); cfg['scene'] = sc; cfg['haptic_style'] = STYLE_OF[sc]   # the active scene drives the run
         save_cfg(cfg)
 
-    NEEDS = {'原生透传': ('usbip', 'hidhide'), '接管': ('hidhide', 'vigem'), '普通': ()}
+    NEEDS = {'原生透传': ('usbip', 'hidhide'), '接管': ('hidhide', 'vigem'), 'Xbox': ('hidhide', 'vigem'), '普通': ()}
 
     def start():
         if running(): return
@@ -767,7 +773,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         head.create_line(cx - px(10), cy + px(6), cx - px(4), cy - px(8), cx + px(2), cy + px(4), cx + px(8), cy - px(4), cx + px(12), cy + px(2), fill=CYAN, width=px(2))
         tt = head.create_text(px(80), px(28), text='声音触感', anchor='w', fill=TEXT, font=(ZH, 18, 'bold'))
         head.create_text(max(px(200), head.bbox(tt)[2] + px(18)), px(31), text='HAPTIC  LINK', anchor='w', fill=CYAN, font=(NUMB, 13))
-        head.create_text(px(81), px(56), text=f'PS5 手柄触感中枢  ·  V{VERSION}  ·  USB 有线', anchor='w', fill=DIM, font=(ZH, 9))
+        head.create_text(px(81), px(56), text=f'PS5 手柄触感中枢  ·  V{VERSION}  ·  USB / DS5Dongle（测试版）', anchor='w', fill=DIM, font=(ZH, 9))
         head.create_line(0, px(77), w, px(77), fill=LINE)
         head.create_line(0, px(77), px(240), px(77), fill=CYAN, width=px(2))
         for i in range(24):
@@ -891,7 +897,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             side.create_text(px(24), y + px(29), text=ic, fill=CYAN if sel else FAINT, font=('Segoe UI Symbol', 14))
             side.create_text(px(50), y + px(21), text=n, anchor='w', fill=TEXT if sel else DIM, font=(ZH, 11, 'bold'))
             side.create_text(px(50), y + px(40), text=en, anchor='w', fill=CYAN if sel else FAINT, font=(NUM, 7))
-        y = h - px(110)
+        y = h - px(130)
         # author + project links: quiet, but always there (click opens the browser)
         side.create_text(px(6), y - px(40), text='作者  ' + about.AUTHOR, anchor='w', fill=FAINT, font=(ZH, 8))
         hv = cur.get('link')
@@ -913,6 +919,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         side.create_text(px(6), y + px(38), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='clock')
         side.create_text(px(6), y + px(58), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='up')
         side.create_text(px(6), y + px(78), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='mode')
+        side.create_text(px(6), y + px(98), text='', anchor='w', fill=DIM, font=(ZH, 8), tags='battery')
     side.bind('<Configure>', draw_side)
 
     def open_link(url):
@@ -1148,7 +1155,38 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     }
     ROUTING = [('原生透传', '原生透传', '', '游戏看到虚拟PS5手柄：保留原生自适应扳机和音圈触感，再叠加声音触感。适合支持PS5手柄的游戏。'),
                ('接管', '接管', '', '游戏看到虚拟PS4手柄：游戏震动与声音触感融合。原生透传不可用时的备用。'),
-               ('普通', '普通', '', '不创建虚拟手柄，只叠加声音触感和扬声器。看电影、听音乐、不支持PS5手柄的游戏用这个。')]
+               ('Xbox', '虚拟 Xbox', '', '游戏看到虚拟Xbox手柄：游戏震动与声音触感融合。给只认Xbox手柄的游戏用（如鬼武者），建议关掉该游戏的Steam输入。'),
+               ('普通', '普通', '', '不创建虚拟手柄，只叠加声音触感和扬声器。看电影、听音乐用这个。')]
+
+    def calibrate_gyro():
+        r = runner['r']; flt = getattr(r, 'pad_filter', None) if running() else None
+        if flt is None:
+            msgs.put('陀螺仪校准要在使用虚拟手柄时进行：先选原生透传、接管或虚拟 Xbox，再点「启动」。'); return
+        msgs.put('正在校准：请把手柄平放别动，约 2 秒…'); flt.calibrate()
+
+        def done(n=0):
+            if flt.cal_result is None and n < 40:
+                root.after(100, lambda: done(n + 1)); return
+            state, bias = flt.cal_result or ('no_data', None)
+            if state == 'ok':
+                cfg['gyro_bias'] = list(bias); save_cfg(cfg); r.live_ver += 1
+                msgs.put(f'陀螺仪校准完成，零偏 {bias[0]} / {bias[1]} / {bias[2]}。')
+            elif state == 'moved':
+                msgs.put('校准失败：手柄在动，请平放后再试。')
+            else:
+                msgs.put('校准失败：没有收到足够的手柄数据。')
+        root.after(2100, done)
+
+    def pad_panel():
+        f = details['游戏']
+        pnl = Panel(f, '手柄输入', 'INPUT', accent=CYAN); pnl.pack(fill='x', pady=(0, px(10)))
+        Slider(pnl.body, '左摇杆死区', V['stick_dz_l'], 0, 30).pack(fill='x', pady=px(2))
+        Slider(pnl.body, '右摇杆死区', V['stick_dz_r'], 0, 30).pack(fill='x', pady=px(2))
+        tk.Label(pnl.body, text='摇杆漂移时调大一点。死区和陀螺仪校准只对虚拟手柄生效（原生透传、接管、虚拟 Xbox）。',
+                 bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(2), px(8)))
+        NeonButton(pnl.body, '校准陀螺仪', calibrate_gyro, w=150, h=36, size=10).pack(anchor='w', pady=(0, px(8)))
+        Toggle(pnl.body, '左右握把对调', V['swap_grips'], '觉得左右触感反了时打开', wrap=820).pack(fill='x', pady=px(3))
+        Toggle(pnl.body, '触感不随系统音量变化', V['volume_comp'], '调低系统音量时补偿系统混音的触感（实验性，按进程截音不受音量影响）', wrap=820).pack(fill='x', pady=px(3))
 
     def scene_settings(sc):
         acc, _art, tag = SCENE_INFO[sc]; sv = SV[sc]
@@ -1183,7 +1221,19 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         tk.Label(pnl.body, text='扳机风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['trigger_profile'], TRIGGER_PROFILES, cell=116, color=MAG, rec='均衡冲击').pack(anchor='w', pady=(px(4), px(10)))
         Toggle(pnl.body, '忽略中置声道', sv['skip_center'], '5.1/7.1 时对白（中置）不触发震动', wrap=300).pack(fill='x', pady=px(4))
+        pnl = Panel(f, '操作触感', 'CONTROLS', accent=GREEN); pnl.pack(fill='x', pady=(0, px(10)))
+        grid = tk.Frame(pnl.body, bg=PANEL); grid.pack(fill='x')
+        for i, (text, key, sub_text) in enumerate((('按键', 'button_haptics', '按下和松开时，对应一侧的握把轻点一下'),
+                                                   ('扳机', 'trigger_haptics', '扳机按过一半和松回时轻点一下'),
+                                                   ('摇杆', 'stick_haptics', '摇杆推到边缘时轻点一下'),
+                                                   ('触摸板', 'touch_haptics', '手指碰到触摸板时轻点一下'))):
+            grid.columnconfigure(i % 2, weight=1, uniform='ctl')
+            Toggle(grid, text, sv[key], sub_text, wrap=380, color=GREEN).grid(row=i // 2, column=i % 2, sticky='ew', padx=(0, px(14)), pady=px(3))
+        Slider(pnl.body, '操作触感强度', sv['button_gain'], color=GREEN).pack(fill='x', pady=(px(6), px(2)))
         pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
+        fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(0, px(8)))
+        tk.Label(fr, text='输出到', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
+        Segmented(fr, sv['speaker_output'], ('扬声器', '耳机孔'), cell=124, color=BLUE, rec='扬声器').pack(side='left')
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
         tk.Label(fr, text='播放', bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
         Segmented(fr, sv['speaker_mode'], SPEAKER_MODES, cell=124, color=BLUE, rec='原声').pack(side='left')
@@ -1204,6 +1254,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                  bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(680)).pack(side='left', padx=px(14))
     for sc in SCENES:
         scene_settings(sc)
+    pad_panel()
 
     # ---- the library grid
     games_on = {'ww': False, 'pbz': False}
@@ -1361,17 +1412,20 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     # ---- footer
     foot = tk.Canvas(root, height=px(30), bg=BG, highlightthickness=0, bd=0); foot.pack(fill='x', side='bottom')
-    fstate = {'msg': '未启动。PS5 手柄需要 USB 有线连接。'}
+    fstate = {'msg': '未启动。PS5 手柄需要 USB 线或 DS5Dongle 接收器（测试版）。'}
 
     def draw_foot():
         foot.delete('all'); w = foot.winfo_width()
         foot.create_line(0, 1, w, 1, fill=LINE)
         foot.create_text(px(16), px(16), text='▸', fill=CYAN, font=(ZH, 9), anchor='w')
-        msg = fstate['msg']; room = max(10, int((w - px(420)) / px(12)))      # keep clear of the right-hand label
-        if len(msg) > room:
-            msg = msg[:room - 1] + '…'
+        msg = tr(fstate['msg']); fnt = tkfont.Font(family=ZH, size=9); room = max(px(100), w - px(420))   # keep clear of the right-hand label
+        if fnt.measure(msg) > room:                                           # translate first, then cut to fit
+            while msg and fnt.measure(msg + '…') > room:
+                msg = msg[:-1]
+            msg += '…'
         foot.create_text(px(32), px(16), text=msg, fill=DIM, font=(ZH, 9), anchor='w')
         foot.create_text(w - px(16), px(16), text='DUALSENSE · VOICE COIL · ADAPTIVE TRIGGER', fill=FAINT, font=(NUM, 8), anchor='e')
+    foot.bind('<Configure>', lambda e: draw_foot())                           # the first log line arrives before layout
 
     def add_log(m):
         ts = time.strftime('%H:%M:%S')
@@ -1386,7 +1440,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     show('总览'); t_start = {'t': None}; last = {'run': None}
     watch_vars()
-    MODE_EN = {'原生透传': 'NATIVE', '接管': 'TAKEOVER', '普通': 'OVERLAY'}
+    MODE_EN = {'原生透传': 'NATIVE', '接管': 'TAKEOVER', 'Xbox': 'XBOX', '普通': 'OVERLAY'}
 
     tick = {'n': 0}
 
@@ -1424,6 +1478,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         up = int(time.time() - t_start['t']) if t_start['t'] else 0
         side.itemconfigure('up', text=tr('运行时长') + '  ' + (f'{up // 3600:02d}:{up // 60 % 60:02d}:{up % 60:02d}' if run else '--:--:--'))
         side.itemconfigure('mode', text=tr('模式') + '  ' + tr(r.start_cfg.get('mode', '') if run else SC('mode')))
+        bat = s.get('battery')                              # (percent, state); the level moves in 10 % steps
+        bat_txt = '--' if not bat else tr('已充满') if bat[1] == 'full' else f'{bat[0]}%' + ('  ' + tr('充电中') if bat[1] == 'charging' else '')
+        side.itemconfigure('battery', text=tr('手柄电量') + '  ' + bat_txt, fill=MAG if bat and bat[1] == 'discharging' and bat[0] <= 15 else DIM)
         # dashboard
         try:
             fg = root.state() != 'iconic'               # minimised: nothing to draw
@@ -1493,6 +1550,6 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             runner['t'].join(8)          # takeover needs a moment to un-hide the real pad
         root.destroy()
     root.protocol('WM_DELETE_WINDOW', close); pump()
-    add_log('就绪。PS5 手柄请用 USB 有线连接，然后点右上角「启动」。')
+    add_log('就绪。PS5 手柄请用 USB 线或 DS5Dongle 接收器（测试版）连接，然后点右上角「启动」。')
     root.after(800, lambda: check_system(auto=True))
     return root

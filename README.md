@@ -1,6 +1,6 @@
 # PS5 手柄 · 声音触感（PS5Haptics）
 
-让 PC 上的 PS5 手柄（DualSense，USB 有线）在**玩游戏、看电影、听音乐**时都用上它的全部能力：握把音圈触感、自适应扳机、手柄扬声器。
+让 PC 上的 PS5 手柄（DualSense，USB 线或 [DS5Dongle](https://github.com/awalol/DS5Dongle) 系接收器，测试版）在**玩游戏、看电影、听音乐**时都用上它的全部能力：握把音圈触感、自适应扳机、手柄扬声器。
 
 作者：[轻言black](https://space.bilibili.com/65980286)（哔哩哔哩） · GitHub：[QINYAN123/PS5Haptics](https://github.com/QINYAN123/PS5Haptics)
 

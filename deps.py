@@ -19,9 +19,9 @@ DEPS = [
     ('usbip', 'usbip-win2（虚拟 PS5 手柄）', 'usbip2_ude', 'USBip-*-x64.exe',
      ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'], '原生透传'),
     ('hidhide', 'HidHide（对游戏隐藏真手柄）', 'HidHide', 'HidHide_*_x64.exe',
-     ['/exenoui', '/qn', '/norestart'], '原生透传、接管'),
-    ('vigem', 'ViGEmBus（虚拟 PS4 手柄）', 'ViGEmBus', 'ViGEmBus_*.exe',
-     ['/exenoui', '/qn', '/norestart'], '接管'),
+     ['/exenoui', '/qn', '/norestart'], '原生透传、接管、虚拟 Xbox'),
+    ('vigem', 'ViGEmBus（虚拟 PS4 / Xbox 手柄）', 'ViGEmBus', 'ViGEmBus_*.exe',
+     ['/exenoui', '/qn', '/norestart'], '接管、虚拟 Xbox'),
 ]
 NOWIN = 0x08000000
 

@@ -17,7 +17,9 @@ import pyaudiowpatch as pa
 from ds_audio import HapticOut, RATE, pa_new, pa_end, pa_open, rescan
 from ds_hid import DualSenseHID, effect_vibration, effect_off
 from haptic_dsp import HapticEngine, HOP, GRIP_PROFILES, TRIGGER_PROFILES, RawSpeaker, SPEAKER_MODES, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
-from takeover import VirtualDS4, Isolation, RumbleCoil, fuse
+from button_haptics import ButtonClicks
+from pad_input import InputFilter
+from takeover import VirtualDS4, VirtualX360, Isolation, RumbleCoil, fuse
 from xds import VirtualDualSense
 from event_fx import EventFX, load_config as load_event_fx
 from ww_vision import WWVision
@@ -122,10 +124,14 @@ def groove_gains(cfg):
     return None
 
 
+CONTROL_HAPTICS = {'button': 'button_haptics', 'trigger': 'trigger_haptics', 'stick': 'stick_haptics', 'touch': 'touch_haptics'}
+
+
 class Runner:
     def __init__(self, cfg, log):
         self.cfg = cfg; self.log = log; self.stop_ev = threading.Event(); self.q = queue.Queue(maxsize=400)   # ~2 s of blocks: the lag control drains it, nothing is dropped
         self.start_cfg = dict(cfg)          # what this run was started with (routing / source need a restart)
+        self.pad_filter = None              # stick deadzones / gyro bias for the virtual pad
         self.live_ver = 0                   # bumped by the UI when settings change: applied within 0.5 s
         self.proc = None
         self.stats = {'level': 0.0, 'trigger': (0.0, 0.0), 'active': False, 'source': '', 'late': 0, 'rumble': (0.0, 0.0), 'vpad': None, 'takeover': False, 'native_trig': (False, False)}
@@ -174,11 +180,12 @@ class Runner:
         raise RuntimeError('打开声音设备失败：' + str(last))
 
     def run(self):
-        p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None
+        p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None; volume = None
         pad_tap = None; g_env = 0.05; g_out_pk = 0.0
         mode = self.cfg.get('mode')
         native = mode == '原生透传'                 # virtual DualSense: game's own triggers + haptics
-        takeover = mode == '接管' or native          # any mode that hides the real pad
+        xbox = mode == 'Xbox'                       # virtual Xbox pad: games that only accept Xbox controllers
+        takeover = mode == '接管' or native or xbox  # any mode that hides the real pad
         try:
             rescan()                                  # see a pad / audio device plugged in since the app opened
             p, src, stream = self._open_loopback()
@@ -186,23 +193,28 @@ class Runner:
             self.stats['source'] = f"{src['name']}  {ch}声道 {rate}Hz"
             out = HapticOut(p); hid = DualSenseHID()   # open the REAL pad before any virtual one exists
             real_out = out.dev['name']
+            fw = hid.firmware_info()
+            if fw:
+                self.log(f"手柄固件：fw {fw['fw']:08x} / hw {fw['hw']:08x} / update {fw['update']:04x} / {fw['date']} {fw['time']}")
             if takeover:
-                iso = Isolation(self.log); iso.open()
-                vpad = VirtualDualSense(self.log) if native else VirtualDS4()
+                iso = Isolation(self.log); iso.open(hid.path)
+                vpad = VirtualDualSense(self.log) if native else VirtualX360() if xbox else VirtualDS4()
                 vpad.open()
-                hid.start_reader(vpad.forward)
+                self.pad_filter = InputFilter(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
+                hid.start_reader(lambda rep, f=self.pad_filter, send=vpad.forward: send(f.apply(rep)))
                 self.stats['takeover'] = True
                 if native:                         # the game's own pad-speaker sound lands on the virtual pad
                     from pad_speaker import PadSpeakerTap
                     pad_tap = PadSpeakerTap(real_out, self.log, self.stop_ev); pad_tap.start()
             if self.cfg.get('speaker_mode', '冲击声') != '关闭':
-                try: hid.enable_speaker()          # undo a mute / headset routing left by a game
+                try: hid.enable_speaker(headset=self.cfg.get('speaker_output') == '耳机孔')          # undo a mute / headset routing left by a game
                 except Exception: pass
             try: hid.set_lightbar(0, 80, 255)
             except Exception: pass
             eng = HapticEngine(self.cfg['grip_profile'], self.cfg['trigger_profile'], self.cfg['grip_gain'], self.cfg['trigger_gain'],
                                self.cfg.get('haptic_style', '游戏'), groove_gains(self.cfg))
-            rum = RumbleCoil(); vol = self.cfg.get('speaker_volume', 0.6)
+            ep_gain = 1.0; source_endpoint = False
+            rum = RumbleCoil(); clicks = ButtonClicks(); vol = self.cfg.get('speaker_volume', 0.6)
             spk_mode = SPEAKER_MODE_ALIAS.get(self.cfg.get('speaker_mode', '原声'), self.cfg.get('speaker_mode', '原声'))
             spk_eq = self.cfg.get('speaker_eq', '原味')
             spk = RawSpeaker() if spk_mode != '关闭' else None
@@ -237,6 +249,8 @@ class Runner:
             msg = f'已启动：{self.stats["source"]} → {out.dev["name"]}'
             if native:
                 msg += '\n原生透传中：游戏看到的是虚拟 PS5 手柄，原生扳机和音圈触感由本程序转到真手柄。游戏如果已经开着，请重启游戏。'
+            elif xbox:
+                msg += '\n虚拟 Xbox 手柄中：游戏看到的是 Xbox 手柄，游戏震动由本程序转到真手柄。游戏如果已经开着，请重启游戏。'
             elif takeover:
                 msg += '\n接管中：游戏看到的是虚拟 PS4 手柄，真手柄只由本程序控制。游戏如果已经开着，请重启游戏。'
             self.log(msg); self.stats["late"] = 0          # drops during pad isolation / virtual pad setup are expected
@@ -309,7 +323,7 @@ class Runner:
                 if hid.read_error is not None:
                     raise RuntimeError('PS5 手柄断开了（' + str(hid.read_error) + '）')
                 try:
-                    blk = self.q.get(timeout=0.01 if keep_running else 0.2)
+                    blk = self.q.get(timeout=0.01 if keep_running or self.cfg.get('button_haptics') or self.cfg.get('trigger_haptics') or self.cfg.get('stick_haptics') or self.cfg.get('touch_haptics') else 0.2)
                     tnow = time.monotonic()
                     if tnow - diag_t > 30:              # audio health line in the log every 30 s
                         pr = self.proc
@@ -335,6 +349,7 @@ class Runner:
                 except queue.Empty:
                     blk = None
                 if blk is not None:
+                    from_endpoint = not isinstance(blk, tuple)
                     if isinstance(blk, tuple):                      # per-process capture: stereo 48 kHz
                         blk = blk[1]; bch, brate = 2, RATE
                         if not (self.proc and self.proc.sounding()):
@@ -344,6 +359,7 @@ class Runner:
                         if self.proc is not None and self.proc.sounding():
                             blk = None                             # game process has sound: it wins
                 if blk is not None:
+                    source_endpoint = from_endpoint
                     if np.any(blk):
                         heard = time.monotonic()
                     l, r = downmix(blk, bch, self.cfg['skip_center'])
@@ -360,7 +376,7 @@ class Runner:
                         l, r = rs.process(l, r, brate / RATE * speed)
                     last_blk = time.monotonic()
                     pend_l = np.concatenate([pend_l, l]); pend_r = np.concatenate([pend_r, r])
-                elif (takeover and len(pend_l) < HOP and time.monotonic() - last_blk > 0.1
+                elif ((takeover or any(self.cfg.get(k) for k in CONTROL_HAPTICS.values())) and len(pend_l) < HOP and time.monotonic() - last_blk > 0.1
                       and (time.monotonic() - clock0) * RATE - produced > 4 * HOP):
                     # only when the source has really stopped (0.1 s): padding inside a stream of 10 ms
                     # packets inserted gaps = the speaker crackled and stuttered
@@ -375,11 +391,23 @@ class Runner:
                     clock0 = now; produced = 0
                 if now - fg_check > 0.5:
                     fg_check = now; fg = foreground_exe()
+                    if self.cfg.get('volume_comp'):             # lowering the system volume should not weaken the haptics
+                        if volume is None:
+                            try:
+                                from audio_volume import VolumeMonitor
+                                volume = VolumeMonitor()
+                            except Exception as exc:
+                                self.cfg['volume_comp'] = False; self.log('无法读取系统音量（不影响使用）：' + str(exc))
+                        ep_gain = volume.gain() if volume is not None else 1.0
+                    else:
+                        ep_gain = 1.0
                     if self.live_ver != live_seen:              # settings changed in the UI: apply what can change live
                         live_seen = self.live_ver
                         vol = self.cfg.get('speaker_volume', 0.6)
                         spk_mode = SPEAKER_MODE_ALIAS.get(self.cfg.get('speaker_mode', '原声'), self.cfg.get('speaker_mode', '原声'))
-                        spk_eq = self.cfg.get('speaker_eq', '原味')
+                        spk_eq = self.cfg.get('speaker_eq', '原味'); spk_assert = 0.0   # output path applies at once
+                        if self.pad_filter is not None:
+                            self.pad_filter.configure(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
                         if spk is None and spk_mode != '关闭':
                             spk = RawSpeaker()
                         elif spk_mode == '关闭':
@@ -437,7 +465,7 @@ class Runner:
                             sd = (ROOT / 'traces' / 'ww-shots') if self.cfg.get('ww_shots', True) else None
                             vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), trace_path=tp, mem=proc_mem_mb, crops_dir=cd, shots_dir=sd, fps=10); vision.start()   # 10 fps: half the screen-capture load (was 20)
                         self.stats['profile'] = prof['name'] if prof else ''
-                press = hid.poll_input()
+                press = hid.poll_input(); self.stats['battery'] = hid.battery
                 if vision is not None and fx is not None:
                     for ev in vision.poll():
                         name = fx.feed(*ev)
@@ -455,13 +483,15 @@ class Runner:
                 large = small = 0.0; gpk_l = gpk_r = 0.0; spk_peak = 0.0
                 if spk is not None and time.monotonic() - spk_assert > 5.0:   # keep the speaker routed
                     spk_assert = time.monotonic()
-                    try: hid.enable_speaker()
+                    try: hid.enable_speaker(headset=self.cfg.get('speaker_output') == '耳机孔')
                     except Exception: pass
                 while len(pend_l) >= HOP:
                     bl, br = pend_l[:HOP], pend_r[:HOP]; pend_l, pend_r = pend_l[HOP:], pend_r[HOP:]
                     produced += HOP
                     if not active:
                         bl = np.zeros(HOP, np.float32); br = bl
+                    if ep_gain != 1.0 and source_endpoint:           # haptics only: the speaker keeps following the system volume
+                        bl = np.clip(bl * ep_gain, -1, 1); br = np.clip(br * ep_gain, -1, 1)
                     wl, wr, trig = eng.process(bl, br, press)
                     if native:
                         (rleft, rright), _, color = vpad.feedback()
@@ -501,6 +531,12 @@ class Runner:
                     if fx is not None:                               # event tuning: synthesized grip effects
                         fl, fr = fx.render(HOP)
                         wl = np.clip(wl + fl, -1, 1).astype(np.float32); wr = np.clip(wr + fr, -1, 1).astype(np.float32)
+                    for group, side, kind, pressed in hid.buttons.drain():    # always drained: enabling never replays old presses
+                        if active and self.cfg.get(CONTROL_HAPTICS[group]):
+                            clicks.add(side, kind, pressed)
+                    if clicks.voices:
+                        fl, fr = clicks.render(HOP, self.cfg.get('button_gain', 1.0))
+                        wl = np.clip(wl + fl, -1, 1).astype(np.float32); wr = np.clip(wr + fr, -1, 1).astype(np.float32)
                     sp = se = None
                     gsp = pad_tap.pull(HOP) if pad_tap is not None else None     # game's own pad-speaker sound
                     if gsp is not None:
@@ -532,6 +568,8 @@ class Runner:
                             sp = (base * (1 - ramp) + se * ramp).astype(np.float32)
                     if sp is not None:
                         spk_peak = max(spk_peak, float(np.max(np.abs(sp))))
+                    if self.cfg.get('swap_grips'):
+                        wl, wr = wr, wl
                     out.feed(wl, wr, sp)
                     gpk_l = max(gpk_l, float(np.max(np.abs(wl)))); gpk_r = max(gpk_r, float(np.max(np.abs(wr))))
                 if len(pend_l) > 4 * HOP:          # never build up latency
@@ -578,6 +616,7 @@ class Runner:
                 vision.stop()
             try:
                 if watcher is not None: watcher.close()
+                if volume is not None: volume.close()
             except Exception: pass
             for o in (hid, vpad):
                 try:

@@ -11,8 +11,31 @@ import threading
 import time
 import hid
 
+from button_haptics import ControlTracker
+
 VID = 0x054C
 PIDS = (0x0CE6, 0x0DF2)   # DualSense, DualSense Edge
+
+
+def battery_status(r):
+    """USB input report 0x01, byte 53 (with report id): low nibble level 0..10, high nibble 0 discharging,
+    1 charging, 2 full, anything else = error. Returns (percent, state) or None."""
+    if len(r) < 54:
+        return None
+    level, state = r[53] & 0x0F, r[53] >> 4
+    if state == 2:
+        return 100, 'full'
+    if state in (0, 1):
+        return min(level * 10 + 5, 100), 'charging' if state else 'discharging'
+    return None
+
+
+def parse_firmware_info(b):
+    if len(b) < 46 or b[0] != 0x20:
+        return None
+    text = lambda x: x.split(b'\0')[0].decode('ascii', 'replace').strip()
+    return {'date': text(b[1:12]), 'time': text(b[12:20]), 'hw': int.from_bytes(b[24:28], 'little'),
+            'fw': int.from_bytes(b[28:32], 'little'), 'update': int.from_bytes(b[44:46], 'little')}
 
 
 def find_path():
@@ -87,16 +110,16 @@ class DualSenseHID:
     def __init__(self):
         path, pid = find_path()
         if path is None:
-            raise RuntimeError('没有找到 USB 连接的 DualSense')
+            raise RuntimeError('没有找到 USB 线或 DS5Dongle 接收器连接的 DualSense')
         self.dev = hid.device()
         self.dev.open_path(path)
         self.dev.set_nonblocking(True)
-        self.pid = pid
+        self.pid = pid; self.path = path
         self.l2 = 0; self.r2 = 0
         self.last = (None, None); self.last_write = 0.0
         self.lock = threading.Lock()
         self.reader = None; self.reader_stop = threading.Event(); self.reports = 0; self.read_error = None
-        self.light = None
+        self.light = None; self.battery = None; self.buttons = ControlTracker()
 
     def set_lightbar(self, r=0, g=0, b=255, player=0x04):
         """Light bar + player LED (they stay dark on PC until a program sets them)."""
@@ -107,16 +130,25 @@ class DualSenseHID:
             self.dev.write(bytes(rep))
         self.light = (r, g, b)
 
-    def enable_speaker(self, volume=0x64, preamp=4):
-        """Route ch1/ch2 to the built-in speaker at a set volume. A game that owned the pad before
+    def firmware_info(self):
+        """Feature report 0x20 (a receiver may not answer it): build date/time, hardware, firmware and update versions."""
+        try:
+            b = bytes(self.dev.get_feature_report(0x20, 64))
+        except Exception:
+            return None
+        return parse_firmware_info(b)
+
+    def enable_speaker(self, volume=0x64, preamp=4, headset=False):
+        """Route ch1/ch2 to the built-in speaker (or the headset jack) at a set volume. A game that owned the pad before
         (e.g. via libScePad) may have left the speaker muted or routed to the headset.
         preamp: speaker pre-amplifier gain 0..7 (byte 38, valid flag1 bit 7 = audio control 2);
         the firmware default is the lowest step, which is easily drowned out by the TV."""
         rep = bytearray(48); rep[0] = 0x02
-        rep[1] = 0x20 | 0x80                  # valid: speaker volume + audio control
+        rep[1] = 0x10 | 0x20 | 0x80           # valid: headset volume + speaker volume + audio control
         rep[2] = 0x80                         # valid: audio control 2 (preamp gain)
         rep[6] = max(0, min(0x7F, int(volume)))
-        rep[8] = 3 << 4                       # output path: speaker
+        rep[5] = 0x7C                         # headset volume; our volume slider scales the signal itself
+        rep[8] = 0 if headset else 3 << 4     # output path: ch1/ch2 to the jack, or ch2 to the speaker
         rep[38] = max(0, min(7, int(preamp)))
         with self.lock:
             self.dev.write(bytes(rep))
@@ -133,7 +165,7 @@ class DualSenseHID:
                 except Exception as exc:          # unplugged
                     self.read_error = exc; break
                 if r and r[0] == 0x01 and len(r) >= 41:
-                    self.l2, self.r2 = r[5], r[6]; self.reports += 1
+                    self.l2, self.r2 = r[5], r[6]; self.reports += 1; self.battery = battery_status(r); self.buttons.update(r)
                     try:
                         on_report(bytes(r))
                     except Exception as exc:
@@ -149,7 +181,7 @@ class DualSenseHID:
             if not r:
                 break
             if r[0] == 0x01 and len(r) >= 7:
-                self.l2, self.r2 = r[5], r[6]
+                self.l2, self.r2 = r[5], r[6]; self.battery = battery_status(r); self.buttons.update(r)
         return self.l2 / 255, self.r2 / 255
 
     def set_triggers(self, left_effect, right_effect, min_interval=0.016, force=False):
