@@ -513,6 +513,26 @@ def test_notes_url():
     assert updater.notes_url('https://example.com/x', 'en') == 'https://example.com/x'
 
 
+def test_deps_checks():
+    import deps, tempfile
+    real_svc, real_exe = deps.service_exists, deps.usbip_exe
+    try:
+        deps.service_exists = lambda name: True
+        deps.usbip_exe = lambda: None
+        assert deps.installed('usbip') is False and deps.installed('hidhide') is True   # driver left behind, no usbip.exe
+        deps.usbip_exe = lambda: pathlib.Path(r'C:\Program Files\USBip\usbip.exe')
+        assert deps.installed('usbip') is True
+    finally:
+        deps.service_exists, deps.usbip_exe = real_svc, real_exe
+    assert set(deps.OFFICIAL) == {d[0] for d in deps.DEPS}
+    for key, (url, sha) in deps.OFFICIAL.items():
+        assert url.startswith('https://github.com/') and len(sha) == 64
+        pat = next(d[3] for d in deps.DEPS if d[0] == key)
+        assert pathlib.PurePath(url.rsplit('/', 1)[1]).match(pat), (url, pat)
+    import xds
+    assert 'usbip' in xds.USBIP_HELP and '重启' in xds.USBIP_HELP
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -572,7 +592,7 @@ def test_live():
 
 
 if __name__ == '__main__':
-    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url()
+    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks()
     print('offline tests ok')
     if '--live' in sys.argv:
         test_live()

@@ -46,6 +46,7 @@ def main():
         if (SRC / p).exists():
             shutil.copy2(SRC / p, app / p)
     shutil.copy2(SRC / 'dist_deps' / '依赖.exe', OUT / '依赖.exe')
+    shutil.copy2(SRC / 'dist_deps' / '依赖.exe', app / '依赖.exe')     # also inside: the update package alone can install drivers
     dep = OUT / '依赖安装包'; dep.mkdir()
     found = sorted(INSTALLERS.glob('*.exe')) if INSTALLERS.exists() else []
     for f in found:

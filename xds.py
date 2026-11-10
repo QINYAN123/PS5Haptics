@@ -83,6 +83,10 @@ class WaveBuffer:
                 np.interp(xs, np.arange(len(arr)), arr[:, 1]).astype(np.float32))
 
 
+USBIP_HELP = ('usbip-win2 驱动没就绪，虚拟 PS5 手柄建不起来：刚装完驱动的话请先重启电脑；还不行就到「系统」页点「一键安装依赖」重装。'
+              '急着玩可以先把连接方式换成「接管」或「虚拟 Xbox」')
+
+
 def host_command():
     """VIIPERHost.exe next to the app (bin/), or the script when running from source."""
     for d in (ROOT / 'bin', ROOT):
@@ -155,8 +159,16 @@ class VirtualDualSense:
                 self.error = str(exc); self.ready.set()
 
     def open(self):
+        env = dict(os.environ)
+        try:                                       # usbip-win2 installed somewhere else: let VIIPER's fallback find usbip.exe
+            import deps
+            exe = deps.usbip_exe()
+            if exe is not None:
+                env['PATH'] = str(exe.parent) + os.pathsep + env.get('PATH', '')
+        except Exception:
+            pass
         self.proc = subprocess.Popen(host_command() + [str(os.getpid())], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     stdin=subprocess.DEVNULL, creationflags=0x08000000, cwd=str(ROOT))
+                                     stdin=subprocess.DEVNULL, creationflags=0x08000000, cwd=str(ROOT), env=env)
         line = self.proc.stdout.readline().decode('ascii', 'replace').split()
         if len(line) != 2 or line[0] != 'PORT':
             self.close(); raise RuntimeError('虚拟 PS5 手柄宿主程序（VIIPERHost）没有启动')
@@ -165,6 +177,8 @@ class VirtualDualSense:
         self.reader = threading.Thread(target=self._read_loop, daemon=True); self.reader.start()
         if not self.ready.wait(15) or self.error:
             err = self.error or '虚拟 PS5 手柄创建超时'
+            if 'usbip' in err.lower():             # say what to do, keep the technical detail for bug reports
+                err = (USBIP_HELP + '（详细：' + err[:240] + '）')
             self.close(); raise RuntimeError(err)
 
     # gate[side] = raw threshold (0..255) or None. While set, the game sees that trigger as fully

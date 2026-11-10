@@ -580,6 +580,10 @@ T = [
     ('没有发现明显问题。', 'No obvious problem found.', '目立った問題は見つかりませんでした。', '뚜렷한 문제가 없습니다.'),
     ('遇到问题点「开始自检」：检查驱动、手柄、手柄声卡、HidHide、英特尔 USB 音频和最近的报错，运行中还会记下最近 60 秒每一路震动的来源。点「反馈到 GitHub」会生成诊断报告、复制到剪贴板并打开 GitHub 反馈页，粘贴后提交即可（需要登录 GitHub）。报告里已经去掉用户名和电脑名，不会自动上传。', "When something goes wrong, press Run self-check: it checks drivers, the controller, its sound device, HidHide, Intel USB audio and recent errors; while running it also notes where each vibration came from over the last 60 s. Report on GitHub creates the report, copies it to the clipboard and opens GitHub's issue page: paste it and submit (needs a GitHub account). Your user name and PC name are removed, and nothing is uploaded automatically.", '問題があれば「自己診断を開始」：ドライバー、コントローラー、そのサウンドデバイス、HidHide、Intel USB オーディオ、最近のエラーを調べ、動作中は直近 60 秒の振動の出どころも記録します。「GitHub で報告」はレポートを作ってクリップボードにコピーし、GitHub の報告ページを開きます。貼り付けて送信してください（GitHub へのログインが必要）。ユーザー名と PC 名は除かれ、自動では送信しません。', '문제가 있으면 「자가 진단 시작」: 드라이버, 컨트롤러, 컨트롤러 사운드 장치, HidHide, Intel USB 오디오, 최근 오류를 확인하고, 실행 중에는 최근 60초 동안 각 진동의 출처도 기록합니다. 「GitHub에 보고」는 보고서를 만들어 클립보드에 복사하고 GitHub 이슈 페이지를 엽니다. 붙여 넣고 제출하세요(GitHub 로그인 필요). 사용자 이름과 PC 이름은 지우며 자동으로 올리지 않습니다.'),
     ('更新日志', 'Changelog', '更新内容', '변경 사항'),
+    ('usbip-win2 驱动没就绪，虚拟 PS5 手柄建不起来：刚装完驱动的话请先重启电脑；还不行就到「系统」页点「一键安装依赖」重装。急着玩可以先把连接方式换成「接管」或「虚拟 Xbox」',
+     'usbip-win2 is not ready, so the virtual PS5 controller could not be created: if you just installed the drivers, restart the PC first; otherwise press Install drivers on the System page to reinstall. To play right away, switch Connection to Takeover or Virtual Xbox',
+     'usbip-win2 の準備ができておらず、仮想 PS5 コントローラーを作れません：ドライバーを入れたばかりならまず PC を再起動してください。それでもだめなら「システム」ページの「ドライバーを一括インストール」で入れ直してください。すぐ遊ぶなら接続方式を「テイクオーバー」か「仮想 Xbox」にしてください',
+     'usbip-win2가 준비되지 않아 가상 PS5 컨트롤러를 만들 수 없습니다: 드라이버를 막 설치했다면 먼저 PC를 다시 시작하세요. 그래도 안 되면 「시스템」 페이지에서 「드라이버 설치」로 다시 설치하세요. 바로 하려면 연결 방식을 「테이크오버」나 「가상 Xbox」로 바꾸세요'),
 ]
 
 # strings with variable parts ({} = anything)
