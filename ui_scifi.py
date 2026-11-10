@@ -253,7 +253,7 @@ class Slider(tk.Canvas):
         super().__init__(master, height=px(56), bg=bg, highlightthickness=0, bd=0, cursor='hand2')
         self.label, self.var, self.frm, self.to, self.unit, self.bgc, self.color, self.hint = label, var, frm, to, unit, bg, color, hint
         self.bind('<Configure>', lambda e: self.draw()); self.bind('<Button-1>', self._drag); self.bind('<B1-Motion>', self._drag)
-        self.bind('<MouseWheel>', lambda e: self._step(5 if e.delta > 0 else -5))
+        # no mouse wheel here: the wheel scrolls the page (it used to change a slider the pointer passed over)
         var.trace_add('write', lambda *a: self.draw())
 
     def _geom(self):
