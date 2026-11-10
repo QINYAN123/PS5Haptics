@@ -134,6 +134,36 @@ def _timeline(out, timeline):
         out.append(f"  {t - t0:6.1f}s  " + '  '.join(f'{v:.2f}' for v in vals) + f'  {ev or "-"}  {le}  {re_}')
 
 
+def _ww(out, problems):
+    """鸣潮 skill recognition in its newest trace: how often each skill counted as ready, the energy ring, errors."""
+    d = ROOT / 'traces'
+    files = sorted(d.glob('ww-*.tsv'), key=lambda p: p.stat().st_mtime) if d.exists() else []
+    files = [f for f in files if f.stat().st_size > 2000]
+    if not files:
+        return
+    f = files[-1]; rows = [ln.split('\t') for ln in f.read_text('utf8', 'replace').splitlines()]
+    states = [r for r in rows if len(r) > 4 and r[1] == 'state']
+    if not states:
+        return
+    def ready(r, k):
+        cell = next((c for c in r if c.startswith(k + '=')), '')
+        return 'final=True' in cell, 'final=None' in cell
+    n = len(states)
+    lib = sum(ready(r, 'liberation')[0] for r in states); echo = sum(ready(r, 'echo')[0] for r in states)
+    unk = sum(ready(r, 'echo')[1] for r in states)
+    rings = [float(c[5:]) for r in states for c in r if c.startswith('ring=') and c[5:] not in ('', '-1.00')]
+    flips = sum(1 for r in rows if len(r) > 1 and r[1] == 'flip')
+    errs = [r[2] for r in rows if len(r) > 2 and r[1] == 'shot_error']
+    out.append(f'鸣潮识别（{f.name}，{n} 次采样）：大招就绪 {lib}，声骸就绪 {echo}，读不到技能栏 {unk}，状态切换 {flips} 次')
+    if rings:
+        rs = sorted(rings)
+        out.append(f'  大招充能环：中位 {rs[len(rs) // 2]:.2f}，最高 {rs[-1]:.2f}（≥0.93 算充满）')
+    if errs:
+        out.append('  截图失败：' + errs[0][:200])
+    if unk > n * 0.6:
+        problems.append('鸣潮技能栏大多读不到：确认游戏是 16:9 全屏或无边框、在主显示器、界面大小为默认。')
+
+
 def collect(cfg=None, stats=None, timeline=None, log_path=None, running=False):
     cfg = cfg or {}; problems = []
     out = [f'PS5 手柄 · 声音触感 v{about.VERSION} 诊断报告  {time.strftime("%Y-%m-%d %H:%M:%S")}',
@@ -159,6 +189,7 @@ def collect(cfg=None, stats=None, timeline=None, log_path=None, running=False):
         if errs:
             problems.append('最近的报错：' + errs[-1].split('  ', 1)[-1][:160])
         out.append('最近日志：'); out += ['  ' + ln for ln in lines]
+    _try(lambda: _ww(out, problems), '')
     traces = sorted((ROOT / 'traces').glob('native-*.tsv'), key=lambda p: p.stat().st_mtime) if (ROOT / 'traces').exists() else []
     if traces:
         out.append(f'最近的调校录制：traces/{traces[-1].name}（{traces[-1].stat().st_size // 1024} KB），反馈时可以一起附上')

@@ -222,7 +222,7 @@ class WWVision:
         self.ocr = ocr; self.cd = {k: None for k in ROIS}; self.cd_seen = {k: False for k in ROIS}; self.final = {k: Debounced(2) for k in ROIS}
         self.shots_dir = shots_dir; self.shot_due = []; self.shots = 0
         self.pad = None; self.pad_time = -9.0; self.layout = '-'
-        self.cd_last = {}; self.ring_on = {}; self.ready_since = {}
+        self.cd_last = {}; self.ring_on = {}; self.ready_since = {}; self.ring_val = {}; self.shot_error = None
 
     def _setup(self):
         if self.ocr is None:
@@ -281,6 +281,7 @@ class WWVision:
             raw = not in_cd
             if raw and k == 'liberation':           # no countdown: ready only with a full energy ring (hysteresis)
                 f = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx))
+                self.ring_val[k] = f                    # traced: why the ultimate does / doesn't count as ready
                 self.ring_on[k] = f > 0.93 or (self.ring_on.get(k, False) and f > 0.75)
                 raw = self.ring_on[k]
             if raw:
@@ -353,6 +354,9 @@ class WWVision:
             for side in 'LR':
                 if self.last_press[side] == now:
                     self.shot_due += [(now, side, 'press'), (now + 0.5, side, 'after')]
+            for k, ready in flips.items():                     # also each ready / not-ready change: the HUD at that moment
+                if k in ('liberation', 'echo') and len(self.shot_due) < 6:
+                    self.shot_due.append((now, k[:3], 'on' if ready else 'off'))
             due = [d for d in self.shot_due if d[0] <= now]
             self.shot_due = [d for d in self.shot_due if d[0] > now]
             for _t, side, tag in due[:2]:
@@ -369,7 +373,8 @@ class WWVision:
             self.trace.write(f'{ms}\tstate\t' + '\t'.join(
                 f'{k}={s.value:.1f}/{(s.lo or 0):.1f}-{(s.hi or 0):.1f}/{s.ready}/cd={self.cd[k]}/final={self.final[k].state}'
                 for k, s in self.icons.items())
-                + f'\tforte={self.forte.value:.3f}\tL2={l2:.2f}\tR2={r2:.2f}\tpad={self.pad if pad_on else None}\tbadges={self.layout}\n')
+                + f'\tforte={self.forte.value:.3f}\tL2={l2:.2f}\tR2={r2:.2f}\tpad={self.pad if pad_on else None}\tbadges={self.layout}'
+                + f'\tring={self.ring_val.get("liberation", -1):.2f}\tpadcd={self.cd.get("echo")}/{self.cd.get("liberation")}\n')
             if self.mem is not None and self.frames % 200 == 0:
                 self.trace.write(f'{ms}\tmem\t{self.mem()}\n')
         if self.trace is not None and (flips or forte_ev):
@@ -384,8 +389,12 @@ class WWVision:
             cds = '_'.join(f'{k[:3]}{self.cd[k] if self.cd[k] is not None else "-"}' for k in ROIS)
             Image.fromarray(frame[..., 2::-1]).save(d / f'{time.strftime("%H%M%S")}-{self.shots:03d}-{tag}-{cds}.png')
             self.shots += 1
-        except Exception:
-            pass
+        except Exception as exc:                                # used to fail silently: say why in the trace
+            self.shots += 1
+            if self.shot_error is None:
+                self.shot_error = repr(exc)
+                if self.trace is not None:
+                    self.trace.write(f'{int(time.time() * 1000)}\tshot_error\t{self.shot_error}\n')
 
     def _loop(self):
         try:
