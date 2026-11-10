@@ -65,6 +65,19 @@ def _check_web(timeout):
             'name': about.UPDATE_ASSET.format(ver), 'size': 0}
 
 
+def notes_url(page, lang='zh'):
+    """Release page to read the changelog; other interface languages get it through Google's page translation."""
+    import urllib.parse
+    page = page or about.RELEASES_URL
+    tl = {'en': 'en', 'ja': 'ja', 'ko': 'ko'}.get(lang)
+    if not tl:
+        return page
+    u = urllib.parse.urlparse(page)
+    if u.netloc != 'github.com':
+        return page
+    return f'https://github-com.translate.goog{u.path}?' + urllib.parse.urlencode({'_x_tr_sl': 'auto', '_x_tr_tl': tl, '_x_tr_hl': tl})
+
+
 def check(api=None, local=about.VERSION, timeout=8):
     """{'version', 'notes', 'page', 'url', 'name', 'size'} of a newer release, or None."""
     try:

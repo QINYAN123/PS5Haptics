@@ -1,5 +1,6 @@
 """HidHide output damage, hidapi path mapping, DualSense -> XInput mapping. Run: python test_compat.py [--live]
 --live also creates a real virtual Xbox pad for a moment and checks it through XInput (needs ViGEmBus)."""
+import pathlib
 import ctypes as C
 import json
 import sys
@@ -433,6 +434,85 @@ def test_receiver_paths():
         assert not _re.match(DEV_PATTERN, bad, _re.I), bad
 
 
+def test_trigger_presets():
+    import trigger_presets as TP
+    from ds_hid import effect_zones
+    cfg = TP.scene_defaults()
+    assert TP.effects(cfg) == (None, None)                                   # default: follow the sound
+    for name in TP.NAMES[1:]:
+        c = dict(cfg); c['trig_preset_L'] = name; c.update({TP.key(k, 'L'): v for k, v in TP.values_for(name).items()})
+        e = TP.effect(c, 'L')
+        assert e is not None and len(e) == 11 and e[0] in (0x21, 0x25, 0x26), name
+        assert TP.effect(c, 'R') is None
+        assert set(TP.uses(name)) <= set(TP.PARAMS)
+    c = dict(cfg, trig_preset_R='重阻力', trig_start_R=50, trig_strength_R=7)
+    e = TP.effect(c, 'R'); mask = int.from_bytes(e[1:3], 'little')
+    assert e[0] == 0x21 and mask == sum(1 << z for z in range(5, 10))           # resistance from the middle on
+    c = dict(cfg, trig_preset_L='枪械扳机', trig_start_L=30, trig_end_L=60, trig_strength_L=6)
+    e = TP.effect(c, 'L'); assert e[0] == 0x25 and int.from_bytes(e[1:3], 'little') == (1 << 3) | (1 << 6) and e[3] == 5
+    c = dict(cfg, trig_preset_L='枪械扳机', trig_start_L=80, trig_end_L=20)    # nonsense from sliders still valid
+    e = TP.effect(c, 'L'); m = int.from_bytes(e[1:3], 'little'); assert bin(m).count('1') == 2
+    c = dict(cfg, trig_preset_L='连发震动', trig_freq_L=999, trig_strength_L=0)
+    e = TP.effect(c, 'L'); assert e[0] == 0x26 and e[9] == 60
+    c = dict(cfg, trig_preset_L='渐重', trig_start_L=0, trig_strength_L=8)
+    e = TP.effect(c, 'L'); packed = int.from_bytes(e[3:7], 'little')
+    lv = [(packed >> (3 * z)) & 7 for z in range(10)]
+    assert lv == sorted(lv) and lv[-1] == 7 and lv[0] == 0                    # light to heavy
+    assert effect_zones([0] * 10) == bytes([5] + [0] * 10)
+    assert TP.effect_name(None) == '-' and TP.effect_name(e) == '阻力'
+
+
+def test_selfcheck_report():
+    import selfcheck, getpass, os, urllib.parse
+    home = os.path.expanduser('~'); user = getpass.getuser()
+    text = selfcheck.sanitize(f'log at {home}\\traces and user {user} done')
+    assert home not in text and (len(user) <= 2 or user not in text)
+    t0 = 1000.0
+    tl = [(t0 + i / 10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '-', '-') for i in range(50)]
+    tl[20] = (t0 + 2.0, 0.1, 0.9, 1.0, 0.0, 0.9, 0.8, '破军·蓄力命中', '-', '震动')
+    out = []; selfcheck._timeline(out, tl)
+    rows = [r for r in out[2:]]
+    assert len(rows) == 1 and '破军·蓄力命中' in rows[0] and '0.90' in rows[0]   # only rows with vibration
+    url = selfcheck.issue_url(['缺少驱动：HidHide。到「系统」页点「一键安装依赖」。'])
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert url.startswith('https://github.com/QINYAN123/PS5Haptics/issues/new?') and '缺少驱动' in q['title'][0] and 'Ctrl+V' in q['body'][0]
+    assert len(url) < 2000
+
+
+def test_game_profiles():
+    import ps5_haptics_app as A
+    cfg = dict(A.DEFAULTS); cfg['scene'] = '游戏'; cfg['grip_gain'] = 1.0
+    cfg['user_games'] = [dict(id='a', name='某游戏', exe=r'D:\Games\Foo\Foo.exe', own=True, settings={'grip_gain': 0.4, 'trig_preset_R': '枪械扳机'}),
+                         dict(id='b', name='另一个', exe=r'D:\Games\Bar\Bar.exe', own=False, settings={'grip_gain': 0.1})]
+    r = A.Runner(cfg, lambda m: None)
+    assert r.profile_for('foo.exe')['name'] == '某游戏' and r.profile_for('bar.exe') is None and r.profile_for('') is None
+    eff = r.effective('foo.exe')
+    assert eff['grip_gain'] == 0.4 and eff['trig_preset_R'] == '枪械扳机' and cfg['grip_gain'] == 1.0     # base untouched
+    assert r.effective('bar.exe') is cfg and r.effective('other.exe') is cfg
+    assert sorted(r.user_exes()) == ['bar.exe', 'foo.exe']
+    cfg['scene'] = '影院'
+    assert r.profile_for('foo.exe') is None                                   # films / music keep their own scene
+
+
+def test_steam_app_for():
+    import covers, tempfile
+    d = pathlib.Path(tempfile.mkdtemp()) / 'steamapps'
+    (d / 'common' / 'Some Game' / 'bin').mkdir(parents=True)
+    (d / 'appmanifest_123.acf').write_text('"AppState"\n{\n\t"appid"\t\t"123"\n\t"name"\t\t"Some Game: Deluxe"\n\t"installdir"\t\t"Some Game"\n}\n', 'utf8')
+    assert covers.steam_app_for(d / 'common' / 'Some Game' / 'bin' / 'game.exe') == (123, 'Some Game: Deluxe')
+    assert covers.steam_app_for(r'D:\Games\Foo\Foo.exe') == (None, None)
+
+
+def test_notes_url():
+    import updater
+    page = 'https://github.com/QINYAN123/PS5Haptics/releases/tag/v9.9.9'
+    assert updater.notes_url(page, 'zh') == page
+    u = updater.notes_url(page, 'ja')
+    assert u.startswith('https://github-com.translate.goog/QINYAN123/PS5Haptics/releases/tag/v9.9.9?') and '_x_tr_tl=ja' in u
+    assert updater.notes_url(None, 'zh').startswith('https://github.com/QINYAN123/PS5Haptics/releases')
+    assert updater.notes_url('https://example.com/x', 'en') == 'https://example.com/x'
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -492,7 +572,7 @@ def test_live():
 
 
 if __name__ == '__main__':
-    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths()
+    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url()
     print('offline tests ok')
     if '--live' in sys.argv:
         test_live()

@@ -102,6 +102,22 @@ def effect_feedback(strength, start_zone=0):
     return bytes(e)
 
 
+def effect_zones(strengths):
+    """0x21 feedback with its own strength per zone (10 zones, 0 = free): ramps such as a bow string."""
+    mask = 0; packed = 0
+    for z, s in enumerate(list(strengths)[:10]):
+        s = max(0, min(8, int(s)))
+        if s:
+            mask |= 1 << z; packed |= (s - 1) << (3 * z)
+    if not mask:
+        return effect_off()
+    e = bytearray(11)
+    e[0] = 0x21
+    e[1:3] = mask.to_bytes(2, 'little')
+    e[3:7] = (packed & 0xFFFFFFFF).to_bytes(4, 'little')
+    return bytes(e)
+
+
 def effect_weapon(start_zone=3, end_zone=6, strength=6):
     """0x25 'weapon': resistance from start_zone that snaps (gives way) at end_zone - a gun trigger
     feel. Zones 2..8 apart; strength 1..8."""

@@ -17,6 +17,8 @@ import pyaudiowpatch as pa
 from scipy.signal import butter, sosfilt, sosfilt_zi
 from ds_audio import HapticOut, RATE, pa_new, pa_end, pa_open, rescan
 from ds_hid import DualSenseHID, effect_vibration, effect_off
+import trigger_presets
+from selfcheck import TL_KEYS
 from haptic_dsp import HapticEngine, HOP, GRIP_PROFILES, TRIGGER_PROFILES, RawSpeaker, SPEAKER_MODES, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
 from button_haptics import ButtonClicks
 from game_caps import GameCaps, NOT_GAMES
@@ -33,6 +35,7 @@ DEFAULTS = {'grip_profile': '均衡', 'trigger_profile': '均衡冲击', 'grip_g
             'skip_center': True, 'foreground_exe': '', 'source_hint': '',
             'mode': '原生透传', 'fusion': '叠加', 'trigger_mode': '自动', 'rumble_gain': 1.0, 'speaker_mode': '特殊事件', 'speaker_eq': '原味', 'speaker_volume': 0.8, 'haptic_style': '游戏', 'pbz_fx': True, 'ww_fx': True, 'ww_enabled': True,
             'cinema_rumble': 1.0, 'cinema_kick': 1.0, 'cinema_trigger': 1.0, 'music_kick': 1.0, 'music_tick': 1.0, 'music_trigger': 1.0, 'record_native': True, 'event_fx': True,
+            **trigger_presets.scene_defaults(), 'user_games': [],
             'ww_vision': True, 'ww_click_gate': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
 
 
@@ -132,6 +135,8 @@ CONTROL_HAPTICS = {'button': 'button_haptics', 'trigger': 'trigger_haptics', 'st
 
 class Runner:
     def __init__(self, cfg, log):
+        self.base = cfg; self.profile = None   # base: the UI's settings; cfg: base + the foreground game's own settings
+        self.timeline = collections.deque(maxlen=600)   # haptic sources, 10 per second, for the self-check report
         self.cfg = cfg; self.log = log; self.stop_ev = threading.Event(); self.q = queue.Queue(maxsize=400)   # ~2 s of blocks: the lag control drains it, nothing is dropped
         self.start_cfg = dict(cfg)          # what this run was started with (routing / source need a restart)
         self.caps = GameCaps()              # which games drive the pad speaker / triggers themselves
@@ -139,6 +144,25 @@ class Runner:
         self.live_ver = 0                   # bumped by the UI when settings change: applied within 0.5 s
         self.proc = None
         self.stats = {'level': 0.0, 'trigger': (0.0, 0.0), 'active': False, 'source': '', 'late': 0, 'rumble': (0.0, 0.0), 'vpad': None, 'takeover': False, 'native_trig': (False, False)}
+
+    def profile_for(self, exe):
+        """The person's own game card with its own settings for this exe (游戏 scene only)."""
+        if not exe or self.base.get('scene', '游戏') != '游戏':
+            return None
+        for g in self.base.get('user_games') or []:
+            if g.get('own') and pathlib.Path(g.get('exe', '')).name.lower() == exe:
+                return g
+        return None
+
+    def effective(self, exe):
+        g = self.profile_for(exe)
+        if g is None:
+            return self.base
+        eff = dict(self.base); eff.update(g.get('settings') or {})
+        return eff
+
+    def user_exes(self):
+        return [pathlib.Path(g.get('exe', '')).name.lower() for g in self.base.get('user_games') or [] if g.get('exe')]
 
     def _audio_cb(self, data, frames, info, status):
         if self.proc is not None and self.proc.sounding():  # game captured per process: ignore the mix
@@ -186,6 +210,15 @@ class Runner:
     def run(self):
         p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None; volume = None
         voice_gate = None; pad_tap = None; g_env = 0.05; g_out_pk = 0.0; spk_clip = None; gsp_z = sosfilt_zi(GSP_LOWCUT) * 0.0
+        try:                                         # a game with its own settings already running: start with them (routing is fixed per run)
+            import proc_loopback as plb
+            here = foreground_exe()
+            start_g = self.profile_for(here) or next((g for g in (self.profile_for(e) for e in self.user_exes()) if g and plb.find_pid(pathlib.Path(g['exe']).name)), None)
+            if start_g is not None:
+                self.cfg = self.effective(pathlib.Path(start_g['exe']).name.lower()); self.profile = start_g.get('name')
+                self.log(f'使用「{self.profile}」的专属设置')
+        except Exception:
+            pass
         mode = self.cfg.get('mode')
         native = mode == '原生透传'                 # virtual DualSense: game's own triggers + haptics
         xbox = mode == 'Xbox'                       # virtual Xbox pad: games that only accept Xbox controllers
@@ -269,6 +302,13 @@ class Runner:
             diag_t = diag_prev = time.monotonic(); diag_loop = 0.0; live_seen = 0; spk_eff = spk_mode
             late_mark = 0                         # drops counted up to the last normal loop pass
             trig = (0.0, 0.0)                     # a block shorter than one hop (resampled) must not leave it unset
+            tl_acc = dict.fromkeys(TL_KEYS, 0.0); tl_t = 0.0; static = (None, None); last_static = static
+            mode_warned = set()
+
+            def ours(i):                          # this side's own effect: a trigger-feel preset, else follow the sound
+                if static[i] is not None:
+                    return static[i]
+                return effect_vibration(amp[i], 30 + 25 * trig[i]) if amp[i] else effect_off()
             if self.cfg.get('capture', '自动') == '自动':
                 # known games are captured per process: works with Dolby Atmos / spatial sound, where the
                 # endpoint loopback is silent, and leaves music / voice chat out of the haptics
@@ -276,7 +316,7 @@ class Runner:
                     from proc_loopback import ProcSource
                     scene_name = self.cfg.get('scene', '游戏')
                     if scene_name == '游戏':                    # adapted games first, then the program in front
-                        exes = [e for e in list(GAME_PROFILES) + [PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower()] if e]
+                        exes = [e for e in list(GAME_PROFILES) + [PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower()] + self.user_exes() if e]
                         players = 'foreground'
                     else:                                 # films / music: whatever is playing (player, browser, music app)
                         exes, players = [], 'loudest'
@@ -400,6 +440,16 @@ class Runner:
                     if new_fg != fg:
                         fg_since = now
                     fg = new_fg
+                    g_now = self.profile_for(fg)
+                    g_name = g_now.get('name') if g_now else None
+                    if g_name != self.profile:                  # the person's own settings for the game in front
+                        self.profile = g_name; self.cfg = self.effective(fg); live_seen = -1
+                        self.log(f'使用「{g_name}」的专属设置' if g_name else '前台不是有专属设置的游戏，使用通用设置')
+                        if g_now and (self.cfg.get('mode') != mode or self.cfg.get('capture') != self.start_cfg.get('capture')) and g_name not in mode_warned:
+                            mode_warned.add(g_name)
+                            self.log(f'「{g_name}」的连接方式或声音来源和当前不同：先打开游戏，再停止并重新启动本软件后生效。')
+                    elif self.live_ver != live_seen:
+                        self.cfg = self.effective(fg)
                     if self.cfg.get('volume_comp'):             # lowering the system volume should not weaken the haptics
                         if volume is None:
                             try:
@@ -429,7 +479,7 @@ class Runner:
                         if self.proc is not None:              # scene changed: which program to listen to
                             game_scene = self.cfg.get('scene', '游戏') == '游戏'
                             self.proc.players = 'foreground' if game_scene else 'loudest'
-                            self.proc.exes = [e for e in list(GAME_PROFILES) + [PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower()] if e] if game_scene else []
+                            self.proc.exes = [e for e in list(GAME_PROFILES) + [PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower()] + self.user_exes() if e] if game_scene else []
                     # 全部游戏声: the whole mix, even over a game's own pad-speaker sound.
                     # 特殊事件: a game that drives the pad speaker itself keeps it; 影之刃零 keeps its event tuning;
                     # games that don't use the pad speaker play the whole mix.
@@ -520,6 +570,7 @@ class Runner:
                     if ep_gain != 1.0 and source_endpoint:           # haptics only: the speaker keeps following the system volume
                         bl = np.clip(bl * ep_gain, -1, 1); br = np.clip(br * ep_gain, -1, 1)
                     wl, wr, trig = eng.process(bl, br, press)
+                    tl_snd_l, tl_snd_r = wl, wr
                     if self.cfg.get('voice_gate') and voice_gate is not False:   # pure dialogue must not shake the grips
                         if voice_gate is None:
                             try:
@@ -543,6 +594,7 @@ class Runner:
                         if fx is not None and FUSION_ALIAS.get(fusion, fusion) != '纯用游戏':   # event tuning: grade / duck the native layer
                             g = fx.native_gain(HOP); nl = nl * g; nr = nr * g
                         nlevel = float(max(np.max(np.abs(nl)), np.max(np.abs(nr))))
+                        tl_acc['nat'] = max(tl_acc['nat'], nlevel); tl_acc['mot'] = max(tl_acc['mot'], large, small)
                         gpk = vpad.spk_peak; vpad.spk_peak = 0              # game's own pad-speaker channels
                         if gpk:
                             self.stats['game_spk'] = max(self.stats.get('game_spk', 0), gpk)
@@ -564,6 +616,7 @@ class Runner:
                             except Exception: pass
                     elif takeover:
                         large, small, color = vpad.rumble()
+                        tl_acc['mot'] = max(tl_acc['mot'], large, small)
                         rl, rr = rum.step(large, small, rgain)
                         wl, wr = fuse(wl, wr, rl, rr, max(large, small), fusion, duck)
                         if color and color != last_color and any(color):
@@ -571,6 +624,7 @@ class Runner:
                             except Exception: pass
                     if fx is not None:                               # event tuning: synthesized grip effects
                         fl, fr = fx.render(HOP)
+                        tl_acc['fx'] = max(tl_acc['fx'], float(np.max(np.abs(fl))), float(np.max(np.abs(fr))))
                         if FUSION_ALIAS.get(fusion, fusion) != '纯用游戏':
                             wl = np.clip(wl + fl, -1, 1).astype(np.float32); wr = np.clip(wr + fr, -1, 1).astype(np.float32)
                     for group, side, kind, pressed in hid.buttons.drain():    # always drained: enabling never replays old presses
@@ -619,9 +673,15 @@ class Runner:
                     if gl_gain != 1.0 or gr_gain != 1.0:              # per-hand strength: everything that reaches that grip
                         wl = np.clip(wl * gl_gain, -1, 1).astype(np.float32); wr = np.clip(wr * gr_gain, -1, 1).astype(np.float32)
                     out.feed(wl, wr, sp)
+                    try:
+                        tl_acc['snd'] = max(tl_acc['snd'], float(np.max(np.abs(tl_snd_l))), float(np.max(np.abs(tl_snd_r))))
+                    except NameError:
+                        pass
+                    tl_acc['out_l'] = max(tl_acc['out_l'], float(np.max(np.abs(wl)))); tl_acc['out_r'] = max(tl_acc['out_r'], float(np.max(np.abs(wr))))
                     gpk_l = max(gpk_l, float(np.max(np.abs(wl)))); gpk_r = max(gpk_r, float(np.max(np.abs(wr))))
                 if len(pend_l) > 4 * HOP:          # never build up latency
                     pend_l, pend_r = pend_l[-HOP:], pend_r[-HOP:]
+                static = trigger_presets.effects(self.cfg)
                 amp = (int(round(min(1.0, trig[0] * self.cfg.get('trigger_left_gain', 1.0)) * 8)),
                        int(round(min(1.0, trig[1] * self.cfg.get('trigger_right_gain', 1.0)) * 8)))
                 game_l = game_r = None
@@ -650,8 +710,8 @@ class Runner:
                     elif trig_mode == '叠加' and game_trig:
                         # a trigger runs one effect at a time: a side the game is using stays the game's, the other is ours
                         ov_l, ov_r = fx.triggers() if fx is not None else (None, None)
-                        lf = ov_l or (game_l if not off(game_l) else (effect_vibration(amp[0], 30 + 25 * trig[0]) if amp[0] else effect_off()))
-                        rf = ov_r or (game_r if not off(game_r) else (effect_vibration(amp[1], 30 + 25 * trig[1]) if amp[1] else effect_off()))
+                        lf = ov_l or (game_l if not off(game_l) else ours(0))
+                        rf = ov_r or (game_r if not off(game_r) else ours(1))
                         hid.set_triggers(lf, rf); last_trig = (-1, -1); amp = None
                 elif self.cfg.get('trigger_mode', '自动') == '纯用游戏':
                     # no game commands reach us here; in overlay mode the game writes to the pad itself, so stay off it
@@ -663,14 +723,18 @@ class Runner:
                 if amp is not None and fx is not None:
                     ov_l, ov_r = fx.triggers()
                     if ov_l or ov_r:                                 # event trigger effect wins for its duration
-                        lf = ov_l or (effect_vibration(amp[0], 30 + 25 * trig[0]) if amp[0] else effect_off())
-                        rf = ov_r or (effect_vibration(amp[1], 30 + 25 * trig[1]) if amp[1] else effect_off())
+                        lf = ov_l or ours(0)
+                        rf = ov_r or ours(1)
                         hid.set_triggers(lf, rf); last_trig = (-1, -1); amp = None
-                if amp is not None and amp != last_trig:
-                    lf = effect_vibration(amp[0], 30 + 25 * trig[0]) if amp[0] else effect_off()
-                    rf = effect_vibration(amp[1], 30 + 25 * trig[1]) if amp[1] else effect_off()
-                    if hid.set_triggers(lf, rf):
-                        last_trig = amp
+                if amp is not None and (amp != last_trig or static != last_static):
+                    if hid.set_triggers(ours(0), ours(1)):
+                        last_trig = amp; last_static = static
+                now_tl = time.monotonic()
+                if now_tl - tl_t >= 0.1:                          # self-check timeline: where the vibration came from
+                    tl_t = now_tl; le, re_ = getattr(hid, 'last', (None, None))
+                    self.timeline.append((round(time.time(), 1), *(round(tl_acc[k], 2) for k in TL_KEYS), self.stats.get('fx_last', ''),
+                                          trigger_presets.effect_name(le), trigger_presets.effect_name(re_)))
+                    tl_acc = dict.fromkeys(TL_KEYS, 0.0)
                 self.stats.update(level=eng.level, trigger=trig, grip=(gpk_l, gpk_r), speaker=spk_peak, xruns=out.xruns, press=(hid.l2 / 255, hid.r2 / 255), active=active, rumble=(large, small),
                                   vpad=((vpad.frames['in'], vpad.frames[1] + vpad.frames[3]) if native else
                                         (vpad.updates, vpad.feedbacks)) if vpad else None,

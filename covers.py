@@ -58,6 +58,29 @@ def _store_background(appid):
     return None
 
 
+def steam_app_for(exe_path):
+    """(appid, name) of the Steam game an exe belongs to, from the library's appmanifest files; (None, None) if not Steam."""
+    p = pathlib.Path(exe_path)
+    parts = [x.lower() for x in p.parts]
+    if 'steamapps' not in parts:
+        return None, None
+    i = parts.index('steamapps')
+    if len(p.parts) <= i + 2 or parts[i + 1] != 'common':
+        return None, None
+    lib = pathlib.Path(*p.parts[:i + 1]); folder = p.parts[i + 2].lower()
+    import re
+    for acf in lib.glob('appmanifest_*.acf'):
+        try:
+            text = acf.read_text('utf8', 'replace')
+        except OSError:
+            continue
+        m = re.search(r'"installdir"\s+"([^"]+)"', text)
+        if m and m.group(1).lower() == folder:
+            appid = re.search(r'"appid"\s+"(\d+)"', text); name = re.search(r'"name"\s+"([^"]+)"', text)
+            return (int(appid.group(1)) if appid else None), (name.group(1) if name else p.parts[i + 2])
+    return None, p.parts[i + 2]
+
+
 def fit(img, w, h):
     """Crop to the w:h aspect (centre) and resize."""
     iw, ih = img.size

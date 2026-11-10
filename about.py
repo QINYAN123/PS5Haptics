@@ -1,5 +1,5 @@
 """Version, author and project links (sidebar, update check, docs, release packaging)."""
-VERSION = '2.2.2'
+VERSION = '2.3.0'
 AUTHOR = '轻言black'
 GITHUB_USER = 'QINYAN123'
 GITHUB_REPO = 'QINYAN123/PS5Haptics'
