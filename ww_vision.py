@@ -37,6 +37,12 @@ PAD_HALF = 80                          # icon box half size
 PAD_RING = (74, 96)                    # liberation energy ring radius range
 PAD_REGION = (PAD_X - 100, PAD_SLOTS[0] - 100, PAD_BADGE_X + 50, PAD_SLOTS[-1] + 100)
 CAST_WINDOW = 0.6
+# character switch (D-pad up / right / left on the gamepad HUD): the other character's skills show up at once,
+# so scan fast for a moment and forget the previous character's countdowns instead of waiting them out
+SWITCH_HATS = (0, 2, 6)        # DualSense hat values: up, right, left
+BURST_S = 1.5                  # fast scanning after a switch
+BURST_FPS = 30
+SETTLE_S = 0.12                # the skill icons swap with a short animation: read after it
 SIDE_OF = {'liberation': 'R', 'echo': 'L'}
 
 
@@ -206,7 +212,7 @@ def body_brightness(bgra):
 
 
 class WWVision:
-    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None):
+    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None):
         """inputs(): returns (l2, r2) pressed 0..1 from the real pad. mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
         self.cam = camera; self.icons = {k: IconState() for k in ROIS}; self.forte = ForteState()
@@ -223,6 +229,8 @@ class WWVision:
         self.shots_dir = shots_dir; self.shot_due = []; self.shots = 0
         self.pad = None; self.pad_time = -9.0; self.layout = '-'
         self.cd_last = {}; self.ring_on = {}; self.ready_since = {}; self.ring_val = {}; self.shot_error = None
+        self.dpad = dpad; self.prev_hat = None; self.burst_until = -9.0; self.settle_until = -9.0; self.switches = 0
+        self.slot = None; self.slot_mem = {}     # D-pad direction -> what that character's skills were when we left it
 
     def _setup(self):
         if self.ocr is None:
@@ -277,16 +285,22 @@ class WWVision:
                 if self.cd[k] is not None:
                     self.cd_last[k] = (now, self.cd[k])
             t_cd, v_cd = self.cd_last.get(k, (-9.0, 0.0))
-            in_cd = self.cd[k] is not None or (now - t_cd < 0.8 and v_cd > 0.8)   # a missed frame is not "ready"
+            burst = now < self.burst_until
+            keep = 0.25 if burst else 0.8                  # at 30 fps a missed countdown frame is caught again quickly
+            in_cd = self.cd[k] is not None or (now - t_cd < keep and v_cd > 0.8)   # a missed frame is not "ready"
             raw = not in_cd
             if raw and k == 'liberation':           # no countdown: ready only with a full energy ring (hysteresis)
                 f = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx))
                 self.ring_val[k] = f                    # traced: why the ultimate does / doesn't count as ready
                 self.ring_on[k] = f > 0.93 or (self.ring_on.get(k, False) and f > 0.75)
                 raw = self.ring_on[k]
-            if raw:
+            keep_now = self.final[k].state                  # no opinion yet: keep the remembered / current state
+            if now < self.settle_until:                    # icons still swapping: don't read them yet
+                self.ready_since[k] = None; wants[k] = keep_now
+            elif raw:
                 self.ready_since[k] = self.ready_since.get(k) or now
-                wants[k] = now - self.ready_since[k] >= 0.4
+                held = now - self.ready_since[k] >= (0.05 if burst else 0.4)
+                wants[k] = True if held else (keep_now if burst else False)
             else:
                 self.ready_since[k] = None; wants[k] = False
         return wants
@@ -299,6 +313,21 @@ class WWVision:
     def step(self, frame, now):
         """Process one captured region (BGRA). Public for tests."""
         l2, r2 = self.inputs()
+        hat = self.dpad() if self.dpad is not None else None
+        if hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS and hat != self.slot:   # character switch: rescan now, fast
+            self.switches += 1
+            self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
+            if self.slot is not None:                                    # remember the one leaving the field
+                self.slot_mem[self.slot] = (now, {k: (self.final[k].state, self.cd_last.get(k)) for k in ('echo', 'liberation')})
+            for k, pred in self._predict(hat, now).items():              # the one coming in: what we knew, aged
+                d = self.final[k]; d.state = pred; d.cand = None; d.count = 0
+            self.slot = hat
+            for k in ('echo', 'liberation'):
+                self.cd_last.pop(k, None); self.ready_since[k] = None; self.ring_on[k] = False
+            self.pad_time = max(self.pad_time, now - 1.0)                # keep the known HUD layout during the burst
+            if self.trace is not None:
+                self.trace.write(f'{int(time.time() * 1000)}\tswitch\that={hat}\n')
+        self.prev_hat = hat
         for side, val in (('L', l2), ('R', r2)):
             if val > 0.5 and self.prev_in[side] <= 0.5:          # press edge: remember the icon before it
                 self.last_press[side] = now
@@ -404,9 +433,36 @@ class WWVision:
                 fr = self.cam.grab(region=self.region, new_frame_only=False)
                 if fr is not None:
                     self.step(fr, t0)
-                self.stop_ev.wait(max(0.0, self.period - (time.monotonic() - t0)))
+                period = 1.0 / BURST_FPS if t0 < self.burst_until or self._switch_pending() else self.period
+                self.stop_ev.wait(max(0.0, period - (time.monotonic() - t0)))
         except Exception as exc:
             self.error = exc
+
+    def _predict(self, slot, now):
+        """Skill states of the character in this slot, from when it left: an energy-full ultimate stays full,
+        a cooldown keeps running off-field. Unknown slot -> unknown (trigger off until read)."""
+        if slot not in self.slot_mem:
+            return {'echo': None, 'liberation': None}
+        left_at, mem = self.slot_mem[slot]; out = {}
+        for k, (state, cd) in mem.items():
+            if state:
+                out[k] = True
+            elif k == 'echo' and cd is not None:
+                t_cd, v_cd = cd
+                out[k] = (v_cd - (now - t_cd)) <= 0.2        # countdown ran out while off-field
+            else:
+                out[k] = False if state is False else None
+        return out
+
+    def _switch_pending(self):
+        """A switch press since the last frame: grab the next frame right away."""
+        if self.dpad is None:
+            return False
+        try:
+            hat = self.dpad()
+        except Exception:
+            return False
+        return hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():

@@ -156,6 +156,7 @@ class DualSenseHID:
         self.lock = threading.Lock()
         self.reader = None; self.reader_stop = threading.Event(); self.reports = 0; self.read_error = None
         self.light = None; self.battery = None; self.buttons = ControlTracker()
+        self.dpad = None                                 # D-pad hat 0..7 (0 = up, clockwise), None = released
 
     def set_lightbar(self, r=0, g=0, b=255, player=0x04):
         """Light bar + player LED (they stay dark on PC until a program sets them)."""
@@ -202,6 +203,7 @@ class DualSenseHID:
                     self.read_error = exc; break
                 if r and r[0] == 0x01 and len(r) >= 41:
                     self.l2, self.r2 = r[5], r[6]; self.reports += 1; self.battery = battery_status(r); self.buttons.update(r)
+                    hat = r[8] & 0x0F; self.dpad = hat if hat < 8 else None
                     try:
                         on_report(bytes(r))
                     except Exception as exc:
@@ -218,6 +220,8 @@ class DualSenseHID:
                 break
             if r[0] == 0x01 and len(r) >= 7:
                 self.l2, self.r2 = r[5], r[6]; self.battery = battery_status(r); self.buttons.update(r)
+                if len(r) > 8:
+                    hat = r[8] & 0x0F; self.dpad = hat if hat < 8 else None
         return self.l2 / 255, self.r2 / 255
 
     def set_triggers(self, left_effect, right_effect, min_interval=0.016, force=False):

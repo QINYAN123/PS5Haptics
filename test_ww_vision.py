@@ -166,6 +166,85 @@ def test_ocr_states():
     assert v.states()['liberation'] is False and ('ww', 'liberation', 'cast') in v.poll(), v.cd
 
 
+def test_switch_burst():
+    """Character switch on the D-pad: the new character's ready skills are seen within ~0.3 s instead of ~1.3 s."""
+    import ww_vision as W
+    hat = {'v': None}
+    keep_ring = W.ring_fill
+
+    class OCR:
+        cds = {}
+        def cooldown(self, crop):
+            return OCR.cds.get(crop.shape[0] * 0 + OCR.current, None)
+        def read_gray(self, crop):
+            return ''
+
+    def run(use_dpad):
+        v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), dpad=(lambda: hat['v']) if use_dpad else None); v._setup()
+        v.ocr = OCR(); v._pad_update = lambda f, n: None
+        v.pad = {'echo': 1740, 'liberation': 1950}
+        fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+        state = {'cd': {'echo': 6.0, 'liberation': 9.0}, 'ring': 0.2}
+        W.ring_fill = lambda *a: state['ring']
+
+        def cooldown(crop, _o=v.ocr):                      # which icon is being read: echo first, then liberation
+            k = order.pop(0); order.append(k); return state['cd'][k]
+        order = ['echo', 'liberation']; v.ocr.cooldown = cooldown
+        t = 0.0
+        for _ in range(30):                                # old character: both on cooldown
+            t += 0.1; v.pad_time = t; v.step(fr, t)
+        assert v.states()['echo'] is False and v.states()['liberation'] is False
+        hat['v'] = 0; state['cd'] = {'echo': None, 'liberation': None}; state['ring'] = 1.0   # switch: new one is ready
+        t_switch = t; got = {}
+        for _ in range(80):
+            dt = 1 / W.BURST_FPS if (use_dpad and t < v.burst_until) else 0.1
+            t += dt; v.pad_time = t; v.step(fr, t)
+            if t - t_switch > 0.05:
+                hat['v'] = None
+            for k in ('echo', 'liberation'):
+                if v.states()[k] and k not in got:
+                    got[k] = round(t - t_switch, 2)
+            if len(got) == 2:
+                break
+        return got
+    def back_and_forth():
+        """Slot up: echo on cooldown 3 s, ultimate full. Switch right, then back after 4 s: both ready at once."""
+        v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), dpad=lambda: hat['v']); v._setup()
+        v.ocr = OCR(); v._pad_update = lambda f, n: None; v.pad = {'echo': 1740, 'liberation': 1950}
+        fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+        screen = {'echo': 3.0, 'liberation': None}; ring = {'v': 1.0}
+        W.ring_fill = lambda *a: ring['v']
+        order = ['echo', 'liberation']
+        def cooldown(crop):
+            k = order.pop(0); order.append(k); return screen[k]
+        v.ocr.cooldown = cooldown
+        t = 0.0
+        def go(h, n, dt=1 / 30):
+            nonlocal t
+            hat['v'] = h
+            for i in range(n):
+                t += dt; v.pad_time = t; v.step(fr, t)
+                if i == 1: hat['v'] = None
+        go(0, 60)                                          # on slot up: echo cooling down, ultimate full
+        st = v.states(); assert st['echo'] is False and st['liberation'] is True, st
+        screen.update(echo=8.0, liberation=12.0); ring['v'] = 0.1
+        go(2, 1); screen.update(echo=8.0, liberation=12.0)
+        go(None, 40)                                       # slot right: both cooling down
+        assert v.states()['echo'] is False and v.states()['liberation'] is False
+        t += 4.0                                           # echo of slot up has run out meanwhile
+        screen.update(echo=None, liberation=None); ring['v'] = 1.0
+        go(0, 1)
+        return v.states()
+
+    try:
+        slow = run(False); fast = run(True); back = back_and_forth()
+    finally:
+        W.ring_fill = keep_ring
+    assert max(fast.values()) <= 0.35 and max(slow.values()) >= 0.9, (slow, fast)
+    assert back['echo'] is True and back['liberation'] is True, back      # known character: at the switch itself
+    print('   ready after switch: before', slow, 'first visit now', fast, 'returning: same frame', back)
+
+
 if __name__ == '__main__':
-    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states):
+    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_switch_burst):
         f(); print('ok', f.__name__)
