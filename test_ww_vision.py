@@ -166,11 +166,44 @@ def test_ocr_states():
     assert v.states()['liberation'] is False and ('ww', 'liberation', 'cast') in v.poll(), v.cd
 
 
+def test_lit_icon():
+    """An ultimate unlocked by a move (no full energy ring) still counts as ready once its icon is drawn lit."""
+    import ww_vision as W
+    disc = np.full((160, 160, 4), 30, np.uint8)                           # dark icon disc
+    lit = disc.copy(); lit[40:120, 60:100, :3] = 238                     # a white glyph (HDR-dimmed white)
+    grey = disc.copy(); grey[40:120, 60:100, :3] = 140                   # unusable: grey glyph
+    flash = np.full((160, 160, 4), 250, np.uint8)
+    w, d = W.disc_stats(lit, 80, 80, 66); assert W.icon_lit(w, d, 0.3)    # partial ring (move-unlocked): ready
+    w, d = W.disc_stats(grey, 80, 80, 66); assert not W.icon_lit(w, d, 1.0)   # full ring, grey glyph: not ready
+    w, d = W.disc_stats(flash, 80, 80, 66); assert not W.icon_lit(w, d, 1.0)  # white flash
+    w, d = W.disc_stats(lit, 80, 80, 66); assert not W.icon_lit(w, d, 0.05)   # no ring: not a skill icon
+    keep_ring, keep_lit = W.ring_fill, W.disc_stats
+    try:
+        v = WWVision(lambda: (0.0, 0.0), camera=FakeCam()); v._setup()
+        class OCR:
+            def cooldown(self, crop): return None
+            def read_gray(self, crop): return ''
+        v.ocr = OCR(); v._pad_update = lambda f, n: None; v.pad = {'echo': 1740, 'liberation': 1950}
+        fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+        W.ring_fill = lambda *a: 0.3                                       # energy ring never full
+        level = {'v': 0.0}; W.disc_stats = lambda *a: (level['v'], 0.4)
+        t = 0.0
+        for _ in range(12):
+            t += 0.1; v.pad_time = t; v.step(fr, t)
+        assert v.states()['liberation'] is False                          # grey, no countdown: not ready
+        level['v'] = 0.3
+        for _ in range(12):
+            t += 0.1; v.pad_time = t; v.step(fr, t)
+        assert v.states()['liberation'] is True                           # lit: ready without the ring
+    finally:
+        W.ring_fill, W.disc_stats = keep_ring, keep_lit
+
+
 def test_switch_burst():
     """Character switch on the D-pad: the new character's ready skills are seen within ~0.3 s instead of ~1.3 s."""
     import ww_vision as W
     hat = {'v': None}
-    keep_ring = W.ring_fill
+    keep_ring, keep_disc = W.ring_fill, W.disc_stats
 
     class OCR:
         cds = {}
@@ -186,6 +219,7 @@ def test_switch_burst():
         fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
         state = {'cd': {'echo': 6.0, 'liberation': 9.0}, 'ring': 0.2}
         W.ring_fill = lambda *a: state['ring']
+        W.disc_stats = lambda *a: ((0.3 if state['ring'] > 0.9 else 0.0), 0.4)   # charged icon drawn lit
 
         def cooldown(crop, _o=v.ocr):                      # which icon is being read: echo first, then liberation
             k = order.pop(0); order.append(k); return state['cd'][k]
@@ -214,6 +248,7 @@ def test_switch_burst():
         fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
         screen = {'echo': 3.0, 'liberation': None}; ring = {'v': 1.0}
         W.ring_fill = lambda *a: ring['v']
+        W.disc_stats = lambda *a: ((0.3 if ring['v'] > 0.9 else 0.0), 0.4)
         order = ['echo', 'liberation']
         def cooldown(crop):
             k = order.pop(0); order.append(k); return screen[k]
@@ -239,12 +274,19 @@ def test_switch_burst():
     try:
         slow = run(False); fast = run(True); back = back_and_forth()
     finally:
-        W.ring_fill = keep_ring
+        W.ring_fill, W.disc_stats = keep_ring, keep_disc
     assert max(fast.values()) <= 0.35 and max(slow.values()) >= 0.9, (slow, fast)
     assert back['echo'] is True and back['liberation'] is True, back      # known character: at the switch itself
+    held = {'m': 0}
+    v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), buttons=lambda: held['m']); v._setup()
+    v._holds(0.0); held['m'] = 0x01; v._holds(0.1); v._holds(0.3)
+    assert v.burst_until < 0 and v.holds == 0                           # a tap is not a long press
+    v._holds(0.5); assert v.holds == 1 and v.burst_until > 1.5        # held 0.4 s: fast scanning
+    v._holds(1.0); assert v.holds == 1                                  # once per hold
+    held['m'] = 0; v._holds(2.5); assert v.burst_until > 3.5          # let go: again, the move just landed
     print('   ready after switch: before', slow, 'first visit now', fast, 'returning: same frame', back)
 
 
 if __name__ == '__main__':
-    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_switch_burst):
+    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_switch_burst):
         f(); print('ok', f.__name__)

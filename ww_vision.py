@@ -43,6 +43,9 @@ SWITCH_HATS = (0, 2, 6)        # DualSense hat values: up, right, left
 BURST_S = 1.5                  # fast scanning after a switch
 BURST_FPS = 30
 SETTLE_S = 0.12                # the skill icons swap with a short animation: read after it
+# long presses (charged basic / heavy attack): some characters' ultimate is unlocked by such a move, not by
+# the energy ring, so the skill bar can change right then -> scan fast while held and right after release
+HOLD_S = 0.35
 SIDE_OF = {'liberation': 'R', 'echo': 'L'}
 
 
@@ -70,6 +73,46 @@ def ring_fill(bgra, cx, cy, r0, r1):
     q = bgra[ys, xs, :3].astype(np.int32)                       # 72 angles x radii x 3, one numpy gather
     score = q.max(-1) - q.min(-1) + q.max(-1) // 3
     return float((score.max(1) > 150).mean())
+
+
+def lit_fraction(bgra, lo=225, spread=25):
+    """Share of near-white pixels in an icon: a usable skill icon is drawn lit (white glyph), an unusable one greyed.
+    Same idea ok-ww uses to tell an available skill; the level is a little lower for HDR-dimmed white."""
+    q = bgra[..., :3].astype(np.int16)
+    if not q.size:
+        return 0.0
+    mn, mx = q.min(-1), q.max(-1)
+    return float(((mn >= lo) & (mx - mn <= spread)).mean())
+
+
+LIT_ON, LIT_OFF = 0.12, 0.08       # share of near-white pixels in the icon disc: lit / still lit (hysteresis)
+PAD_DISC = 66                      # icon disc radius at 3840x2160 (inside the energy ring)
+
+
+def disc_stats(bgra, cx, cy, r):
+    """(white, dark) shares inside the icon disc. Measured on 600 skill-bar snapshots (RenoDX HDR10, UI 203 nits):
+    a usable ultimate is a white glyph on a dark disc (white 0.19-0.43); an unusable one is grey (white 0);
+    countdown digits are white too (0.05-0.08); screen flashes are white without the dark disc."""
+    h, w = bgra.shape[:2]
+    if r <= 0 or cx - r < 0 or cy - r < 0 or cx + r > w or cy + r > h:
+        return 0.0, 0.0
+    ys, xs = np.ogrid[-r:r, -r:r]
+    m = xs * xs + ys * ys < r * r
+    q = bgra[cy - r:cy + r, cx - r:cx + r, :3].astype(np.int16)[m]
+    mn, mx = q.min(-1), q.max(-1)
+    return float(((mn >= 225) & (mx - mn <= 25)).mean()), float((mx < 100).mean())
+
+
+def icon_lit(white, dark, ring, was_on=False):
+    """The ultimate icon drawn usable. Works for characters whose ultimate is unlocked by a move rather than the
+    energy ring (the ring is then partial but the glyph turns white). The ring alone is not enough: an almost
+    full ring with a grey glyph is still not ready."""
+    if ring < 0.15:                                    # not a skill icon (traversal prompt, menu, black screen)
+        return False
+    lo = LIT_OFF if was_on else LIT_ON
+    if white < lo or white > 0.6:                      # > 0.6: a white flash over the whole icon
+        return False
+    return dark >= 0.15 or ring >= 0.93                # dark disc behind the glyph; a full ring on a bright scene
 
 
 def otsu(values):
@@ -212,7 +255,7 @@ def body_brightness(bgra):
 
 
 class WWVision:
-    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None):
+    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None):
         """inputs(): returns (l2, r2) pressed 0..1 from the real pad. mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
         self.cam = camera; self.icons = {k: IconState() for k in ROIS}; self.forte = ForteState()
@@ -231,6 +274,8 @@ class WWVision:
         self.cd_last = {}; self.ring_on = {}; self.ready_since = {}; self.ring_val = {}; self.shot_error = None
         self.dpad = dpad; self.prev_hat = None; self.burst_until = -9.0; self.settle_until = -9.0; self.switches = 0
         self.slot = None; self.slot_mem = {}     # D-pad direction -> what that character's skills were when we left it
+        self.buttons = buttons; self.hold_since = {}; self.hold_fired = set(); self.holds = 0; self.lib_color = -1.0
+        self.lit_on = {}; self.lib_lit = -1.0; self.lib_disc = (0.0, 0.0)
 
     def _setup(self):
         if self.ocr is None:
@@ -289,11 +334,17 @@ class WWVision:
             keep = 0.25 if burst else 0.8                  # at 30 fps a missed countdown frame is caught again quickly
             in_cd = self.cd[k] is not None or (now - t_cd < keep and v_cd > 0.8)   # a missed frame is not "ready"
             raw = not in_cd
+            if k == 'liberation':                   # traced: how colourful the ultimate icon is (calibration for
+                ic = frame[max(0, cy - hy // 2):cy + hy // 2, max(0, cx - hx // 2):cx + hx // 2, :3].astype(np.int16)   # mechanics without the ring)
+                self.lib_color = float((ic.max(-1) - ic.min(-1)).mean()) if ic.size else -1.0
+                self.lib_disc = disc_stats(frame, cx, cy, int(PAD_DISC * self.sx)); self.lib_lit = self.lib_disc[0]
             if raw and k == 'liberation':           # no countdown: ready only with a full energy ring (hysteresis)
                 f = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx))
                 self.ring_val[k] = f                    # traced: why the ultimate does / doesn't count as ready
                 self.ring_on[k] = f > 0.93 or (self.ring_on.get(k, False) and f > 0.75)
-                raw = self.ring_on[k]
+                # ready = the icon drawn usable (white glyph), not just the ring: see icon_lit()
+                self.lit_on[k] = icon_lit(self.lib_disc[0], self.lib_disc[1], f, self.lit_on.get(k, False))
+                raw = self.lit_on[k]
             keep_now = self.final[k].state                  # no opinion yet: keep the remembered / current state
             if now < self.settle_until:                    # icons still swapping: don't read them yet
                 self.ready_since[k] = None; wants[k] = keep_now
@@ -328,6 +379,7 @@ class WWVision:
             if self.trace is not None:
                 self.trace.write(f'{int(time.time() * 1000)}\tswitch\that={hat}\n')
         self.prev_hat = hat
+        self._holds(now)
         for side, val in (('L', l2), ('R', r2)):
             if val > 0.5 and self.prev_in[side] <= 0.5:          # press edge: remember the icon before it
                 self.last_press[side] = now
@@ -403,7 +455,8 @@ class WWVision:
                 f'{k}={s.value:.1f}/{(s.lo or 0):.1f}-{(s.hi or 0):.1f}/{s.ready}/cd={self.cd[k]}/final={self.final[k].state}'
                 for k, s in self.icons.items())
                 + f'\tforte={self.forte.value:.3f}\tL2={l2:.2f}\tR2={r2:.2f}\tpad={self.pad if pad_on else None}\tbadges={self.layout}'
-                + f'\tring={self.ring_val.get("liberation", -1):.2f}\tpadcd={self.cd.get("echo")}/{self.cd.get("liberation")}\n')
+                + f'\tring={self.ring_val.get("liberation", -1):.2f}\tpadcd={self.cd.get("echo")}/{self.cd.get("liberation")}'
+                + f'\tlibcol={self.lib_color:.1f}\tliblit={self.lib_lit:.4f}\tburst={int(now < self.burst_until)}\n')
             if self.mem is not None and self.frames % 200 == 0:
                 self.trace.write(f'{ms}\tmem\t{self.mem()}\n')
         if self.trace is not None and (flips or forte_ev):
@@ -437,6 +490,32 @@ class WWVision:
                 self.stop_ev.wait(max(0.0, period - (time.monotonic() - t0)))
         except Exception as exc:
             self.error = exc
+
+    def _holds(self, now):
+        """Any face button or R1 / L1 held past HOLD_S: scan fast now and again right after it is let go."""
+        if self.buttons is None:
+            return
+        try:
+            mask = int(self.buttons() or 0)
+        except Exception:
+            return
+        for bit in range(8):
+            on = bool(mask & (1 << bit))
+            if on:
+                start = self.hold_since.setdefault(bit, now)
+                if now - start >= HOLD_S and bit not in self.hold_fired:
+                    self.hold_fired.add(bit); self.holds += 1
+                    self.burst_until = max(self.burst_until, now + BURST_S)
+                    if len(self.shot_due) < 6:
+                        self.shot_due.append((now + 0.3, 'H', f'hold{bit}'))
+                    if self.trace is not None:
+                        self.trace.write(f'{int(time.time() * 1000)}\thold\tbit={bit}\n')
+            elif bit in self.hold_since:
+                if bit in self.hold_fired:                   # released after a long press: the move just landed
+                    self.burst_until = max(self.burst_until, now + BURST_S)
+                    if len(self.shot_due) < 6:
+                        self.shot_due.append((now + 0.3, 'H', f'release{bit}'))
+                self.hold_since.pop(bit, None); self.hold_fired.discard(bit)
 
     def _predict(self, slot, now):
         """Skill states of the character in this slot, from when it left: an energy-full ultimate stays full,

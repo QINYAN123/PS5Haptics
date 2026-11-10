@@ -540,7 +540,7 @@ class Runner:
                                 tp = ROOT / 'traces' / time.strftime('ww-%Y%m%d-%H%M%S.tsv')
                             cd = (ROOT / 'traces' / 'ww-crops') if self.cfg.get('ww_collect', False) else None
                             sd = (ROOT / 'traces' / 'ww-shots') if self.cfg.get('ww_shots', True) else None
-                            vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), dpad=lambda: getattr(hid, 'dpad', None), trace_path=tp, mem=proc_mem_mb, crops_dir=cd, shots_dir=sd, fps=10); vision.start()   # 10 fps: half the screen-capture load (was 20)
+                            vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), dpad=lambda: getattr(hid, 'dpad', None), buttons=lambda: getattr(hid, 'held', 0), trace_path=tp, mem=proc_mem_mb, crops_dir=cd, shots_dir=sd, fps=10); vision.start()   # 10 fps: half the screen-capture load (was 20)
                         self.stats['profile'] = prof['name'] if prof else ''
                 press = hid.poll_input(); self.stats['battery'] = hid.battery
                 if vision is not None and fx is not None:
