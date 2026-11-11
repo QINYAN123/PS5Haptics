@@ -117,9 +117,11 @@ class EventFX:
         self.rules = list(cfg.get('rules', [])) + list(cfg.get('ww_rules', WW_RULES))
         self.groups = {}                       # group -> (priority, start_sample, until_sample)
         self.last_fire = {}; self.recent = collections.deque(maxlen=6); self.count = 0
+        self.last_event = 0.0                  # monotonic time of the last game event of any kind (stuck-vibration guard)
 
     # ---------------------------------------------------------------- events
     def feed(self, kind, fn, detail):
+        self.last_event = time.monotonic()
         for i, rule in enumerate(self.rules):
             if not rule_matches(rule, kind, fn, detail):
                 continue

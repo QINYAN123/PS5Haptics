@@ -533,6 +533,25 @@ def test_deps_checks():
     assert 'usbip' in xds.USBIP_HELP and '重启' in xds.USBIP_HELP
 
 
+def test_stuck_guard():
+    import ps5_haptics_app as A
+    logs = []; g = A.StuckGuard(logs.append)
+    vib = bytes([0x26, 0xFF, 3] + [0] * 8); bow = bytes([0x22, 2, 2, 0x3C] + [0] * 7)
+    assert g.trigger('R', vib, 0.0) == vib and g.trigger('R', vib, 2.0) == vib
+    assert g.trigger('R', vib, 3.5) is None and logs                  # trigger vibration left on: released
+    assert g.trigger('R', bow, 3.6) == bow and g.trigger('R', bow, 60.0) == bow   # resistance may stay forever
+    assert g.trigger('R', vib, 61.0) == vib                             # a new vibration works again
+    assert g.motors(80, 40, 0.0) == (80, 40) and g.motors(80, 40, 6.0) == (0, 0)
+    assert g.motors(90, 40, 6.1) == (90, 40)                            # values change: the game is driving it
+    t = 100.0; ev = 100.0
+    for i in range(100):                                                # ship: rumble with an event every second
+        t += 0.1; ev = t if i % 10 == 0 else ev
+        assert g.wave(0.3, ev, t) is False
+    muted = [g.wave(0.3, ev, t + k) for k in (1, 3, 5, 6.5, 8)]       # then no event any more
+    assert muted[:2] == [False, False] and muted[-1] is True
+    assert g.wave(0.05, ev, t + 9) is False                             # it stopped by itself
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -592,7 +611,7 @@ def test_live():
 
 
 if __name__ == '__main__':
-    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks()
+    test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks(); test_stuck_guard()
     print('offline tests ok')
     if '--live' in sys.argv:
         test_live()

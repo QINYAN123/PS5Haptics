@@ -41,6 +41,49 @@ DEFAULTS = {'grip_profile': '均衡', 'trigger_profile': '均衡冲击', 'grip_g
 
 WW_EXE = 'client-win64-shipping.exe'
 PBZ_EXE = 'pbz.exe'
+# 影之刃零 stuck-vibration guard (reported after some moves, e.g. 少主剑 R1+△): in this game every trigger vibration
+# the game sends is momentary and long coil rumbles (ship, slides) come with a stream of game events; so a trigger
+# vibration held for seconds, motor values frozen for seconds, or coil rumble with no game event for seconds is a
+# vibration the game forgot to stop, and is let go until the game changes it.
+STUCK_TRIGGER_S, STUCK_MOTOR_S, STUCK_WAVE_S, QUIET_EVENTS_S = 3.0, 5.0, 6.0, 4.0
+
+
+class StuckGuard:
+    def __init__(self, log):
+        self.log = log; self.seen = {}; self.wave_since = None; self.said = set()
+
+    def _say(self, what):
+        if what not in self.said:
+            self.said.add(what); self.log(f'检测到游戏的{what}一直没有停（游戏没发停止指令），已自动松开；游戏换成新的效果时恢复。')
+
+    def held(self, key, value, now):
+        last = self.seen.get(key)
+        if last is None or last[0] != value:
+            self.seen[key] = (value, now); return 0.0
+        return now - last[1]
+
+    def trigger(self, side, eff, now):
+        t = self.held('trig' + side, eff, now)
+        if eff is not None and eff[0] == 0x26 and t > STUCK_TRIGGER_S:
+            self._say('扳机震动'); return None
+        return eff
+
+    def motors(self, l, r, now):
+        t = self.held('motor', (l, r), now)
+        if (l or r) and t > STUCK_MOTOR_S:
+            self._say('马达震动'); return 0, 0
+        return l, r
+
+    def wave(self, level, last_event, now):
+        """True = mute the game's coil wave: strong for a while and no game event lately."""
+        if level < 0.15:
+            self.wave_since = None; return False
+        self.wave_since = self.wave_since or now
+        if now - self.wave_since > STUCK_WAVE_S and last_event and now - last_event > QUIET_EVENTS_S:
+            self._say('握把震动'); return True
+        return False
+
+
 # per-game tuning applied while that game is in the foreground
 GAME_PROFILES = {
     WW_EXE: {'name': '鸣潮', 'rumble_scale': 0.6, 'duck': 0.25, 'grip_profile': '细节丰富', 'vision': True},
@@ -303,7 +346,7 @@ class Runner:
             late_mark = 0                         # drops counted up to the last normal loop pass
             trig = (0.0, 0.0)                     # a block shorter than one hop (resampled) must not leave it unset
             tl_acc = dict.fromkeys(TL_KEYS, 0.0); tl_t = 0.0; static = (None, None); last_static = static
-            mode_warned = set()
+            mode_warned = set(); stuck = StuckGuard(self.log)
 
             def ours(i):                          # this side's own effect: a trigger-feel preset, else follow the sound
                 if static[i] is not None:
@@ -587,6 +630,8 @@ class Runner:
                         self.stats['voice_closed'] = False
                     if native:
                         (rleft, rright), _, color = vpad.feedback()
+                        if fg == PBZ_EXE:
+                            rleft, rright = stuck.motors(rleft, rright, time.monotonic())
                         large, small = rleft / 255, rright / 255
                         nl, nr = vpad.wave.pull(HOP)                  # game's own voice-coil waveform
                         rl, rr = rum.step(large, small, rgain)         # legacy rumble, if the game uses it
@@ -594,6 +639,8 @@ class Runner:
                         if fx is not None and FUSION_ALIAS.get(fusion, fusion) != '纯用游戏':   # event tuning: grade / duck the native layer
                             g = fx.native_gain(HOP); nl = nl * g; nr = nr * g
                         nlevel = float(max(np.max(np.abs(nl)), np.max(np.abs(nr))))
+                        if fg == PBZ_EXE and fx is not None and stuck.wave(nlevel, getattr(fx, 'last_event', 0.0), time.monotonic()):
+                            nl = nl * 0; nr = nr * 0; nlevel = 0.0
                         tl_acc['nat'] = max(tl_acc['nat'], nlevel); tl_acc['mot'] = max(tl_acc['mot'], large, small)
                         gpk = vpad.spk_peak; vpad.spk_peak = 0              # game's own pad-speaker channels
                         if gpk:
@@ -687,6 +734,9 @@ class Runner:
                 game_l = game_r = None
                 if native:
                     game_l, game_r, _ = vpad.triggers()
+                    if fg == PBZ_EXE:
+                        tnow = time.monotonic()
+                        game_l = stuck.trigger('L', game_l, tnow); game_r = stuck.trigger('R', game_r, tnow)
                     if trace is not None and (game_l, game_r) != trace_trig:
                         trace_trig = (game_l, game_r)
                         trace.write(f"{int(time.time() * 1000)}\ttrigger\t{game_l.hex() if game_l else '-'}\t{game_r.hex() if game_r else '-'}\n")
