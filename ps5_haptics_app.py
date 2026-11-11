@@ -289,7 +289,7 @@ class Runner:
                     if self.cfg.get('record_native'):
                         spk_clip = SpeakerClip(ROOT / 'traces')
             if self.cfg.get('speaker_mode', '冲击声') != '关闭':
-                try: hid.enable_speaker(volume=0x48, headset=self.cfg.get('speaker_output') == '耳机孔')          # undo a mute / headset routing left by a game
+                try: hid.enable_speaker(volume=0x64, headset=self.cfg.get('speaker_output') == '耳机孔')          # undo a mute / headset routing left by a game
                 except Exception: pass
             try: hid.set_lightbar(0, 80, 255)
             except Exception: pass
@@ -604,7 +604,7 @@ class Runner:
                 large = small = 0.0; gpk_l = gpk_r = 0.0; spk_peak = 0.0
                 if spk is not None and time.monotonic() - spk_assert > 5.0:   # keep the speaker routed
                     spk_assert = time.monotonic()
-                    try: hid.enable_speaker(volume=0x48, headset=self.cfg.get('speaker_output') == '耳机孔')
+                    try: hid.enable_speaker(volume=0x64, headset=self.cfg.get('speaker_output') == '耳机孔')
                     except Exception: pass
                 while len(pend_l) >= HOP:
                     bl, br = pend_l[:HOP], pend_r[:HOP]; pend_l, pend_r = pend_l[HOP:], pend_r[HOP:]

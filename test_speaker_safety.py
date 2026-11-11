@@ -10,6 +10,20 @@ def stream(x, block=240, headset=False):
 
 
 class SpeakerTests(unittest.TestCase):
+    def test_quiet_audio_keeps_nominal_makeup_gain(self):
+        renderer = RawSpeaker()
+        guard = SpeakerSafety()
+        output = []
+        for block in range(600):
+            t = (np.arange(HOP) + block * HOP) / 48000
+            tone = (.01 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+            renderer.analyse(tone, tone)
+            output.extend(guard.process(renderer.render('原味', .7)))
+        rms = np.sqrt(np.mean(np.asarray(output[-4800:]) ** 2))
+        self.assertGreater(rms, .027)
+        self.assertLess(rms, .031)
+        self.assertEqual(guard.limited_samples, 0)
+
     def test_overload_impulse_and_corrupt_samples(self):
         rng = np.random.default_rng(83)
         x = np.concatenate((np.zeros(4800), rng.normal(0, 5, 24000),

@@ -366,12 +366,12 @@ class RawSpeaker:
         rms = float(np.sqrt(np.mean(self.parts[0] ** 2))) if len(x) else 0.0
         if rms > 1e-4:                                   # silence does not count (no boost creeping up)
             self.lv = self.lv * 0.98 + rms * 0.02
-        self.mk += (min(2.0, max(1.0, 0.14 / max(self.lv, 1e-4))) - self.mk) * 0.02
+        self.mk += (min(4.0, max(1.0, 0.14 / max(self.lv, 1e-4))) - self.mk) * 0.02
 
     def render(self, preset, volume, boost=1.0):
         base, h, pr, top = self.parts; wb, wp, wt = self.PRESETS.get(preset, self.PRESETS['原味'])
         y = base + wb * h * float(np.sqrt(np.mean(base * base)) + 1e-4) * 4 + wp * pr + wt * top
-        return (y * np.clip(volume, 0., 1.) * boost * self.mk).astype(np.float32)  # final output lookahead limiter preserves waveform
+        return (y * np.clip(volume, 0., 1.) * boost * 1.5 * self.mk).astype(np.float32)  # final output lookahead limiter preserves waveform
 
 
 class SmartSpeaker:
