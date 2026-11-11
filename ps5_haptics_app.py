@@ -252,7 +252,7 @@ class Runner:
 
     def run(self):
         p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None; volume = None
-        voice_gate = None; pad_tap = None; g_env = 0.05; g_out_pk = 0.0; spk_clip = None; gsp_z = sosfilt_zi(GSP_LOWCUT) * 0.0
+        voice_gate = None; pad_tap = None; g_env = 0.05; g_gain = 1.0; g_out_pk = 0.0; spk_clip = None; gsp_z = sosfilt_zi(GSP_LOWCUT) * 0.0
         try:                                         # a game with its own settings already running: start with them (routing is fixed per run)
             import proc_loopback as plb
             here = foreground_exe()
@@ -289,7 +289,7 @@ class Runner:
                     if self.cfg.get('record_native'):
                         spk_clip = SpeakerClip(ROOT / 'traces')
             if self.cfg.get('speaker_mode', '冲击声') != '关闭':
-                try: hid.enable_speaker(headset=self.cfg.get('speaker_output') == '耳机孔')          # undo a mute / headset routing left by a game
+                try: hid.enable_speaker(volume=0x48, headset=self.cfg.get('speaker_output') == '耳机孔')          # undo a mute / headset routing left by a game
                 except Exception: pass
             try: hid.set_lightbar(0, 80, 255)
             except Exception: pass
@@ -420,7 +420,8 @@ class Runner:
                                  f'{(pr.max_gap * 1000 if pr else 0):.0f} ms，重连 {pr.reattach if pr else 0} 次，'
                                  f'积压清空 {self.stats.get("resync", 0)} 次，丢块 {self.stats["late"]}'
                                  + (f'，游戏原生扬声器峰值 {self.stats.get("game_spk", 0)}（断续 {pad_tap.underruns if pad_tap else 0} 次）（{vpad.spk_frames} 帧有声）' if native and vpad is not None else '')
-                                 + (f'，转到真手柄峰值 {g_out_pk:.2f}（增益 {min(10.0, 0.7 / g_env):.1f}x）' if pad_tap is not None else ''))
+                                 + (f'，转到真手柄峰值 {g_out_pk:.2f}（当前增益 {g_gain:.1f}x）' if pad_tap is not None else '')
+                                 + f'，输出欠载 {out.xruns} 次，扬声器限幅 {out.speaker_safety.limited_samples} 采样，异常采样 {out.speaker_safety.invalid_samples}')
                         g_out_pk = 0.0
                         self.stats['game_spk'] = 0
                         diag_t = tnow; diag_loop = 0.0
@@ -603,7 +604,7 @@ class Runner:
                 large = small = 0.0; gpk_l = gpk_r = 0.0; spk_peak = 0.0
                 if spk is not None and time.monotonic() - spk_assert > 5.0:   # keep the speaker routed
                     spk_assert = time.monotonic()
-                    try: hid.enable_speaker(headset=self.cfg.get('speaker_output') == '耳机孔')
+                    try: hid.enable_speaker(volume=0x48, headset=self.cfg.get('speaker_output') == '耳机孔')
                     except Exception: pass
                 while len(pend_l) >= HOP:
                     bl, br = pend_l[:HOP], pend_r[:HOP]; pend_l, pend_r = pend_l[HOP:], pend_r[HOP:]
@@ -692,18 +693,21 @@ class Runner:
                         # slow make-up gain to ~70 % peak, at most 10x; the speaker-volume slider applies on top
                         gpk_now = float(np.max(np.abs(gsp)))
                         g_env = max(gpk_now, g_env * 0.9995, 0.02)
-                        gsp = gsp * min(10.0, 0.7 / g_env)
+                        g_target = min(10.0, 0.7 / g_env)
+                        g_next = g_gain + (g_target - g_gain) * 0.1
+                        gsp = gsp * np.linspace(g_gain, g_next, len(gsp))
+                        g_gain = g_next
                     if spk is not None:
                         spk.analyse(bl, br)
                         if spk_eff == '全部游戏声':
                             sp = spk.render(spk_eq, vol)
                         elif spk_eff == '游戏原生':
-                            sp = np.clip(gsp * vol, -1, 1).astype(np.float32)
+                            sp = (gsp * vol).astype(np.float32) if gsp is not None else None
                         if gsp is not None:
                             g_out_pk = max(g_out_pk, float(np.max(np.abs(gsp))) * vol)
                         ev_on = fx is not None and fx.speaker_on() and spk_eff == '特殊事件'
                         if ev_on or spk_mix:                       # 特殊事件: the moment's own sound, its EQ, louder
-                            se = spk.render(fx.speaker_eq if (fx is not None and fx.speaker_eq) else None, max(0.8, vol), 1.5)
+                            se = spk.render(fx.speaker_eq if (fx is not None and fx.speaker_eq) else None, vol, 1.0)
                     if se is not None:                             # key event (parry, perfect dodge, ultimate...):
                         spk_want = 1.0 if ev_on else 0.0           # crossfade in / out
                         if spk_want or spk_mix:
@@ -719,7 +723,7 @@ class Runner:
                     gl_gain, gr_gain = self.cfg.get('grip_left_gain', 1.0), self.cfg.get('grip_right_gain', 1.0)
                     if gl_gain != 1.0 or gr_gain != 1.0:              # per-hand strength: everything that reaches that grip
                         wl = np.clip(wl * gl_gain, -1, 1).astype(np.float32); wr = np.clip(wr * gr_gain, -1, 1).astype(np.float32)
-                    out.feed(wl, wr, sp)
+                    out.feed(wl, wr, sp, headset=self.cfg.get('speaker_output') == '耳机孔')
                     try:
                         tl_acc['snd'] = max(tl_acc['snd'], float(np.max(np.abs(tl_snd_l))), float(np.max(np.abs(tl_snd_r))))
                     except NameError:

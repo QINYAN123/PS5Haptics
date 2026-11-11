@@ -343,7 +343,7 @@ class RawSpeaker:
     特殊事件 moments: clang (parry metal), whoosh (dodge), big (ultimate / special), thud (heavy hit).
     """
     PRESETS = {'原味': (0.0, 0.0, 0.0), '低音饱满': (0.9, 0.0, -0.15), '人声清晰': (0.0, 0.45, -0.1),
-               'clang': (0.0, 0.7, 0.15), 'whoosh': (0.2, 0.5, 0.1), 'big': (1.0, 0.25, 0.0), 'thud': (1.1, 0.0, -0.25),
+               'clang': (0.0, 0.15, -0.20), 'whoosh': (0.15, 0.15, -0.15), 'big': (0.4, 0.10, -0.15), 'thud': (0.4, 0.0, -0.25),
                None: (0.4, 0.3, 0.0)}
 
     def __init__(self):
@@ -366,12 +366,12 @@ class RawSpeaker:
         rms = float(np.sqrt(np.mean(self.parts[0] ** 2))) if len(x) else 0.0
         if rms > 1e-4:                                   # silence does not count (no boost creeping up)
             self.lv = self.lv * 0.98 + rms * 0.02
-        self.mk += (min(4.0, max(1.0, 0.14 / max(self.lv, 1e-4))) - self.mk) * 0.02
+        self.mk += (min(2.0, max(1.0, 0.14 / max(self.lv, 1e-4))) - self.mk) * 0.02
 
     def render(self, preset, volume, boost=1.0):
         base, h, pr, top = self.parts; wb, wp, wt = self.PRESETS.get(preset, self.PRESETS['原味'])
         y = base + wb * h * float(np.sqrt(np.mean(base * base)) + 1e-4) * 4 + wp * pr + wt * top
-        return np.tanh(y * volume * boost * 1.5 * self.mk).astype(np.float32)     # SmartSpeaker stays internal (key-event EQ)
+        return (y * np.clip(volume, 0., 1.) * boost * self.mk).astype(np.float32)  # final output lookahead limiter preserves waveform
 
 
 class SmartSpeaker:

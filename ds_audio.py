@@ -7,6 +7,7 @@ on the actuators (wired only).
 import threading
 import numpy as np
 import pyaudiowpatch as pa
+from speaker_safety import SpeakerSafety
 
 RATE = 48000
 
@@ -94,12 +95,16 @@ class HapticOut:
         self.stream = pa_open(self.p, format=pa.paFloat32, channels=4, rate=RATE, output=True,
                                   output_device_index=self.dev['index'], frames_per_buffer=960)   # 20 ms periods: rides out short stalls of the main loop (10-20 ms gaps = crackle)
         self.lock = threading.Lock(); self.xruns = 0
+        self.speaker_safety = SpeakerSafety()
 
-    def feed(self, left, right, speaker=None):
+    def feed(self, left, right, speaker=None, headset=False):
         n = len(left)
         buf = np.zeros((n, 4), np.float32)
-        if speaker is not None:             # ch1/ch2 = controller speaker (or its headphone jack)
-            buf[:, 0] = speaker; buf[:, 1] = speaker
+        if headset != self.speaker_safety.headset:
+            self.speaker_safety = SpeakerSafety(headset=headset)
+        # Feed zeros too, so filter/limiter tails drain when an event ends.
+        clean = self.speaker_safety.process(np.zeros(n) if speaker is None else speaker)
+        buf[:, 0] = clean; buf[:, 1] = clean
         buf[:, 2] = np.clip(left, -1, 1)
         buf[:, 3] = np.clip(right, -1, 1)
         try:
