@@ -464,6 +464,7 @@ def test_trigger_presets():
 
 def test_selfcheck_report():
     import selfcheck, getpass, os, urllib.parse
+    from unittest.mock import patch
     home = os.path.expanduser('~'); user = getpass.getuser()
     text = selfcheck.sanitize(f'log at {home}\\traces and user {user} done')
     assert home not in text and (len(user) <= 2 or user not in text)
@@ -477,6 +478,10 @@ def test_selfcheck_report():
     q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
     assert url.startswith('https://github.com/QINYAN123/PS5Haptics/issues/new?') and '缺少驱动' in q['title'][0] and 'Ctrl+V' in q['body'][0]
     assert len(url) < 2000
+    with patch.object(selfcheck, '_try', return_value=True):
+        problems, _ = selfcheck.collect(stats={'xruns': 0, 'late': 1239})
+        assert any('积压丢块' in p for p in problems)
+        assert all('输出欠载' not in p for p in problems)
 
 
 def test_game_profiles():
@@ -535,6 +540,7 @@ def test_deps_checks():
 
 def test_stuck_guard():
     import ps5_haptics_app as A
+    import numpy as np
     logs = []; g = A.StuckGuard(logs.append)
     vib = bytes([0x26, 0xFF, 3] + [0] * 8); bow = bytes([0x22, 2, 2, 0x3C] + [0] * 7)
     assert g.trigger('R', vib, 0.0) == vib and g.trigger('R', vib, 2.0) == vib
@@ -543,13 +549,35 @@ def test_stuck_guard():
     assert g.trigger('R', vib, 61.0) == vib                             # a new vibration works again
     assert g.motors(80, 40, 0.0) == (80, 40) and g.motors(80, 40, 6.0) == (0, 0)
     assert g.motors(90, 40, 6.1) == (90, 40)                            # values change: the game is driving it
-    t = 100.0; ev = 100.0
-    for i in range(100):                                                # ship: rumble with an event every second
-        t += 0.1; ev = t if i % 10 == 0 else ev
-        assert g.wave(0.3, ev, t) is False
-    muted = [g.wave(0.3, ev, t + k) for k in (1, 3, 5, 6.5, 8)]       # then no event any more
-    assert muted[:2] == [False, False] and muted[-1] is True
-    assert g.wave(0.05, ev, t + 9) is False                             # it stopped by itself
+    step = A.HOP / A.RATE
+    t = 100.0
+    phase = 2 * np.pi * 97 * np.arange(A.HOP) / A.RATE
+
+    def render(seconds, amplitudes, events=False):
+        nonlocal t
+        states = []
+        start = t
+        for i in range(round(seconds / step)):
+            t = start + i * step
+            left, right = amplitudes(i * step)
+            carrier = np.sin(phase + 2 * np.pi * 97 * i * step)
+            event = start + int(i * step) if events else 0.0
+            states.append(g.wave(left * carrier, right * carrier, event, t))
+        t = start + seconds
+        return states
+
+    plateau = lambda s: (0.60 + 0.012 * np.sin(13 * s), 0.32)
+    assert not any(render(12, plateau, events=True))   # recent events keep regular feedback
+    g.reset_wave()
+    assert not any(render(12, lambda s: (0.4 + 0.17 * np.sin(3 * s), 0.32)))
+    g.reset_wave()
+    assert not any(render(5.9, plateau))               # no event mod, issue #2 pattern
+    assert render(1, plateau)[-1]
+    assert all(render(1, plateau))
+    assert not render(0.2, lambda s: (0.60, 0.48))[-1]  # new effect rearms, even if the strongest side stays the same
+    assert render(6.5, plateau)[-1]
+    assert not render(0.2, lambda s: (0.0, 0.0))[-1]    # silence rearms the guard
+    assert not any(render(0.5, plateau))
 
 
 def test_volume():

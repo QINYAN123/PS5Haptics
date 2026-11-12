@@ -688,6 +688,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     root.geometry(f'{px(1240)}x{px(830)}'); root.minsize(px(1100), px(760))
     _dark_titlebar(root)
     msgs = queue.Queue(); runner = {'r': None, 't': None}
+    pbz = {'status': None, 'started': None, 'checking': False, 'state': 'checking', 'notice': None}
 
     V = {
         'grip_profile': tk.StringVar(value=cfg['grip_profile']), 'trigger_profile': tk.StringVar(value=cfg['trigger_profile']),
@@ -782,13 +783,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             msgs.put('「' + SC('mode') + '」需要先安装：' + '、'.join(m[1] for m in miss) + '。正在打开依赖安装…')
             install_deps(); return
         if V['pbz_fx'].get():
-            try:
-                import sysfix
-                st = sysfix.pbz_status()
-                if st['game'] and (not st['ue4ss'] or st['mod'] != 'ok'):
-                    msgs.put('提示：影之刃零的事件特调缺少 UE4SS 或事件 mod（游戏适配 → 影之刃零的齿轮里有安装说明）。其他功能照常启动。')
-            except Exception:
-                pass
+            pbz_check()
         collect()
         r = runner_cls(cfg, msgs.put); runner['r'] = r
         runner['t'] = threading.Thread(target=r.run, daemon=True); runner['t'].start()
@@ -1107,6 +1102,13 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     next_buttons = {'deps': NeonButton(nextbar, '一键安装依赖', lambda: install_deps(), w=130, h=30, size=10, color=AMBER, bg=NB),
                     'repair': NeonButton(nextbar, '修复手柄', lambda: repair_pad_ui(), w=110, h=30, size=10, color=AMBER, bg=NB)}
     row1 = tk.Frame(pg, bg=BG); row1.pack(fill='both', expand=True)
+    pbz_bg = mix(BG, AMBER, 0.12)
+    pbz_bar = tk.Frame(pg, bg=pbz_bg, highlightthickness=1, highlightbackground=AMBER)
+    pbz_banner = tk.Label(pbz_bar, bg=pbz_bg, fg=AMBER, font=(ZH, 10, 'bold'), anchor='w', justify='left')
+    pbz_banner.pack(side='left', fill='x', expand=True, padx=px(12), pady=px(6))
+    NeonButton(pbz_bar, '检查事件 Mod', lambda: open_detail('影之刃零'), w=156, h=30,
+               size=10, color=AMBER, bg=pbz_bg).pack(side='right', padx=px(8))
+    pbz_banner.bind('<Configure>', lambda e: pbz_banner.configure(wraplength=max(px(300), e.width)))
 
     def update_next(run):
         need = NEEDS.get(SC('mode'), ())
@@ -1168,6 +1170,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         grid_view.pack_forget()
         for f in details.values(): f.pack_forget()
         details[key].pack(fill='x')
+        if key == '影之刃零':
+            pbz_check()
 
     def open_detail(key):                   # (scripted screenshots)
         if key in SCENES:
@@ -1220,7 +1224,11 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     NeonButton(fr, '自动查找', pbz_auto, w=96, h=30, size=9).pack(side='left')
     NeonButton(fr, '浏览…', pbz_browse, w=80, h=30, size=9).pack(side='left', padx=px(6))
     pbz_lb.pack(fill='x', pady=(px(4), 0))
-    req = Panel(details['影之刃零'], '运行条件', 'REQUIREMENTS', accent=MAG); req.pack(fill='x', pady=(0, px(10)))
+    req = Panel(details['影之刃零'], '运行条件', 'REQUIREMENTS', accent=AMBER)
+    req.pack(fill='x', pady=(0, px(10)), before=p)
+    req_status = tk.Label(req.body, text='检测中…', bg=PANEL, fg=AMBER, font=(ZH, 12, 'bold'),
+                          justify='left', anchor='w', wraplength=px(890))
+    req_status.pack(fill='x', pady=(0, px(6)))
     req_lb = tk.Label(req.body, text='检测中…', bg=PANEL, fg=TEXT, font=(ZH, 10), justify='left', anchor='w', wraplength=px(900))
     req_lb.pack(fill='x')
     tk.Label(req.body, justify='left', anchor='w', bg=PANEL, fg=DIM, font=(ZH, 9), wraplength=px(900), text=(
@@ -1233,27 +1241,80 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     fr = tk.Frame(req.body, bg=PANEL); fr.pack(fill='x')
 
     def pbz_check():
+        if pbz['checking']:
+            return
+        pbz['checking'] = True
+        log_dir = V['pbz_log_dir'].get()
+
+        def done(st):
+            pbz['checking'] = False
+            if log_dir != V['pbz_log_dir'].get():
+                pbz_check()
+                return
+            pbz['status'] = st
+            show_pbz()
+
         def work():
             try:
                 import sysfix
-                st = sysfix.pbz_status()
+                st = sysfix.pbz_status(log_dir)
             except Exception as exc:
                 st = {'error': str(exc)}
-            root.after(0, lambda: show_pbz(st))
+            root.after(0, done, st)
         threading.Thread(target=work, daemon=True).start()
 
-    def show_pbz(st):
-        if st.get('error'):
-            req_lb.configure(text='检测失败：' + st['error'], fg=AMBER); return
-        if not st['game']:
-            req_lb.configure(text='✗ 没有在 Steam 库里找到影之刃零（没装这个游戏可以忽略）', fg=FAINT); return
-        lines = ['✓ 游戏：' + st['game'],
-                 ('✓ UE4SS 已安装' if st['ue4ss'] else '✗ 没有安装 UE4SS：请先按下面说明安装'),
-                 {'ok': '✓ 事件 mod 已安装（最新）', 'old': '! 事件 mod 版本较旧：点「一键安装事件 mod」更新',
-                  'disabled': '! 事件 mod 被停用（缺 enabled.txt）：点「一键安装事件 mod」重新启用',
-                  None: '✗ 没有安装事件 mod'}[st['mod']]]
-        ok = st['ue4ss'] and st['mod'] == 'ok'
-        req_lb.configure(text='\n'.join(lines), fg=GREEN if ok else AMBER)
+    pbz_states = {
+        'checking': ('检测中…', '正在检查 UE4SS 和事件 Mod'),
+        'error': ('检测失败', '无法检查事件 Mod，请重新检测。'),
+        'game_missing': ('未找到游戏', '未找到游戏安装目录。可手动选择事件日志目录。'),
+        'loader_missing': ('缺少 UE4SS', '缺少 UE4SS。请先安装加载器，再安装事件 Mod。'),
+        'mod_missing': ('缺少 Mod', '缺少 PS5EventLog。请点「一键安装事件 mod」。'),
+        'mod_disabled': ('Mod 已停用', 'PS5EventLog 已停用。请重新安装并重启游戏。'),
+        'mod_old': ('Mod 待更新', 'PS5EventLog 与随软件附带的版本不同。请检查版本，更新后重启游戏。'),
+        'manual': ('手动目录', '已设置手动日志目录。启动游戏后检查是否写入本次日志。'),
+        'ready': ('依赖已安装', 'UE4SS 和 PS5EventLog 文件已找到。启动游戏后验证事件日志。'),
+        'waiting': ('等待事件日志', '正在等待本次游戏的事件日志。'),
+        'no_log': ('未见事件日志', '本次游戏运行超过 3 分钟仍未发现事件日志。请检查加载器、Mod 和日志目录。'),
+        'logging': ('已见事件日志', '已检测到本次游戏的事件日志。'),
+    }
+    pbz_warnings = {'error', 'loader_missing', 'mod_missing', 'mod_disabled', 'mod_old', 'no_log'}
+
+    def pbz_badge():
+        state = pbz['state']
+        return pbz_states[state][0], AMBER if state in pbz_warnings else GREEN if state == 'logging' else DIM
+
+    def show_pbz():
+        from sysfix import pbz_event_state
+        st = pbz['status']
+        state = pbz_event_state(st, pbz['started'])
+        pbz['state'] = state
+        message = pbz_states[state][1]
+        color = pbz_badge()[1]
+        req_status.configure(text=message, fg=color)
+        lines = []
+        if st and st.get('game'):
+            lines = ['✓ 游戏：' + st['game'],
+                     '✓ UE4SS 已安装' if st['ue4ss'] else '✗ 没有安装 UE4SS：请先按下面说明安装',
+                     {'ok': '✓ 事件 mod 已安装（最新）', 'old': '! 事件 mod 版本较旧：点「一键安装事件 mod」更新',
+                      'disabled': '! 事件 mod 被停用（缺 enabled.txt）：点「一键安装事件 mod」重新启用',
+                      None: '✗ 没有安装事件 mod'}[st['mod']]]
+        elif st and st.get('error'):
+            lines = [st['error']]
+        req_lb.configure(text='\n'.join(lines))
+        show_warning = V['pbz_fx'].get() and V['scene'].get() == '游戏' and (
+            state in pbz_warnings or (state == 'game_missing' and games_on['pbz']))
+        if show_warning:
+            notice = '影之刃零事件特调：' + message
+            pbz_banner.configure(text=notice)
+            if not pbz_bar.winfo_manager():
+                pbz_bar.pack(fill='x', before=row1, pady=(0, px(6)))
+            if running() and notice != pbz['notice']:
+                msgs.put(notice)
+                pbz['notice'] = notice
+        else:
+            pbz_bar.pack_forget()
+            pbz['notice'] = None
+        cards['影之刃零'].redraw()
 
     def pbz_install():
         import sysfix
@@ -1532,8 +1593,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                            is_on=lambda: V['ww_enabled'].get(), badge=lambda: ('运行中', GREEN) if games_on['ww'] else None,
                            on_click=lambda: toggle(V['ww_enabled']), on_gear=lambda: show_detail('鸣潮'))
     cards['影之刃零'] = GameCard(row, '影之刃零', '格挡 · 闪避 · 受击事件特调', art='impact', accent=MAG,
-                             is_on=lambda: V['pbz_fx'].get(), badge=lambda: ('运行中', GREEN) if games_on['pbz'] else None,
-                             on_click=lambda: toggle(V['pbz_fx']), on_gear=lambda: show_detail('影之刃零'))
+                             is_on=lambda: V['pbz_fx'].get(), badge=pbz_badge,
+                             on_click=lambda: toggle(V['pbz_fx']), on_gear=lambda: show_detail('影之刃零'),
+                             on_text='已选择')
     for c in ('鸣潮', '影之刃零'):
         cards[c].pack(side='left', padx=(0, px(16)))
     tk.Label(grid_view, text='其他游戏不用设置，打开就能用：在「游戏」场景下自动把前台游戏的声音转成触感，支持 PS5 手柄的游戏走原生透传。',
@@ -1721,6 +1783,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         for c in list(cards.values()) + list(lib['cards'].values()): c.redraw()
     for k in ('ww_enabled', 'pbz_fx', 'scene'):
         V[k].trace_add('write', redraw_cards)
+    for k in ('pbz_fx', 'scene'):
+        V[k].trace_add('write', lambda *_: show_pbz())
+    V['pbz_log_dir'].trace_add('write', lambda *_: root.after_idle(pbz_check))
 
     def load_covers():
         import covers
@@ -1736,24 +1801,29 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def watch_games():
         import proc_loopback as plb
-        pbz_since = None; warned = False
+        from sysfix import process_start_time
+        last_pid = None
+        started = None
+
+        def update_pbz(running_game, start_time):
+            games_on['pbz'] = running_game
+            if pbz['started'] != start_time:
+                pbz['started'] = start_time
+                show_pbz()
+            if running_game:
+                pbz_check()
+
         while True:
             try:
                 games_on['ww'] = plb.find_pid('Client-Win64-Shipping.exe') is not None
-                games_on['pbz'] = plb.find_pid('PBZ.exe', 'PBZ-Win64-Shipping.exe') is not None
+                found = plb.find_pid('PBZ.exe', 'PBZ-Win64-Shipping.exe')
+                pid = found[0] if found else None
+                if pid != last_pid:
+                    last_pid = pid
+                    started = (process_start_time(pid) or time.time()) if pid is not None else None
+                root.after(0, update_pbz, pid is not None, started)
                 lib['running'] = {exe_name(g) for g in list(games()) if exe_name(g) and plb.find_pid(pathlib.Path(g['exe']).name) is not None}
                 root.after(0, redraw_cards)
-                if games_on['pbz'] and V['pbz_fx'].get():
-                    pbz_since = pbz_since or time.time()
-                    if not warned and time.time() - pbz_since > 180:
-                        import sysfix
-                        st = sysfix.pbz_status()
-                        if st['mod'] == 'ok' and (st['last_log'] is None or st['last_log'] < pbz_since - 5):
-                            warned = True
-                            msgs.put('影之刃零已运行 3 分钟，但事件 mod 没有写出日志：可能是游戏更新后 UE4SS 或 mod 失效。'
-                                     '事件特调暂时不起作用，原生触感和声音触感不受影响。请检查 UE4SS 是否有新版本。')
-                else:
-                    pbz_since = None; warned = False
             except Exception:
                 pass
             time.sleep(3)

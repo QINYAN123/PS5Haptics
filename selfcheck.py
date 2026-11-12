@@ -178,8 +178,10 @@ def collect(cfg=None, stats=None, timeline=None, log_path=None, running=False):
     if stats:
         keep = {k: v for k, v in stats.items() if isinstance(v, (int, float, str, bool, tuple)) and k not in ('level',)}
         out.append('运行状态：' + '，'.join(f'{k}={v}' for k, v in keep.items()))
-        if stats.get('xruns', 0) > 50 or stats.get('late', 0) > 50:
-            problems.append(f"音频断流较多（xruns {stats.get('xruns', 0)}，late {stats.get('late', 0)}）：握把可能断断续续，关掉其他占用手柄声卡的软件试试。")
+        if stats.get('xruns', 0) > 50:
+            problems.append(f"手柄音频输出欠载较多（xruns {stats['xruns']}）：声音或握把触感可能断续。")
+        if stats.get('late', 0) > 50:
+            problems.append(f"音频输入队列曾积压丢块（late {stats['late']}，本次运行累计）。")
     out.append('')
     _timeline(out, timeline)
     out.append('')

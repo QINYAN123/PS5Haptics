@@ -128,30 +128,79 @@ def bundled_mod():
     return None
 
 
-def pbz_status():
+def pbz_status(log_dir=None):
     """dict: game, ue4ss (bool), mod (None / 'ok' / 'old' / 'disabled'), log_dir, last_log (epoch or None)."""
     import hashlib
     st = dict(game=None, ue4ss=False, mod=None, log_dir=None, last_log=None)
     g = find_pbz_game()
-    if g is None:
-        return st
-    st['game'] = str(g)
-    base = g / 'platform' / 'steam'
-    ue = base / 'ue4ss'
-    st['ue4ss'] = (ue / 'UE4SS.dll').exists() and any((base / n).exists() for n in ('dwmapi.dll', 'xinput1_3.dll', 'dxgi.dll'))
-    mod = ue / 'Mods' / 'PS5EventLog'
-    if (mod / 'Scripts' / 'main.lua').exists():
-        src = bundled_mod()
-        same = src is None or hashlib.sha1((mod / 'Scripts' / 'main.lua').read_bytes()).digest() == \
-            hashlib.sha1((src / 'Scripts' / 'main.lua').read_bytes()).digest()
-        st['mod'] = 'disabled' if not (mod / 'enabled.txt').exists() else ('ok' if same else 'old')
-        logs = mod / 'logs'; st['log_dir'] = str(logs)
+    if g is not None:
+        st['game'] = str(g)
+        base = g / 'platform' / 'steam'
+        ue = base / 'ue4ss'
+        st['ue4ss'] = (ue / 'UE4SS.dll').is_file() and any(
+            (base / n).is_file() for n in ('dwmapi.dll', 'xinput1_3.dll', 'dxgi.dll'))
+        mod = ue / 'Mods' / 'PS5EventLog'
+        script = mod / 'Scripts' / 'main.lua'
+        if script.is_file():
+            src = bundled_mod()
+            same = src is None or hashlib.sha1(script.read_bytes()).digest() == \
+                hashlib.sha1((src / 'Scripts' / 'main.lua').read_bytes()).digest()
+            st['mod'] = 'disabled' if not (mod / 'enabled.txt').is_file() else ('ok' if same else 'old')
+            st['log_dir'] = str(mod / 'logs')
+    if log_dir:
+        st['log_dir'] = str(log_dir)
+    if st['log_dir']:
+        logs = pathlib.Path(st['log_dir'])
         try:
-            files = sorted(logs.glob('events-*.tsv'), key=lambda p: p.stat().st_mtime)
-            st['last_log'] = files[-1].stat().st_mtime if files else None
+            st['last_log'] = max((p.stat().st_mtime for p in logs.glob('events-*.tsv') if p.is_file()), default=None)
         except OSError:
             pass
     return st
+
+
+def pbz_event_state(status, session_started=None, now=None):
+    """Display state. A log from the current game session is stronger evidence than installed files."""
+    if status is None:
+        return 'checking'
+    if status.get('error'):
+        return 'error'
+    last_log = status['last_log']
+    if session_started is not None and last_log is not None and last_log >= session_started:
+        return 'logging'
+    if not status['game'] and not status['log_dir']:
+        return 'game_missing'
+    if status['game']:
+        if not status['ue4ss']:
+            return 'loader_missing'
+        if status['mod'] != 'ok':
+            return {'disabled': 'mod_disabled', 'old': 'mod_old', None: 'mod_missing'}[status['mod']]
+    if session_started is None:
+        return 'ready' if status['game'] else 'manual'
+    if (now if now is not None else time.time()) - session_started >= 180:
+        return 'no_log'
+    return 'waiting'
+
+
+def process_start_time(pid):
+    """Creation time in Unix seconds, for comparing event-log mtimes to this game session."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k.OpenProcess.restype = wintypes.HANDLE
+    filetime_p = ctypes.POINTER(wintypes.FILETIME)
+    k.GetProcessTimes.argtypes = (wintypes.HANDLE, filetime_p, filetime_p, filetime_p, filetime_p)
+    k.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if k.GetProcessTimes(handle, *(ctypes.byref(t) for t in (created, exited, kernel, user))):
+            ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return (ticks - 116444736000000000) / 10_000_000
+    finally:
+        k.CloseHandle(handle)
 
 
 def install_pbz_mod():

@@ -44,17 +44,27 @@ PBZ_EXE = 'pbz.exe'
 # 影之刃零 stuck-vibration guard (reported after some moves, e.g. 少主剑 R1+△): in this game every trigger vibration
 # the game sends is momentary and long coil rumbles (ship, slides) come with a stream of game events; so a trigger
 # vibration held for seconds, motor values frozen for seconds, or coil rumble with no game event for seconds is a
-# vibration the game forgot to stop, and is let go until the game changes it.
+# vibration the game may have forgotten to stop. Without event data, require a
+# sustained plateau in both channels before suppressing the native waveform.
 STUCK_TRIGGER_S, STUCK_MOTOR_S, STUCK_WAVE_S, QUIET_EVENTS_S = 3.0, 5.0, 6.0, 4.0
+WAVE_WINDOW_SAMPLES = RATE // 10
 
 
 class StuckGuard:
     def __init__(self, log):
-        self.log = log; self.seen = {}; self.wave_since = None; self.said = set()
+        self.log = log; self.seen = {}; self.said = set()
+        self.reset_wave()
+
+    def reset_wave(self):
+        self.wave_since = None
+        self.wave_reference = None
+        self.wave_peaks = (0.0, 0.0)
+        self.wave_samples = 0
+        self.wave_muted = False
 
     def _say(self, what):
         if what not in self.said:
-            self.said.add(what); self.log(f'检测到游戏的{what}一直没有停（游戏没发停止指令），已自动松开；游戏换成新的效果时恢复。')
+            self.said.add(what); self.log(f'检测到游戏的{what}疑似卡住，已自动松开；游戏换成新的效果时恢复。')
 
     def held(self, key, value, now):
         last = self.seen.get(key)
@@ -74,14 +84,33 @@ class StuckGuard:
             self._say('马达震动'); return 0, 0
         return l, r
 
-    def wave(self, level, last_event, now):
-        """True = mute the game's coil wave: strong for a while and no game event lately."""
-        if level < 0.15:
-            self.wave_since = None; return False
-        self.wave_since = self.wave_since or now
-        if now - self.wave_since > STUCK_WAVE_S and last_event and now - last_event > QUIET_EVENTS_S:
-            self._say('握把震动'); return True
-        return False
+    def wave(self, left, right, last_event, now):
+        """Watch the raw native coil signal, before it is mixed with other vibration."""
+        peaks = (float(np.max(np.abs(left))), float(np.max(np.abs(right))))
+        if last_event and now - last_event <= QUIET_EVENTS_S:
+            self.reset_wave()
+            return False
+        self.wave_peaks = tuple(max(a, b) for a, b in zip(self.wave_peaks, peaks))
+        self.wave_samples += len(left)
+        if self.wave_samples < WAVE_WINDOW_SAMPLES:
+            return self.wave_muted
+        peaks = self.wave_peaks
+        self.wave_peaks = (0.0, 0.0)
+        self.wave_samples = 0
+        if max(peaks) < 0.15:
+            self.reset_wave()
+            return False
+        # Compare to the first window of the plateau, so gradual changes rearm it too.
+        if self.wave_reference is None or any(
+            abs(a - b) > max(0.025, 0.08 * b) for a, b in zip(peaks, self.wave_reference)
+        ):
+            self.wave_reference = peaks
+            self.wave_since = now
+            self.wave_muted = False
+        elif now - self.wave_since >= STUCK_WAVE_S:
+            self.wave_muted = True
+            self._say('原生握把震动')
+        return self.wave_muted
 
 
 # per-game tuning applied while that game is in the foreground
@@ -483,6 +512,7 @@ class Runner:
                     fg_check = now; new_fg = foreground_exe()
                     if new_fg != fg:
                         fg_since = now
+                        stuck.reset_wave()
                     fg = new_fg
                     g_now = self.profile_for(fg)
                     g_name = g_now.get('name') if g_now else None
@@ -635,13 +665,13 @@ class Runner:
                             rleft, rright = stuck.motors(rleft, rright, time.monotonic())
                         large, small = rleft / 255, rright / 255
                         nl, nr = vpad.wave.pull(HOP)                  # game's own voice-coil waveform
+                        if fg == PBZ_EXE and stuck.wave(nl, nr, fx.last_event if fx is not None else 0.0, time.monotonic()):
+                            nl = np.zeros_like(nl); nr = np.zeros_like(nr)
                         rl, rr = rum.step(large, small, rgain)         # legacy rumble, if the game uses it
                         nl = nl * rgain + rl; nr = nr * rgain + rr
                         if fx is not None and FUSION_ALIAS.get(fusion, fusion) != '纯用游戏':   # event tuning: grade / duck the native layer
                             g = fx.native_gain(HOP); nl = nl * g; nr = nr * g
                         nlevel = float(max(np.max(np.abs(nl)), np.max(np.abs(nr))))
-                        if fg == PBZ_EXE and fx is not None and stuck.wave(nlevel, getattr(fx, 'last_event', 0.0), time.monotonic()):
-                            nl = nl * 0; nr = nr * 0; nlevel = 0.0
                         tl_acc['nat'] = max(tl_acc['nat'], nlevel); tl_acc['mot'] = max(tl_acc['mot'], large, small)
                         gpk = vpad.spk_peak; vpad.spk_peak = 0              # game's own pad-speaker channels
                         if gpk:
