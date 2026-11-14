@@ -20,6 +20,8 @@ import sys
 import threading
 import numpy as np
 
+from usbip_vhci import VHCI_DESCRIPTION, VHCI_ERROR, Vhci
+
 ROOT = pathlib.Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else pathlib.Path(__file__).resolve().parent
 
 
@@ -83,8 +85,18 @@ class WaveBuffer:
                 np.interp(xs, np.arange(len(arr)), arr[:, 1]).astype(np.float32))
 
 
-USBIP_HELP = ('usbip-win2 驱动没就绪，虚拟 PS5 手柄建不起来：刚装完驱动的话请先重启电脑；还不行就到「系统」页点「一键安装依赖」重装。'
+USBIP_HELP = ('usbip-win2 驱动没就绪：刚装完驱动请先重启电脑；缺少驱动时可到「系统」页点「一键安装依赖」。'
               '急着玩可以先把连接方式换成「接管」或「虚拟 Xbox」')
+VHCI_HELP = VHCI_DESCRIPTION + '，虚拟 PS5 手柄无法启动。请点「修复 VHCI」，完成后重新启动原生透传。'
+
+
+def startup_error(err, logs=()):
+    details = '\n'.join((err, *logs))
+    if any(marker.casefold() in details.casefold() for marker in VHCI_ERROR):
+        return VHCI_HELP
+    if 'usbip' in err.lower():
+        return USBIP_HELP + '（详细：' + err[:240] + '）'
+    return err
 
 
 def host_command():
@@ -159,6 +171,15 @@ class VirtualDualSense:
                 self.error = str(exc); self.ready.set()
 
     def open(self):
+        try:
+            interfaces = Vhci().interfaces()
+        except (OSError, RuntimeError) as exc:
+            self.log(f'无法预检 VHCI 接口，将由虚拟手柄宿主程序检查：{exc}')
+        else:
+            if len(interfaces) > 1:
+                self.log(f'usbip-win2 VHCI 接口数量：{len(interfaces)}')
+                raise RuntimeError(VHCI_HELP)
+
         env = dict(os.environ)
         try:                                       # usbip-win2 installed somewhere else: let VIIPER's fallback find usbip.exe
             import deps
@@ -177,9 +198,14 @@ class VirtualDualSense:
         self.reader = threading.Thread(target=self._read_loop, daemon=True); self.reader.start()
         if not self.ready.wait(15) or self.error:
             err = self.error or '虚拟 PS5 手柄创建超时'
-            if 'usbip' in err.lower():             # say what to do, keep the technical detail for bug reports
-                err = (USBIP_HELP + '（详细：' + err[:240] + '）')
-            self.close(); raise RuntimeError(err)
+            logs = [line for _, line in self.logs]
+            message = startup_error(err, logs)
+            if message == VHCI_HELP:
+                self.log(f'虚拟 PS5 手柄启动失败（VIIPERHost）：{err}')
+                for line in logs:
+                    self.log(line)
+            self.close()
+            raise RuntimeError(message)
 
     # gate[side] = raw threshold (0..255) or None. While set, the game sees that trigger as fully
     # released until the physical trigger passes the threshold (the adaptive "click" point), then

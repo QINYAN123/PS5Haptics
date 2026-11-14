@@ -892,13 +892,18 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             errbar.pack_forget()
 
     def show_error(text):
+        from usbip_vhci import VHCI_DESCRIPTION
+        conflict = VHCI_DESCRIPTION in text
+        err_repair.config_look(text=tr('修复 VHCI' if conflict else '修复手柄'))
+        err_repair.command = repair_vhci_ui if conflict else repair_pad_ui
         err_lb.configure(text=text, wraplength=max(px(300), root.winfo_width() - px(520)))
         if not errbar.winfo_ismapped():
             errbar.pack(fill='x', padx=px(14), pady=(px(8), 0), after=head)
     NeonButton(errbar, '关闭', hide_error, w=70, h=30, size=10, color=MAG, bg=EB).pack(side='right', padx=(0, px(8)), pady=px(4))
     NeonButton(errbar, '查看日志', lambda: show('日志'), w=100, h=30, size=10, color=MAG, bg=EB).pack(side='right', padx=(0, px(8)), pady=px(4))
     NeonButton(errbar, '反馈问题', lambda: run_selfcheck(open_issue=True), w=100, h=30, size=10, color=MAG, bg=EB).pack(side='right', padx=(0, px(8)), pady=px(4))
-    NeonButton(errbar, '修复手柄', lambda: repair_pad_ui(), w=100, h=30, size=10, color=MAG, bg=EB, filled=True).pack(side='right', padx=(0, px(8)), pady=px(4))
+    err_repair = NeonButton(errbar, '修复手柄', lambda: repair_pad_ui(), w=112, h=30, size=10, color=MAG, bg=EB, filled=True)
+    err_repair.pack(side='right', padx=(0, px(8)), pady=px(4))
 
     # ---- update banner (no pop-up): a newer release on GitHub -> online update or manual download
     UB = mix(BG, GREEN, 0.14)
@@ -1881,6 +1886,16 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     NeonButton(fr, '一键安装依赖', install_deps, w=130, h=32, size=10, color=AMBER).pack(side='left')
     NeonButton(fr, '重新检查', check_system, w=100, h=32, size=10).pack(side='left', padx=px(8))
     NeonButton(fr, '关闭英特尔USB音频', intel_off, w=170, h=32, size=10, color=AMBER).pack(side='left', padx=px(8))
+
+    def repair_vhci_ui():
+        import deps
+        exe = deps.installer_exe()
+        if exe is None:
+            show_error('usbip-win2 检测到多个 VHCI 接口。找不到「依赖.exe」，请完整解压最新发布包后再修复。')
+        elif deps.run_elevated(exe, '--repair-vhci'):
+            msgs.put('已启动 VHCI 修复，请查看依赖工具窗口里的结果。')
+        else:
+            show_error('usbip-win2 检测到多个 VHCI 接口。修复工具未启动，请重试并允许管理员权限。')
 
     def repair_pad_ui():
         """Crash left the controller hidden / unrecognised: stop, undo every hide, close a leftover virtual pad."""

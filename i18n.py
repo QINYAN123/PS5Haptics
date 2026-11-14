@@ -452,6 +452,11 @@ T = [
     ('声骸释放', 'Echo cast', '音骸 発動', '에코 발동'),
     ('声骸就绪', 'Echo ready', '音骸 準備完了', '에코 준비'),
     # ---- repair controller
+    ('修复 VHCI', 'Repair VHCI', 'VHCI 修復', 'VHCI 복구'),
+    ('usbip-win2 检测到多个 VHCI 接口，虚拟 PS5 手柄无法启动。请点「修复 VHCI」，完成后重新启动原生透传。',
+     'usbip-win2 found multiple VHCI interfaces and could not start the virtual PS5 controller. Click Repair VHCI, then start native passthrough again.',
+     'usbip-win2 が複数の VHCI インターフェースを検出し、仮想 PS5 コントローラーを起動できません。「VHCI 修復」を実行してから、ネイティブ透過を起動してください。',
+     'usbip-win2에서 여러 VHCI 인터페이스를 감지하여 가상 PS5 컨트롤러를 시작하지 못했습니다. VHCI 복구 후 네이티브 패스스루를 다시 시작하세요.'),
     ('修复手柄', 'Repair controller', 'コントローラー修復', '컨트롤러 복구'),
     ('正在修复手柄…', 'Repairing the controller…', 'コントローラーを修復中…', '컨트롤러 복구 중…'),
     ('修复手柄完成：', 'Controller repaired: ', 'コントローラー修復完了：', '컨트롤러 복구 완료: '),

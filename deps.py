@@ -167,8 +167,12 @@ def install(key, log=print):
     log(f'正在安装 {disp}：{exe.name} …')
     r = subprocess.run([str(exe), *args])
     if r.returncode not in (0, 3010) or not installed(key):
-        log(f'静默安装没有成功（返回码 {r.returncode}），改为打开安装界面，请按提示完成。')
-        subprocess.run([str(exe)])
+        # USBip setup registers a new root devnode each time it is run.
+        if key == 'usbip':
+            log(f'USBip 安装需要检查（返回码 {r.returncode}）。请先重启后检查驱动状态。')
+        else:
+            log(f'静默安装没有成功（返回码 {r.returncode}），改为打开安装界面，请按提示完成。')
+            subprocess.run([str(exe)])
     ok = installed(key)
     log(f'{disp}：' + ('已安装' if ok else '仍未安装'))
     return ok
