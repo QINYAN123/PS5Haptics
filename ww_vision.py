@@ -20,6 +20,8 @@ import threading
 import time
 import numpy as np
 
+from ww_bike import BikeHud, HUD_BOXES, HUD_TTL
+
 REF_W, REF_H = 3840, 2160
 ROIS = {                     # x, y, w, h at 3840x2160 (ok-ww box_resonance / box_echo / box_liberation)
     'resonance': (3185, 1877, 135, 113),
@@ -255,9 +257,13 @@ def body_brightness(bgra):
 
 
 class WWVision:
-    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None):
+    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True):
         """inputs(): returns (l2, r2) pressed 0..1 from the real pad. mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
+        self.bike = BikeHud() if bike else None
+        self.skills = skills
+        self.after_bike = False
+        self.last_frame = None
         self.cam = camera; self.icons = {k: IconState() for k in ROIS}; self.forte = ForteState()
         self.events = collections.deque(maxlen=64)
         self.last_press = {'L': -9.0, 'R': -9.0}; self.prev_in = {'L': 0.0, 'R': 0.0}
@@ -278,7 +284,7 @@ class WWVision:
         self.lit_on = {}; self.lib_lit = -1.0; self.lib_disc = (0.0, 0.0)
 
     def _setup(self):
-        if self.ocr is None:
+        if self.ocr is None and self.skills:
             try:
                 from ww_ocr import CDReader
                 self.ocr = CDReader()
@@ -294,6 +300,10 @@ class WWVision:
         fb = sc(FORTE_ROI)
         pr = PAD_REGION; padb = (int(pr[0] * sx), int(pr[1] * sy), int((pr[2] - pr[0]) * sx), int((pr[3] - pr[1]) * sy))
         allb = list(boxes.values()) + [fb, padb]
+        if self.bike is not None and abs(w / h - REF_W / REF_H) < 0.02:
+            allb += [sc((x, y, x1 - x, y1 - y)) for x, y, x1, y1 in HUD_BOXES.values()]
+        else:
+            self.bike = None
         x0 = min(b[0] for b in allb); y0 = min(b[1] for b in allb)
         x1 = max(b[0] + b[2] for b in allb); y1 = max(b[1] + b[3] for b in allb)
         self.region = (x0, y0, x1, y1)
@@ -364,6 +374,47 @@ class WWVision:
     def step(self, frame, now):
         """Process one captured region (BGRA). Public for tests."""
         l2, r2 = self.inputs()
+        self.last_frame = now
+        if self.bike is not None:
+            previous_mode, _ = self.bike.state
+            self.bike.update(frame, self._pad_xy, now)
+            mode, _ = self.bike.state
+            if mode != previous_mode and self.trace is not None:
+                self.trace.write(f'{int(time.time() * 1000)}\tbike\t{mode}\n')
+                self.trace.flush()
+            if mode != 'other':
+                if not self.after_bike:
+                    self.pad = None
+                    self.pad_time = -9.0
+                    self.slot_mem.clear()
+                    self.cd_last.clear()
+                    self.cd = dict.fromkeys(ROIS)
+                    self.cd_seen = dict.fromkeys(ROIS, False)
+                    self.shot_due.clear()
+                    self.ready_since.clear()
+                    self.ring_on.clear()
+                    self.lit_on.clear()
+                    self.pre_press.clear()
+                    self.forte = ForteState()
+                    self.icons = {k: IconState() for k in ROIS}
+                    self.final = {k: Debounced(2) for k in ROIS}
+                    self.events.clear()
+                self.after_bike = True
+                self.prev_in.update(L=l2, R=r2)
+                self.last_press.update(L=-9.0, R=-9.0)
+                self.frames += 1
+                return
+        if not self.skills:
+            self.frames += 1
+            return
+        if self.after_bike:
+            if self.ocr and self.frames % 3 == 0:
+                self._pad_update(frame, now)
+                self.after_bike = self.pad is None
+            if self.after_bike:
+                self.prev_in.update(L=l2, R=r2)
+                self.frames += 1
+                return
         hat = self.dpad() if self.dpad is not None else None
         if hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS and hat != self.slot:   # character switch: rescan now, fast
             self.switches += 1
@@ -483,7 +534,7 @@ class WWVision:
             self._setup()
             while not self.stop_ev.is_set():
                 t0 = time.monotonic()
-                fr = self.cam.grab(region=self.region, new_frame_only=False)
+                fr = self.cam.grab(region=self.region, new_frame_only=self.bike is not None)
                 if fr is not None:
                     self.step(fr, t0)
                 period = 1.0 / BURST_FPS if t0 < self.burst_until or self._switch_pending() else self.period
@@ -566,5 +617,12 @@ class WWVision:
             out.append(self.events.popleft())
         return out
 
+    def bike_state(self):
+        if self.bike is None:
+            return 'other', 0.0
+        return self.bike.current(time.monotonic())
+
     def states(self):
+        if self.bike is not None and (self.last_frame is None or time.monotonic() - self.last_frame >= HUD_TTL):
+            return dict.fromkeys(self.final)
         return {k: d.state for k, d in self.final.items()}

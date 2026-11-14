@@ -16,7 +16,7 @@ import numpy as np
 import pyaudiowpatch as pa
 from scipy.signal import butter, sosfilt, sosfilt_zi
 from ds_audio import HapticOut, RATE, pa_new, pa_end, pa_open, rescan
-from ds_hid import DualSenseHID, effect_vibration, effect_off
+from ds_hid import DualSenseHID, effect_vibration, effect_off, effect_zones
 import trigger_presets
 from selfcheck import TL_KEYS
 from haptic_dsp import HapticEngine, HOP, GRIP_PROFILES, TRIGGER_PROFILES, RawSpeaker, SPEAKER_MODES, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
@@ -27,6 +27,7 @@ from takeover import VirtualDS4, VirtualX360, Isolation, RumbleCoil, fuse, FUSIO
 from xds import VirtualDualSense
 from event_fx import EventFX, load_config as load_event_fx
 from ww_vision import WWVision
+from ww_bike import BoostResistance, DIVE_EFFECT
 from ww_rules import STATE_TRIGGERS
 
 ROOT = pathlib.Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else pathlib.Path(__file__).resolve().parent
@@ -36,7 +37,7 @@ DEFAULTS = {'grip_profile': '均衡', 'trigger_profile': '均衡冲击', 'grip_g
             'mode': '原生透传', 'fusion': '叠加', 'trigger_mode': '自动', 'rumble_gain': 1.0, 'speaker_mode': '特殊事件', 'speaker_eq': '原味', 'speaker_volume': 0.8, 'haptic_style': '游戏', 'pbz_fx': True, 'ww_fx': True, 'ww_enabled': True,
             'cinema_rumble': 1.0, 'cinema_kick': 1.0, 'cinema_trigger': 1.0, 'music_kick': 1.0, 'music_tick': 1.0, 'music_trigger': 1.0, 'record_native': True, 'event_fx': True,
             **trigger_presets.scene_defaults(), 'user_games': [],
-            'ww_vision': True, 'ww_click_gate': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
+            'ww_vision': True, 'ww_click_gate': True, 'ww_bike_swap': True, 'ww_bike_audio': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
 
 
 WW_EXE = 'client-win64-shipping.exe'
@@ -119,10 +120,15 @@ GAME_PROFILES = {
 }
 
 
-def foreground_exe():
+def foreground_window():
+    get_window = C.windll.user32.GetForegroundWindow
+    get_window.restype = W.HWND
+    return get_window()
+
+
+def foreground_exe(hwnd=None):
     u = C.windll.user32; k = C.windll.kernel32
-    u.GetForegroundWindow.restype = W.HWND
-    hwnd = u.GetForegroundWindow()
+    hwnd = hwnd or foreground_window()
     pid = W.DWORD(); u.GetWindowThreadProcessId(hwnd, C.byref(pid))
     k.OpenProcess.restype = W.HANDLE
     h = k.OpenProcess(0x1000, False, pid.value)
@@ -350,6 +356,24 @@ class Runner:
                 if fxcfg.get('enabled', True):
                     fx = EventFX(fxcfg)          # PBZ mod log is optional (tail waits for it); 鸣潮 uses the screen
             base_rgain = rgain; duck = 0.5; prof = None; vision = None; fg = ''
+            boost = BoostResistance() if native else None
+            bike_mode = 'other'
+            vision_key = None
+            bike_window = None
+
+            def bike_context():
+                current = vision
+                if self.stop_ev.is_set():
+                    return 'unknown'
+                if current is None:
+                    return 'other'
+                if bike_window != foreground_window():
+                    return 'unknown'
+                context, _ = current.bike_state()
+                if context in ('boost', 'air') and not self.cfg.get('ww_bike_swap', True):
+                    return 'bike'
+                return context
+
             trace = None; trace_trig = None; trace_color = None
             if native and self.cfg.get('record_native'):
                 (ROOT / 'traces').mkdir(exist_ok=True)
@@ -467,10 +491,11 @@ class Runner:
                     diag_loop = max(diag_loop, gap); diag_prev = tnow
                 except queue.Empty:
                     blk = None
+                audio_exe = ''
                 if blk is not None:
                     from_endpoint = not isinstance(blk, tuple)
                     if isinstance(blk, tuple):                      # per-process capture: stereo 48 kHz
-                        blk = blk[1]; bch, brate = 2, RATE
+                        audio_exe, blk = blk; bch, brate = 2, RATE
                         if not (self.proc and self.proc.sounding()):
                             blk = None                             # silent game process: the mix is used
                     else:
@@ -509,7 +534,7 @@ class Runner:
                 if (now - clock0) * RATE - produced > RATE:    # >1 s behind (stall): resync the clock
                     clock0 = now; produced = 0
                 if now - fg_check > 0.5:
-                    fg_check = now; new_fg = foreground_exe()
+                    fg_check = now; hwnd = foreground_window(); new_fg = foreground_exe(hwnd)
                     if new_fg != fg:
                         fg_since = now
                         stuck.reset_wave()
@@ -601,27 +626,62 @@ class Runner:
                         gprof = prof['grip_profile'] if tune and self.cfg['grip_profile'] != '细腻' else self.cfg['grip_profile']   # a game's tuning doesn't override an explicit 细腻
                         eng = HapticEngine(gprof, self.cfg['trigger_profile'], self.cfg['grip_gain'], self.cfg['trigger_gain'],
                                            self.cfg.get('haptic_style', '游戏'), groove_gains(self.cfg))
-                        if vision is not None:
-                            vision.stop(); vision = None
-                            if fx is not None:
-                                fx.set_state_trigger('L', None); fx.set_state_trigger('R', None)
-                            if native and vpad is not None:
-                                vpad.gate['L'] = vpad.gate['R'] = None
-                        if prof and prof.get('vision') and fx is not None and self.cfg.get('ww_vision', True):
+                        self.stats['profile'] = prof['name'] if prof else ''
+                    skills = bool(self.cfg.get('ww_vision', True) and fx is not None)
+                    observe_ww = skills or (native and self.cfg.get('scene', '游戏') == '游戏')
+                    new_vision_key = (hwnd, skills) if prof and prof.get('vision') and observe_ww else None
+                    if new_vision_key != vision_key:
+                        vision_key = new_vision_key
+                        if native:
+                            vpad.gate['L'] = vpad.gate['R'] = None
+                        if fx is not None:
+                            fx.set_state_trigger('L', None); fx.set_state_trigger('R', None)
+                        previous, vision = vision, None
+                        if previous is not None:
+                            previous.stop()
+                        if new_vision_key is not None:
                             tp = None
                             if self.cfg.get('record_native', True):
                                 (ROOT / 'traces').mkdir(exist_ok=True)
                                 tp = ROOT / 'traces' / time.strftime('ww-%Y%m%d-%H%M%S.tsv')
                             cd = (ROOT / 'traces' / 'ww-crops') if self.cfg.get('ww_collect', False) else None
                             sd = (ROOT / 'traces' / 'ww-shots') if self.cfg.get('ww_shots', True) else None
-                            vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), dpad=lambda: getattr(hid, 'dpad', None), buttons=lambda: getattr(hid, 'held', 0), trace_path=tp, mem=proc_mem_mb, crops_dir=cd, shots_dir=sd, fps=10); vision.start()   # 10 fps: half the screen-capture load (was 20)
-                        self.stats['profile'] = prof['name'] if prof else ''
+                            vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), dpad=lambda: hid.dpad,
+                                              buttons=lambda: hid.held, trace_path=tp, mem=proc_mem_mb,
+                                              crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills)
+                            bike_window = hwnd
+                            if native:
+                                vpad.bike_context = bike_context
+                            vision.start()
                 press = hid.poll_input(); self.stats['battery'] = hid.battery
+                new_bike_mode = bike_context() if vision is not None else 'other'
+                if new_bike_mode != bike_mode:
+                    if boost is not None:
+                        boost.reset()
+                    if new_bike_mode != 'other' and fx is not None:
+                        fx.trig.update(L=(None, 0), R=(None, 0))
+                    if new_bike_mode in ('air', 'boost') and bike_mode not in ('air', 'boost'):
+                        self.log('科考摩托：R2 氮气加速，R1 对应原 R2')
+                    elif bike_mode in ('air', 'boost') and new_bike_mode not in ('air', 'boost'):
+                        self.log('科考摩托 R1/R2 已恢复')
+                    bike_mode = new_bike_mode
+                self.stats['ww_bike'] = bike_mode
+
+                if native and bike_mode in ('boost', 'air'):
+                    if not self.cfg.get('ww_bike_audio', True):
+                        boost.reset()
+                    elif blk is not None:
+                        if audio_exe == WW_EXE and lag <= 0.3:
+                            boost.feed(l, r, now)
+                        else:
+                            boost.reset()
+
                 if vision is not None and fx is not None:
                     for ev in vision.poll():
-                        name = fx.feed(*ev)
-                        if name: self.stats['fx_last'] = name
-                    st = vision.states()
+                        if bike_mode == 'other' and not vision.after_bike:
+                            name = fx.feed(*ev)
+                            if name: self.stats['fx_last'] = name
+                    st = vision.states() if bike_mode == 'other' else dict.fromkeys(vision.final)
                     for side, (skill, eff, gate) in STATE_TRIGGERS.items():
                         on = bool(st.get(skill))
                         fx.set_state_trigger(side, eff if on else None)
@@ -785,6 +845,19 @@ class Runner:
                     last_game_trig = (game_l, game_r)
                     if trig_mode == '纯用游戏':                       # ours is off: exactly what the game sends
                         hid.set_triggers(game_l or effect_off(), game_r or effect_off())
+                        last_trig = (-1, -1); amp = None
+                    elif bike_mode != 'other':
+                        left = game_l or effect_off()
+                        right = game_r or effect_off()
+                        if bike_mode in ('air', 'boost'):
+                            # The game receives R1 from physical R2. Its R2 effect
+                            # belongs to the pitch action now on the physical shoulder.
+                            right_gain = self.cfg.get('trigger_gain', 1.0) * self.cfg.get('trigger_right_gain', 1.0)
+                            right = boost.effect(vpad.bike_input.boost_pressed, now, right_gain)
+                            if bike_mode == 'air' and off(game_l):
+                                gain = min(1.0, max(0.0, self.cfg.get('trigger_gain', 1.0) * self.cfg.get('trigger_left_gain', 1.0)))
+                                left = effect_zones(round(force * gain) for force in DIVE_EFFECT) if hid.l2 > 8 else effect_off()
+                        hid.set_triggers(left, right)
                         last_trig = (-1, -1); amp = None
                     elif trig_mode == '自动' and (game_trig or self.caps.has(fg, 'trigger')):
                         # the game drives the triggers: pass its effects through untouched

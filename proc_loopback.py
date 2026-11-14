@@ -228,7 +228,7 @@ def find_pid(*exe_names):
 
 
 class ProcSource(threading.Thread):
-    """Feeds ('proc', samples) into a queue from the first running game in `exes` (re-checked every
+    """Feeds (process_name, samples) into a queue from the first running game in `exes` (re-checked every
     2 s, follows restarts). .active tells the runner to ignore the endpoint loopback meanwhile."""
 
     def __init__(self, q, exes, log, stop_ev, players='off'):
@@ -305,7 +305,7 @@ class ProcSource(threading.Thread):
                 t = time.monotonic(); self.max_gap = max(self.max_gap, t - last_pkt); last_pkt = t
                 if np.abs(x).max() > 1e-4:
                     self.last_sound = t
-                try: self.q.put_nowait(('proc', x))
+                try: self.q.put_nowait((self.name.lower(), x))
                 except _q.Full: pass
             elif time.monotonic() - last_pkt > 1.5:
                 # alt-tab: the game recreates its audio stream and the capture silently stops delivering.

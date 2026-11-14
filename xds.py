@@ -21,6 +21,7 @@ import threading
 import numpy as np
 
 from usbip_vhci import VHCI_DESCRIPTION, VHCI_ERROR, Vhci
+from ww_bike import BikeInput
 
 ROOT = pathlib.Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else pathlib.Path(__file__).resolve().parent
 
@@ -120,6 +121,8 @@ class VirtualDualSense:
         # send their authored speaker sounds there.
         self.spk_peak = 0; self.spk_frames = 0
         self.gate = {'L': None, 'R': None}; self._gate_down = {'L': False, 'R': False}
+        self.bike_input = BikeInput()
+        self.bike_context = None
         self.ready = threading.Event(); self.error = None
 
     def _on_raw(self, data):
@@ -234,11 +237,18 @@ class VirtualDualSense:
         # the pad reports ~1000x/s, mostly because gyro / timestamps move. Forward at once when sticks,
         # triggers or buttons change (bytes 1..10), otherwise at most every 4 ms (game sees 250 Hz motion)
         import time as _t
-        now = _t.perf_counter(); key = bytes(report[1:11])
+        now = _t.perf_counter()
+        context = self.bike_context
+        bike = context() if context is not None else 'other'
+        report = self.bike_input.apply(report, bike in ('boost', 'air'))
+        if bike == 'other' and not self.bike_input.wait_release:
+            report = self._apply_gate(report)
+        else:
+            self._gate_down.update(L=False, R=False)
+        key = bytes(report[1:11])
         if key == getattr(self, '_last_key', None) and now - getattr(self, '_last_fw', 0.0) < 0.004:
             return
         self._last_key = key; self._last_fw = now
-        report = self._apply_gate(report)
         state = asb_input(report)
         try:
             with self.send_lock:
