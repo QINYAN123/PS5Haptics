@@ -318,7 +318,7 @@ def test_switch_burst():
     finally:
         W.ring_fill, W.disc_stats = keep_ring, keep_disc
     assert max(fast.values()) <= 0.35 and max(slow.values()) >= 0.9, (slow, fast)
-    assert back['echo'] is True and back['liberation'] is None, back     # fresh R2 check after switching back
+    assert back['echo'] is None and back['liberation'] is None, back     # both skills need a fresh read
     held = {'m': 0}
     v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), buttons=lambda: held['m']); v._setup()
     v._holds(0.0); held['m'] = 0x01; v._holds(0.1); v._holds(0.3)
@@ -329,6 +329,20 @@ def test_switch_burst():
     print('   ready after switch: before', slow, 'first visit now', fast, 'returning: same frame', back)
 
 
+def test_short_switch_tap_wakes_capture():
+    v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), ocr=False, dpad=lambda: None)
+    v._setup()
+    v.notify_hat(2)
+    v.notify_hat(8)
+    assert v.scan_wake.is_set()
+    assert v._switch_pending()
+    fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+    v.step(fr, 1.0)
+    assert v.slot == 2 and v.switches == 1
+    assert not v._switch_pending()
+    assert v.settle_until > 1.0
+
+
 if __name__ == '__main__':
-    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst):
+    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture):
         f(); print('ok', f.__name__)

@@ -271,6 +271,9 @@ class WWVision:
         self.last_press = {'L': -9.0, 'R': -9.0}; self.prev_in = {'L': 0.0, 'R': 0.0}
         self.pre_press = {}; self.last_cast = {k: -9.0 for k in ROIS}
         self.stop_ev = threading.Event(); self.thread = None; self.frames = 0; self.error = None
+        self.scan_wake = threading.Event()
+        self.switch_presses = collections.deque(maxlen=1)
+        self.input_hat = None
         self.region = None; self.boxes = {}; self.forte_box = None
         self.trace = open(trace_path, 'a', encoding='utf8') if trace_path else None
         self.recorder = CropRecorder(crops_dir) if crops_dir else None
@@ -283,7 +286,7 @@ class WWVision:
         self.lib_badges_until = 0.0
         self.refresh_badges_after = None
         self.dpad = dpad; self.prev_hat = None; self.burst_until = -9.0; self.settle_until = -9.0; self.switches = 0
-        self.slot = None; self.slot_mem = {}     # D-pad direction -> what that character's skills were when we left it
+        self.slot = None
         self.buttons = buttons; self.hold_since = {}; self.hold_fired = set(); self.holds = 0; self.lib_color = -1.0
         self.lit_on = {}; self.lib_lit = -1.0; self.lib_disc = (0.0, 0.0)
 
@@ -394,10 +397,10 @@ class WWVision:
                 self.trace.write(f'{int(time.time() * 1000)}\tbike\t{mode}\n')
                 self.trace.flush()
             if mode != 'other':
+                self.switch_presses.clear()
                 if not self.after_bike:
                     self.pad = None
                     self.pad_time = -9.0
-                    self.slot_mem.clear()
                     self.cd_last.clear()
                     self.cd = dict.fromkeys(ROIS)
                     self.cd_seen = dict.fromkeys(ROIS, False)
@@ -427,24 +430,35 @@ class WWVision:
                 self.frames += 1
                 return
         hat = self.dpad() if self.dpad is not None else None
-        if hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS and hat != self.slot:   # character switch: rescan now, fast
-            self.switches += 1
-            self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
-            self.refresh_badges_after = self.settle_until
-            if self.slot is not None:                                    # remember the one leaving the field
-                self.slot_mem[self.slot] = (now, {k: (self.final[k].state, self.cd_last.get(k)) for k in ('echo', 'liberation')})
-            for k, pred in self._predict(hat, now).items():              # the one coming in: what we knew, aged
-                d = self.final[k]; d.state = pred; d.cand = None; d.count = 0
-            self.slot = hat
-            for k in ('echo', 'liberation'):
-                self.cd_last.pop(k, None); self.ready_since[k] = None; self.lit_on[k] = False
-            self.lib_badges_until = 0.0
-            self.last_press['R'] = -9.0
-            self.pre_press.pop('liberation', None)
-            self.pad_time = max(self.pad_time, now - 1.0)                # keep the known HUD layout during the burst
-            if self.trace is not None:
-                self.trace.write(f'{int(time.time() * 1000)}\tswitch\that={hat}\n')
+        try:
+            queued_hat = self.switch_presses.pop()
+        except IndexError:
+            queued_hat = None
+        switch_hat = queued_hat if queued_hat is not None else (
+            hat if hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS else None)
+        if switch_hat is not None and switch_hat != self.slot:
+            self._on_switch(switch_hat, now)
         self.prev_hat = hat
+        self._read_skills(frame, now, l2, r2)
+
+    def _on_switch(self, hat, now):
+        self.switches += 1
+        self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
+        self.refresh_badges_after = self.settle_until
+        self.slot = hat
+        for skill in ('echo', 'liberation'):
+            self.final[skill] = Debounced(2)
+            self.cd_last.pop(skill, None)
+            self.ready_since.pop(skill, None)
+            self.lit_on.pop(skill, None)
+        self.lib_badges_until = 0.0
+        self.last_press.update(L=-9.0, R=-9.0)
+        self.pre_press.clear()
+        self.pad_time = max(self.pad_time, now - 1.0)                # keep the known HUD layout during the burst
+        if self.trace is not None:
+            self.trace.write(f'{int(time.time() * 1000)}\tswitch\that={hat}\n')
+
+    def _read_skills(self, frame, now, l2, r2):
         self._holds(now)
         for side, val in (('L', l2), ('R', r2)):
             if val > 0.5 and self.prev_in[side] <= 0.5:          # press edge: remember the icon before it
@@ -551,12 +565,14 @@ class WWVision:
         try:
             self._setup()
             while not self.stop_ev.is_set():
+                self.scan_wake.clear()
                 t0 = time.monotonic()
                 fr = self.cam.grab(region=self.region, new_frame_only=self.bike is not None)
                 if fr is not None:
                     self.step(fr, t0)
                 period = 1.0 / BURST_FPS if t0 < self.burst_until or self._switch_pending() else self.period
-                self.stop_ev.wait(max(0.0, period - (time.monotonic() - t0)))
+                if not self.switch_presses or fr is None:
+                    self.scan_wake.wait(max(0.0, period - (time.monotonic() - t0)))
         except Exception as exc:
             self.error = exc
 
@@ -586,26 +602,17 @@ class WWVision:
                         self.shot_due.append((now + 0.3, 'H', f'release{bit}'))
                 self.hold_since.pop(bit, None); self.hold_fired.discard(bit)
 
-    def _predict(self, slot, now):
-        """Echo cooldown ages off-field. Liberation always needs fresh visual confirmation."""
-        if slot not in self.slot_mem:
-            return {'echo': None, 'liberation': None}
-        left_at, mem = self.slot_mem[slot]; out = {}
-        for k, (state, cd) in mem.items():
-            if k == 'liberation':
-                out[k] = None
-                continue
-            if state:
-                out[k] = True
-            elif k == 'echo' and cd is not None:
-                t_cd, v_cd = cd
-                out[k] = (v_cd - (now - t_cd)) <= 0.2        # countdown ran out while off-field
-            else:
-                out[k] = False if state is False else None
-        return out
+    def notify_hat(self, hat):
+        """Receive a D-pad report on the input-reader thread, without capturing here."""
+        if hat in SWITCH_HATS and self.input_hat != hat:
+            self.switch_presses.append(hat)
+            self.scan_wake.set()
+        self.input_hat = hat
 
     def _switch_pending(self):
         """A switch press since the last frame: grab the next frame right away."""
+        if self.switch_presses:
+            return True
         if self.dpad is None:
             return False
         try:
@@ -621,6 +628,7 @@ class WWVision:
 
     def stop(self):
         self.stop_ev.set()
+        self.scan_wake.set()
         if self.thread:
             self.thread.join(1.0)
         if self.recorder is not None:

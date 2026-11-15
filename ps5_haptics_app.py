@@ -316,7 +316,13 @@ class Runner:
                 vpad = VirtualDualSense(self.log) if native else VirtualX360() if xbox else VirtualDS4()
                 vpad.open()
                 self.pad_filter = InputFilter(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
-                hid.start_reader(lambda rep, f=self.pad_filter, send=vpad.forward: send(f.apply(rep)))
+                def forward_input(report):
+                    current = vision
+                    if current is not None:
+                        current.notify_hat(report[8] & 0x0F)
+                    vpad.forward(self.pad_filter.apply(report))
+
+                hid.start_reader(forward_input)
                 self.stats['takeover'] = True
                 if native:                         # the game's own pad-speaker sound lands on the virtual pad
                     from pad_speaker import PadSpeakerTap, SpeakerClip
@@ -355,7 +361,7 @@ class Runner:
                         pass
                 if fxcfg.get('enabled', True):
                     fx = EventFX(fxcfg)          # PBZ mod log is optional (tail waits for it); 鸣潮 uses the screen
-            base_rgain = rgain; duck = 0.5; prof = None; vision = None; fg = ''
+            base_rgain = rgain; duck = 0.5; prof = None; fg = ''
             boost = BoostResistance() if native else None
             bike_mode = 'other'
             vision_key = None
