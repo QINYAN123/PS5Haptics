@@ -105,12 +105,14 @@ def disc_stats(bgra, cx, cy, r):
     return float(((mn >= 225) & (mx - mn <= 25)).mean()), float((mx < 100).mean())
 
 
-def icon_lit(white, dark, ring, was_on=False):
+def icon_lit(white, dark, ring, was_on=False, confirmed_badges=False):
     """The ultimate icon drawn usable. Works for characters whose ultimate is unlocked by a move rather than the
     energy ring (the ring is then partial but the glyph turns white). The ring alone is not enough: an almost
     full ring with a grey glyph is still not ready."""
-    if ring < 0.15:                                    # not a skill icon (traversal prompt, menu, black screen)
-        return False
+    if ring < 0.15:
+        # A conditional liberation can show a bright glyph without an energy ring.
+        # Require explicit L2/R2 labels and a dark disc to reject scenery and flashes.
+        return confirmed_badges and (0.12 if was_on else 0.16) <= white <= 0.55 and dark >= 0.23
     lo = LIT_OFF if was_on else LIT_ON
     if white < lo or white > 0.6:                      # > 0.6: a white flash over the whole icon
         return False
@@ -277,7 +279,9 @@ class WWVision:
         self.ocr = ocr; self.cd = {k: None for k in ROIS}; self.cd_seen = {k: False for k in ROIS}; self.final = {k: Debounced(2) for k in ROIS}
         self.shots_dir = shots_dir; self.shot_due = []; self.shots = 0
         self.pad = None; self.pad_time = -9.0; self.layout = '-'
-        self.cd_last = {}; self.ring_on = {}; self.ready_since = {}; self.ring_val = {}; self.shot_error = None
+        self.cd_last = {}; self.ready_since = {}; self.ring_val = {}; self.shot_error = None
+        self.lib_badges_until = 0.0
+        self.refresh_badges_after = None
         self.dpad = dpad; self.prev_hat = None; self.burst_until = -9.0; self.settle_until = -9.0; self.switches = 0
         self.slot = None; self.slot_mem = {}     # D-pad direction -> what that character's skills were when we left it
         self.buttons = buttons; self.hold_since = {}; self.hold_fired = set(); self.holds = 0; self.lib_color = -1.0
@@ -326,11 +330,13 @@ class WWVision:
         if lay:
             self.pad = {k: PAD_SLOTS[i] for k, i in lay.items()}; self.pad_time = now
         self.layout = '|'.join(labels)
+        normalized = [value.upper().replace(' ', '') for value in labels]
+        confirmed = lay is not None and normalized[lay['echo']] == 'L2' and normalized[lay['liberation']] == 'R2'
+        self.lib_badges_until = now + 0.65 if confirmed else 0.0
 
     def _pad_wants(self, frame, now):
-        """Ready = no countdown (+ full energy ring for liberation), held for 0.4 s. Going back to
-        'not ready' is immediate. First live session: the charged ring's glow pulsed around the
-        threshold and single frames missed the countdown -> R2 flipped every 0.1-0.2 s."""
+        """A visible countdown blocks readiness. For R2, confirm the current glyph
+        promptly so short conditional liberation windows can still arm the trigger."""
         wants = {'resonance': None}
         hx, hy = int(PAD_HALF * self.sx), int(PAD_HALF * self.sy)
         for k, y in self.pad.items():
@@ -341,20 +347,25 @@ class WWVision:
                     self.cd_last[k] = (now, self.cd[k])
             t_cd, v_cd = self.cd_last.get(k, (-9.0, 0.0))
             burst = now < self.burst_until
-            keep = 0.25 if burst else 0.8                  # at 30 fps a missed countdown frame is caught again quickly
-            in_cd = self.cd[k] is not None or (now - t_cd < keep and v_cd > 0.8)   # a missed frame is not "ready"
-            raw = not in_cd
-            if k == 'liberation':                   # traced: how colourful the ultimate icon is (calibration for
-                ic = frame[max(0, cy - hy // 2):cy + hy // 2, max(0, cx - hx // 2):cx + hx // 2, :3].astype(np.int16)   # mechanics without the ring)
+            keep = 0.25 if burst else 0.8
+            if k == 'liberation':
+                # Let consistent fresh glyph evidence override an old countdown.
+                keep = 0.12
+                ic = frame[max(0, cy - hy // 2):cy + hy // 2, max(0, cx - hx // 2):cx + hx // 2, :3].astype(np.int16)
                 self.lib_color = float((ic.max(-1) - ic.min(-1)).mean()) if ic.size else -1.0
-                self.lib_disc = disc_stats(frame, cx, cy, int(PAD_DISC * self.sx)); self.lib_lit = self.lib_disc[0]
-            if raw and k == 'liberation':           # no countdown: ready only with a full energy ring (hysteresis)
-                f = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx))
-                self.ring_val[k] = f                    # traced: why the ultimate does / doesn't count as ready
-                self.ring_on[k] = f > 0.93 or (self.ring_on.get(k, False) and f > 0.75)
-                # ready = the icon drawn usable (white glyph), not just the ring: see icon_lit()
-                self.lit_on[k] = icon_lit(self.lib_disc[0], self.lib_disc[1], f, self.lit_on.get(k, False))
-                raw = self.lit_on[k]
+                self.lib_disc = disc_stats(frame, cx, cy, int(PAD_DISC * self.sx))
+                self.lib_lit = self.lib_disc[0]
+                self.ring_val[k] = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx))
+            in_cd = self.cd[k] is not None or (now - t_cd < keep and v_cd > 0.8)
+            raw = not in_cd
+            if k == 'liberation':
+                raw = raw and icon_lit(*self.lib_disc, self.ring_val[k], self.lit_on.get(k, False),
+                                       confirmed_badges=0.0 < now < self.lib_badges_until)
+                self.lit_on[k] = raw
+                # Debounced already requires two frames. Keep one readiness debounce
+                # for R2 instead of stacking it after another 0.4 s hold.
+                wants[k] = raw if now >= self.settle_until else None
+                continue
             keep_now = self.final[k].state                  # no opinion yet: keep the remembered / current state
             if now < self.settle_until:                    # icons still swapping: don't read them yet
                 self.ready_since[k] = None; wants[k] = keep_now
@@ -392,7 +403,7 @@ class WWVision:
                     self.cd_seen = dict.fromkeys(ROIS, False)
                     self.shot_due.clear()
                     self.ready_since.clear()
-                    self.ring_on.clear()
+                    self.lib_badges_until = 0.0
                     self.lit_on.clear()
                     self.pre_press.clear()
                     self.forte = ForteState()
@@ -419,13 +430,17 @@ class WWVision:
         if hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS and hat != self.slot:   # character switch: rescan now, fast
             self.switches += 1
             self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
+            self.refresh_badges_after = self.settle_until
             if self.slot is not None:                                    # remember the one leaving the field
                 self.slot_mem[self.slot] = (now, {k: (self.final[k].state, self.cd_last.get(k)) for k in ('echo', 'liberation')})
             for k, pred in self._predict(hat, now).items():              # the one coming in: what we knew, aged
                 d = self.final[k]; d.state = pred; d.cand = None; d.count = 0
             self.slot = hat
             for k in ('echo', 'liberation'):
-                self.cd_last.pop(k, None); self.ready_since[k] = None; self.ring_on[k] = False
+                self.cd_last.pop(k, None); self.ready_since[k] = None; self.lit_on[k] = False
+            self.lib_badges_until = 0.0
+            self.last_press['R'] = -9.0
+            self.pre_press.pop('liberation', None)
             self.pad_time = max(self.pad_time, now - 1.0)                # keep the known HUD layout during the burst
             if self.trace is not None:
                 self.trace.write(f'{int(time.time() * 1000)}\tswitch\that={hat}\n')
@@ -439,8 +454,11 @@ class WWVision:
             self.prev_in[side] = val
         if self.recorder is not None:
             self.recorder.add(frame, self.boxes, self.forte_box, l2, r2)
-        if self.ocr and self.frames % 5 == 0:                  # gamepad HUD: where are L2 / R2? (2 Hz at 10 fps)
+        refresh = self.refresh_badges_after is not None and now >= self.refresh_badges_after
+        if self.ocr and (refresh or self.frames % 5 == 0):
             self._pad_update(frame, now)
+            if refresh:
+                self.refresh_badges_after = None
         pad_on = bool(self.ocr) and self.pad is not None and now - self.pad_time < 2.0
         pad_wants = self._pad_wants(frame, now) if pad_on else None
         bright = {}
@@ -569,12 +587,14 @@ class WWVision:
                 self.hold_since.pop(bit, None); self.hold_fired.discard(bit)
 
     def _predict(self, slot, now):
-        """Skill states of the character in this slot, from when it left: an energy-full ultimate stays full,
-        a cooldown keeps running off-field. Unknown slot -> unknown (trigger off until read)."""
+        """Echo cooldown ages off-field. Liberation always needs fresh visual confirmation."""
         if slot not in self.slot_mem:
             return {'echo': None, 'liberation': None}
         left_at, mem = self.slot_mem[slot]; out = {}
         for k, (state, cd) in mem.items():
+            if k == 'liberation':
+                out[k] = None
+                continue
             if state:
                 out[k] = True
             elif k == 'echo' and cd is not None:

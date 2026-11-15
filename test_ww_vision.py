@@ -176,7 +176,11 @@ def test_lit_icon():
     w, d = W.disc_stats(lit, 80, 80, 66); assert W.icon_lit(w, d, 0.3)    # partial ring (move-unlocked): ready
     w, d = W.disc_stats(grey, 80, 80, 66); assert not W.icon_lit(w, d, 1.0)   # full ring, grey glyph: not ready
     w, d = W.disc_stats(flash, 80, 80, 66); assert not W.icon_lit(w, d, 1.0)  # white flash
-    w, d = W.disc_stats(lit, 80, 80, 66); assert not W.icon_lit(w, d, 0.05)   # no ring: not a skill icon
+    w, d = W.disc_stats(lit, 80, 80, 66)
+    assert not W.icon_lit(w, d, 0.05)
+    assert W.icon_lit(w, d, 0.05, confirmed_badges=True)
+    w, d = W.disc_stats(flash, 80, 80, 66)
+    assert not W.icon_lit(w, d, 0.05, confirmed_badges=True)
     keep_ring, keep_lit = W.ring_fill, W.disc_stats
     try:
         v = WWVision(lambda: (0.0, 0.0), camera=FakeCam()); v._setup()
@@ -197,6 +201,44 @@ def test_lit_icon():
         assert v.states()['liberation'] is True                           # lit: ready without the ring
     finally:
         W.ring_fill, W.disc_stats = keep_ring, keep_lit
+
+
+def test_short_conditional_liberation():
+    from unittest.mock import patch
+    import ww_vision as W
+
+    class OCR:
+        cd = 8.0
+
+        def cooldown(self, crop):
+            return self.cd
+
+        def read_gray(self, crop):
+            return ''
+
+    ocr = OCR()
+    v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), ocr=ocr)
+    v._setup()
+    v.pad = {'echo': 1740, 'liberation': 1950}
+    v.lib_badges_until = 2.0
+    v._pad_update = lambda *_: None
+    fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+    with patch.object(W, 'ring_fill', return_value=0.04), patch.object(W, 'disc_stats', return_value=(0.31, 0.42)):
+        for t in (1.0, 1.1):
+            v.pad_time = t
+            v.step(fr, t)
+        assert v.states()['liberation'] is False
+        ocr.cd = None
+        for t in (1.2, 1.3, 1.4):
+            v.pad_time = t
+            v.step(fr, t)
+        assert v.states()['liberation'] is True
+        assert ('ww', 'liberation', 'ready') in v.poll()
+        ocr.cd = 12.0
+        for t in (1.5, 1.6):
+            v.pad_time = t
+            v.step(fr, t)
+        assert v.states()['liberation'] is False
 
 
 def test_switch_burst():
@@ -276,7 +318,7 @@ def test_switch_burst():
     finally:
         W.ring_fill, W.disc_stats = keep_ring, keep_disc
     assert max(fast.values()) <= 0.35 and max(slow.values()) >= 0.9, (slow, fast)
-    assert back['echo'] is True and back['liberation'] is True, back      # known character: at the switch itself
+    assert back['echo'] is True and back['liberation'] is None, back     # fresh R2 check after switching back
     held = {'m': 0}
     v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), buttons=lambda: held['m']); v._setup()
     v._holds(0.0); held['m'] = 0x01; v._holds(0.1); v._holds(0.3)
@@ -288,5 +330,5 @@ def test_switch_burst():
 
 
 if __name__ == '__main__':
-    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_switch_burst):
+    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst):
         f(); print('ok', f.__name__)
