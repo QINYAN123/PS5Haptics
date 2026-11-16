@@ -211,8 +211,8 @@ class DualSenseHID:
                         self.read_error = exc; break
         self.reader = threading.Thread(target=loop, daemon=True); self.reader.start()
 
-    def poll_input(self):
-        """Drain pending input reports; keep latest L2/R2 (0..255)."""
+    def poll_input(self, on_report=None):
+        """Drain reports, optionally forwarding each full input sample."""
         if self.reader is not None:
             return self.l2 / 255, self.r2 / 255
         for _ in range(16):
@@ -223,6 +223,8 @@ class DualSenseHID:
                 self.l2, self.r2 = r[5], r[6]; self.battery = battery_status(r); self.buttons.update(r)
                 if len(r) > 9:
                     hat = r[8] & 0x0F; self.dpad = hat if hat < 8 else None; self.held = (r[8] >> 4) | ((r[9] & 0x03) << 4)
+                    if on_report is not None:
+                        on_report(r)
         return self.l2 / 255, self.r2 / 255
 
     def set_triggers(self, left_effect, right_effect, min_interval=0.016, force=False):

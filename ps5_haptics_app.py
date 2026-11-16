@@ -311,15 +311,19 @@ class Runner:
             fw = hid.firmware_info()
             if fw:
                 self.log(f"手柄固件：fw {fw['fw']:08x} / hw {fw['hw']:08x} / update {fw['update']:04x} / {fw['date']} {fw['time']}")
+
+            def observe_ww_input(report):
+                current = vision
+                if current is not None:
+                    current.notify_input(report)
+
             if takeover:
                 iso = Isolation(self.log); iso.open(hid.path)
                 vpad = VirtualDualSense(self.log) if native else VirtualX360() if xbox else VirtualDS4()
                 vpad.open()
                 self.pad_filter = InputFilter(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
                 def forward_input(report):
-                    current = vision
-                    if current is not None:
-                        current.notify_hat(report[8] & 0x0F)
+                    observe_ww_input(report)
                     vpad.forward(self.pad_filter.apply(report))
 
                 hid.start_reader(forward_input)
@@ -661,7 +665,8 @@ class Runner:
                             if native:
                                 vpad.bike_context = bike_context
                             vision.start()
-                press = hid.poll_input(); self.stats['battery'] = hid.battery
+                press = hid.poll_input(observe_ww_input if vision is not None else None)
+                self.stats['battery'] = hid.battery
                 new_bike_mode = bike_context() if vision is not None else 'other'
                 if new_bike_mode != bike_mode:
                     if boost is not None:

@@ -49,7 +49,14 @@ SETTLE_S = 0.12                # the skill icons swap with a short animation: re
 # long presses (charged basic / heavy attack): some characters' ultimate is unlocked by such a move, not by
 # the energy ring, so the skill bar can change right then -> scan fast while held and right after release
 HOLD_S = 0.35
+TRIGGER_ATTACK_LEVEL = 128
+NORMAL_ATTACK = 0x01          # Square on the default DualSense layout
+RESONANCE_ATTACK = 0x08      # Triangle
+ECHO_ATTACK = 0x10           # L2, represented as a digital edge here
+LIBERATION_ATTACK = 0x20     # R2
+OTHER_ATTACKS = RESONANCE_ATTACK | ECHO_ATTACK | LIBERATION_ATTACK
 SIDE_OF = {'liberation': 'R', 'echo': 'L'}
+SWITCH_SKILLS = ('echo', 'liberation')
 
 
 def badge_layout(labels):
@@ -273,8 +280,15 @@ class WWVision:
         self.pre_press = {}; self.last_cast = {k: -9.0 for k in ROIS}
         self.stop_ev = threading.Event(); self.thread = None; self.frames = 0; self.error = None
         self.scan_wake = threading.Event()
-        self.switch_presses = collections.deque(maxlen=1)
+        self.switch_request = None
+        self.scanned_switch = None
         self.input_hat = None
+        self.attack_buttons = 0
+        self.basic_hold_started = None
+        self.liberation_rescan = None
+        self.scanned_liberation = None
+        self.liberation_settle_until = -9.0
+        self.liberation_provisional_until = -9.0
         self.region = None; self.boxes = {}; self.forte_box = None
         self.trace = open(trace_path, 'a', encoding='utf8') if trace_path else None
         self.recorder = CropRecorder(crops_dir) if crops_dir else None
@@ -298,6 +312,7 @@ class WWVision:
         self.lib_badges_until = 0.0
         self.refresh_badges_after = None
         self.dpad = dpad; self.prev_hat = None; self.burst_until = -9.0; self.settle_until = -9.0; self.switches = 0
+        self.provisional_until = -9.0
         self.slot = None
         self.buttons = buttons; self.hold_since = {}; self.hold_fired = set(); self.holds = 0; self.lib_color = -1.0
         self.lit_on = {}; self.lib_lit = -1.0; self.lib_disc = (0.0, 0.0)
@@ -355,6 +370,8 @@ class WWVision:
         wants = {'resonance': None}
         hx, hy = int(PAD_HALF * self.sx), int(PAD_HALF * self.sy)
         for k, y in self.pad.items():
+            if k == 'liberation' and now < self.liberation_settle_until:
+                continue
             cx, cy = self._pad_xy(PAD_X, y)
             if self.frames % 1 == 0:
                 self.cd[k] = self.ocr.cooldown(frame[max(0, cy - hy):cy + hy, max(0, cx - hx):cx + hx])
@@ -379,15 +396,12 @@ class WWVision:
                 self.lit_on[k] = raw
                 # Debounced already requires two frames. Keep one readiness debounce
                 # for R2 instead of stacking it after another 0.4 s hold.
-                wants[k] = raw if now >= self.settle_until else None
+                wants[k] = raw
                 continue
-            keep_now = self.final[k].state                  # no opinion yet: keep the remembered / current state
-            if now < self.settle_until:                    # icons still swapping: don't read them yet
-                self.ready_since[k] = None; wants[k] = keep_now
-            elif raw:
+            if raw:
                 self.ready_since[k] = self.ready_since.get(k) or now
                 held = now - self.ready_since[k] >= (0.05 if burst else 0.4)
-                wants[k] = True if held else (keep_now if burst else False)
+                wants[k] = True if held else (self.final[k].state if burst else False)
             else:
                 self.ready_since[k] = None; wants[k] = False
         return wants
@@ -409,7 +423,11 @@ class WWVision:
                 self.trace.write(f'{int(time.time() * 1000)}\tbike\t{mode}\n')
                 self.trace.flush()
             if mode != 'other':
-                self.switch_presses.clear()
+                self.scanned_switch = self.switch_request
+                self.scanned_liberation = self.liberation_rescan
+                self.liberation_provisional_until = -9.0
+                self.basic_hold_started = None
+                self.provisional_until = -9.0
                 if not self.after_bike:
                     self.pad = None
                     self.pad_time = -9.0
@@ -438,37 +456,58 @@ class WWVision:
                 self._pad_update(frame, now)
                 self.after_bike = self.pad is None
             if self.after_bike:
+                self.scanned_switch = self.switch_request
+                self.scanned_liberation = self.liberation_rescan
                 self.prev_in.update(L=l2, R=r2)
                 self.frames += 1
                 return
         hat = self.dpad() if self.dpad is not None else None
-        try:
-            queued_hat = self.switch_presses.pop()
-        except IndexError:
-            queued_hat = None
-        switch_hat = queued_hat if queued_hat is not None else (
-            hat if hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS else None)
-        if switch_hat is not None and switch_hat != self.slot:
-            self._on_switch(switch_hat, now)
+        request = self.switch_request
+        if request is not None and request is not self.scanned_switch:
+            switch_hat, pressed_at = request
+            self._on_switch(switch_hat, now, pressed_at)
+            self.scanned_switch = request
+        elif self.dpad is not None and self.switch_request is None and hat in SWITCH_HATS and hat != self.prev_hat:
+            self._on_switch(hat, now, now)
         self.prev_hat = hat
+        rescan = self.liberation_rescan
+        if rescan is not None and rescan is not self.scanned_liberation:
+            self._reset_skill('liberation')
+            self.pre_press.pop('liberation', None)
+            self.liberation_settle_until = rescan + SETTLE_S
+            self.liberation_provisional_until = rescan + BURST_S
+            self.burst_until = max(self.burst_until, now + BURST_S)
+            self.scanned_liberation = rescan
+        if now < self.settle_until:
+            # Never cache cooldowns from the outgoing character during the animation.
+            self.prev_in.update(L=l2, R=r2)
+            self.frames += 1
+            return
         self._read_skills(frame, now, l2, r2)
 
-    def _on_switch(self, hat, now):
+    def _on_switch(self, hat, now, pressed_at):
         self.switches += 1
         self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
         self.refresh_badges_after = self.settle_until
         self.slot = hat
-        for skill in ('echo', 'liberation'):
-            self.final[skill] = Debounced(2)
-            self.cd_last.pop(skill, None)
-            self.ready_since.pop(skill, None)
-            self.lit_on.pop(skill, None)
+        for skill in SWITCH_SKILLS:
+            self._reset_skill(skill)
         self.lib_badges_until = 0.0
         self.last_press.update(L=-9.0, R=-9.0)
         self.pre_press.clear()
         self.pad_time = max(self.pad_time, now - 1.0)                # keep the known HUD layout during the burst
+        self.provisional_until = pressed_at + BURST_S
         if self.trace is not None:
             self.trace.write(f'{int(time.time() * 1000)}\tswitch\that={hat}\n')
+
+    def _reset_skill(self, skill):
+        self.final[skill] = Debounced(2)
+        self.icons[skill].ready = None
+        self.icons[skill].pending = 0
+        self.cd[skill] = None
+        self.cd_last.pop(skill, None)
+        self.ready_since.pop(skill, None)
+        self.lit_on.pop(skill, None)
 
     def _read_skills(self, frame, now, l2, r2):
         self._holds(now)
@@ -487,10 +526,13 @@ class WWVision:
                 self.refresh_badges_after = None
         pad_on = bool(self.ocr) and self.pad is not None and now - self.pad_time < 2.0
         pad_wants = self._pad_wants(frame, now) if pad_on else None
+        settling_liberation = now < self.liberation_settle_until
         bright = {}
         for k, (x, y, w, h) in self.boxes.items():
             crop = frame[y:y + h, x:x + w]
             bright[k] = body_brightness(crop)
+            if k == 'liberation' and settling_liberation:
+                continue
             self.icons[k].update(bright[k])
             if self.ocr and self.frames % 1 == 0 and not pad_on:   # keyboard HUD: OCR at 10 Hz
                 self.cd[k] = self.ocr.cooldown(crop)
@@ -498,6 +540,8 @@ class WWVision:
         hud_hidden = max(bright.values()) < 15                 # menus / cutscenes: skill bar not drawn
         flips = {}
         for k in ROIS:
+            if k == 'liberation' and settling_liberation:
+                continue
             if pad_on:
                 want = pad_wants.get(k)
             elif hud_hidden:
@@ -515,6 +559,8 @@ class WWVision:
                 flips[k] = f
         if self.shadow is not None and pad_on and now >= self.settle_until and now < self.lib_badges_until:
             for skill, slot_y in self.pad.items():
+                if skill == 'liberation' and settling_liberation:
+                    continue
                 cx, cy = self._pad_xy(PAD_X, slot_y)
                 self.shadow.sample(frame, cx, cy, int(round(96 * self.sx)), skill,
                                    self.final[skill].state, self.cd[skill] is not None, layout='gamepad')
@@ -588,8 +634,9 @@ class WWVision:
                 fr = self.cam.grab(region=self.region, new_frame_only=self.bike is not None)
                 if fr is not None:
                     self.step(fr, t0)
-                period = 1.0 / BURST_FPS if t0 < self.burst_until or self._switch_pending() else self.period
-                if not self.switch_presses or fr is None:
+                pending = self._switch_pending() or self.liberation_rescan is not self.scanned_liberation
+                period = 1.0 / BURST_FPS if t0 < self.burst_until or pending else self.period
+                if not pending or fr is None:
                     self.scan_wake.wait(max(0.0, period - (time.monotonic() - t0)))
         except Exception as exc:
             self.error = exc
@@ -622,22 +669,48 @@ class WWVision:
 
     def notify_hat(self, hat):
         """Receive a D-pad report on the input-reader thread, without capturing here."""
-        if hat in SWITCH_HATS and self.input_hat != hat:
-            self.switch_presses.append(hat)
+        if self.skills and hat in SWITCH_HATS and self.input_hat != hat:
+            self.switch_request = (hat, time.monotonic())
             self.scan_wake.set()
         self.input_hat = hat
 
+    def notify_input(self, report):
+        """Observe physical input before any report filtering or gamepad remapping."""
+        if not self.skills:
+            return
+        previous_switch = self.switch_request
+        self.notify_hat(report[8] & 0x0F)
+        buttons = (report[8] >> 4) & (NORMAL_ATTACK | RESONANCE_ATTACK)
+        if report[5] >= TRIGGER_ATTACK_LEVEL:
+            buttons |= ECHO_ATTACK
+        if report[6] >= TRIGGER_ATTACK_LEVEL:
+            buttons |= LIBERATION_ATTACK
+        pressed = buttons & ~self.attack_buttons
+        self.attack_buttons = buttons
+        if self.after_bike or self.switch_request is not previous_switch:
+            self.basic_hold_started = None
+            return
+        if self.basic_hold_started is not None and (
+                not buttons & NORMAL_ATTACK or pressed & OTHER_ATTACKS):
+            now = time.monotonic()
+            if now - self.basic_hold_started >= HOLD_S:
+                self.liberation_rescan = now
+                self.scan_wake.set()
+            self.basic_hold_started = None
+        elif pressed & NORMAL_ATTACK and not buttons & OTHER_ATTACKS:
+            self.basic_hold_started = time.monotonic()
+
     def _switch_pending(self):
         """A switch press since the last frame: grab the next frame right away."""
-        if self.switch_presses:
+        if self.switch_request is not self.scanned_switch:
             return True
-        if self.dpad is None:
+        if self.dpad is None or self.switch_request is not None:
             return False
         try:
             hat = self.dpad()
         except Exception:
             return False
-        return hat in SWITCH_HATS and self.prev_hat not in SWITCH_HATS
+        return hat in SWITCH_HATS and hat != self.prev_hat
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
@@ -668,7 +741,29 @@ class WWVision:
             return 'other', 0.0
         return self.bike.current(time.monotonic())
 
-    def states(self):
-        if self.bike is not None and (self.last_frame is None or time.monotonic() - self.last_frame >= HUD_TTL):
+    def states(self, now=None):
+        """Trigger output. A provisional switch never changes the vision events."""
+        now = time.monotonic() if now is None else now
+        if self.after_bike or (self.bike is not None and (
+                self.last_frame is None or now - self.last_frame >= HUD_TTL)):
             return dict.fromkeys(self.final)
-        return {k: d.state for k, d in self.final.items()}
+        # Read the acknowledgement first so a press arriving during this read is
+        # still treated as pending, even while the capture thread resets its debouncers.
+        scanned = self.scanned_switch
+        scanned_liberation = self.scanned_liberation
+        states = {k: d.state for k, d in self.final.items()}
+        request = self.switch_request
+        pending = request is not None and request is not scanned
+        deadline = request[1] + BURST_S if pending else self.provisional_until
+        if now < deadline:
+            for skill in SWITCH_SKILLS:
+                if pending or states[skill] is None:
+                    states[skill] = True
+        start = self.basic_hold_started
+        rescan = self.liberation_rescan
+        pending = rescan is not None and rescan is not scanned_liberation
+        deadline = rescan + BURST_S if pending else self.liberation_provisional_until
+        if ((start is not None and now - start >= HOLD_S)
+                or (now < deadline and (pending or states['liberation'] is None))):
+            states['liberation'] = True
+        return states

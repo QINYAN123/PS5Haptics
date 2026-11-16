@@ -343,6 +343,86 @@ def test_short_switch_tap_wakes_capture():
     assert v.settle_until > 1.0
 
 
+def test_switch_arms_both_until_new_icons_confirm():
+    from unittest.mock import patch
+
+    with patch('ww_vision.time.monotonic', return_value=10.0):
+        v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), ocr=False)
+        v._setup()
+        v.final['echo'].state = v.final['liberation'].state = False
+        v.notify_hat(0)
+        v.notify_hat(8)
+    assert v.states(10.0) == {'resonance': None, 'echo': True, 'liberation': True}
+    assert v.poll() == []
+
+    fr = make_frame(v, {'resonance': None, 'echo': False, 'liberation': True})
+    with patch.object(v, '_read_skills', wraps=v._read_skills) as read:
+        v.step(fr, 10.0)
+        v.step(fr, 10.1)
+        read.assert_not_called()
+    assert v.states(10.1)['echo'] and v.states(10.1)['liberation']
+
+    v.icons['echo'].ready = False
+    v.icons['liberation'].ready = None
+    v.step(fr, 10.2)
+    v.step(fr, 10.24)
+    assert v.states(10.24) == {'resonance': None, 'echo': False, 'liberation': True}
+    assert v.states(11.5)['liberation'] is None
+
+    v.icons['liberation'].ready = True
+    v.step(fr, 10.28)
+    v.step(fr, 10.32)
+    assert v.states(10.32) == {'resonance': None, 'echo': False, 'liberation': True}
+    assert v.states(11.5)['liberation'] is True
+    assert v.poll() == []
+
+    with patch('ww_vision.time.monotonic', side_effect=[10.4, 10.41]):
+        v.notify_hat(2)
+        v.notify_hat(0)
+    assert v.states(10.41)['echo'] is True
+    v.step(fr, 10.42)
+    assert v.slot == 0 and v.switches == 2
+    assert v.states(10.42)['echo'] is True
+
+
+def test_hold_arms_only_liberation_and_rescans_on_release_or_attack():
+    from unittest.mock import patch
+
+    for end_buttons, l2, r2, confirmed in ((0, 0, 0, False), (0x09, 0, 0, True),
+                                           (0x01, 200, 0, False), (0x01, 0, 200, False)):
+        v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), ocr=False)
+        v._setup()
+        v.final['echo'].state = v.final['liberation'].state = False
+        v.icons['echo'].ready = False
+
+        def send(now, buttons, l2=0, r2=0):
+            report = bytearray(64)
+            report[0], report[5], report[6], report[8] = 1, l2, r2, buttons << 4 | 8
+            with patch('ww_vision.time.monotonic', return_value=now):
+                v.notify_input(report)
+
+        send(10.0, 0x01)
+        assert v.states(10.1)['liberation'] is False
+        assert v.states(10.4) == {'resonance': None, 'echo': False, 'liberation': True}
+        send(10.5, end_buttons, l2, r2)
+        assert v.scan_wake.is_set()
+        assert v.states(10.5)['liberation'] is True
+
+        frame = make_frame(v, {'resonance': None, 'echo': False, 'liberation': confirmed})
+        v.step(frame, 10.5)
+        assert v.final['liberation'].state is None
+        v.icons['liberation'].ready = confirmed
+        v.step(frame, 10.65)
+        v.step(frame, 10.69)
+        assert v.states(10.69)['liberation'] is confirmed
+        send(10.7, end_buttons & 0x01)
+        assert v.states(11.2)['liberation'] is confirmed
+        assert v.states(11.2)['echo'] is False
+        assert v.poll() == []
+
+
 if __name__ == '__main__':
-    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture):
+    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
         f(); print('ok', f.__name__)
+    test_hold_arms_only_liberation_and_rescans_on_release_or_attack()
+    print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')
