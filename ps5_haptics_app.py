@@ -37,7 +37,7 @@ DEFAULTS = {'grip_profile': '均衡', 'trigger_profile': '均衡冲击', 'grip_g
             'mode': '原生透传', 'fusion': '叠加', 'trigger_mode': '自动', 'rumble_gain': 1.0, 'speaker_mode': '特殊事件', 'speaker_eq': '原味', 'speaker_volume': 0.8, 'haptic_style': '游戏', 'pbz_fx': True, 'ww_fx': True, 'ww_enabled': True,
             'cinema_rumble': 1.0, 'cinema_kick': 1.0, 'cinema_trigger': 1.0, 'music_kick': 1.0, 'music_tick': 1.0, 'music_trigger': 1.0, 'record_native': True, 'event_fx': True,
             **trigger_presets.scene_defaults(), 'user_games': [],
-            'ww_vision': True, 'ww_click_gate': True, 'ww_bike_swap': True, 'ww_bike_audio': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
+            'ww_vision': True, 'ww_skill_shadow': False, 'ww_click_gate': True, 'ww_bike_swap': True, 'ww_bike_audio': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
 
 
 WW_EXE = 'client-win64-shipping.exe'
@@ -647,14 +647,16 @@ class Runner:
                             previous.stop()
                         if new_vision_key is not None:
                             tp = None
-                            if self.cfg.get('record_native', True):
+                            shadow = self.cfg.get('ww_skill_shadow', False)
+                            if self.cfg.get('record_native', True) or shadow:
                                 (ROOT / 'traces').mkdir(exist_ok=True)
                                 tp = ROOT / 'traces' / time.strftime('ww-%Y%m%d-%H%M%S.tsv')
                             cd = (ROOT / 'traces' / 'ww-crops') if self.cfg.get('ww_collect', False) else None
                             sd = (ROOT / 'traces' / 'ww-shots') if self.cfg.get('ww_shots', True) else None
                             vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), dpad=lambda: hid.dpad,
                                               buttons=lambda: hid.held, trace_path=tp, mem=proc_mem_mb,
-                                              crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills)
+                                              crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills,
+                                              skill_shadow=shadow)
                             bike_window = hwnd
                             if native:
                                 vpad.bike_context = bike_context

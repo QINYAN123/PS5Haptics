@@ -14,7 +14,7 @@ a = Analysis(
     ['ps5_haptics_app.py'],
     pathex=[],
     binaries=[],
-    datas=ocr_datas + [('models/silero_vad.onnx', 'models'), ('models/ww-bike-hud.npz', 'models')],
+    datas=ocr_datas + [('models/silero_vad.onnx', 'models'), ('models/ww-bike-hud.npz', 'models'), ('models/ww-skill-visual.json', 'models')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

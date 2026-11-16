@@ -705,6 +705,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         'rumble_gain': tk.DoubleVar(value=cfg['rumble_gain'] * 100), 'speaker_mode': tk.StringVar(value={'仅大招/特殊技': '仅关键事件', '智能增强': '全部游戏声音'}.get(cfg['speaker_mode'], cfg['speaker_mode'])),
         'speaker_volume': tk.DoubleVar(value=cfg['speaker_volume'] * 100), 'record_native': tk.BooleanVar(value=cfg.get('record_native', True)),
         'event_fx': tk.BooleanVar(value=cfg.get('event_fx', True)), 'ww_vision': tk.BooleanVar(value=cfg.get('ww_vision', True)),
+        'ww_skill_shadow': tk.BooleanVar(value=cfg.get('ww_skill_shadow', False)),
         'ww_bike_swap': tk.BooleanVar(value=cfg.get('ww_bike_swap', True)),
         'ww_bike_audio': tk.BooleanVar(value=cfg.get('ww_bike_audio', True)),
         'ww_click_gate': tk.BooleanVar(value=cfg.get('ww_click_gate', True)), 'game_profiles': tk.BooleanVar(value=cfg.get('game_profiles', True)), 'capture': tk.StringVar(value=cfg.get('capture', '自动')), 'speaker_scene': tk.BooleanVar(value=cfg.get('speaker_scene', True)), 'pbz_log_dir': tk.StringVar(value=cfg.get('pbz_log_dir', '')),
@@ -798,7 +799,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     # settings that the running engine picks up live (within 0.5 s) vs the ones that need a restart
     RESTART_KEYS = {'mode': '连接方式', 'capture': '声音来源', 'pbz_fx': '影之刃零事件特调', 'ww_fx': '鸣潮事件特调',
-                    'ww_vision': '鸣潮技能识别', 'record_native': '录制调校数据', 'foreground_exe': '指定前台游戏',
+                    'ww_vision': '鸣潮技能识别', 'ww_skill_shadow': '鸣潮识别对照记录', 'record_native': '录制调校数据', 'foreground_exe': '指定前台游戏',
                     'pbz_log_dir': '事件日志目录'}
     live = {'job': None}
 
@@ -1198,6 +1199,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     p = module('鸣潮', 'WUTHERING WAVES', GREEN, '鸣潮（Client-Win64-Shipping.exe）在前台时自动生效。读屏幕识别技能状态，不注入、不修改游戏。')
     Toggle(p.body, '鸣潮专属调校', V['game_profiles'], '在前台时自动切换：原生震动降到 60%、握把风格改为细节丰富', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '技能识别（读屏 + OCR）', V['ww_vision'], '识别手柄界面 L2 / R2 技能按钮的冷却数字：大招就绪时 R2 变成「咔哒」武器扳机，声骸就绪时 L2 有阻力', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
+    Toggle(p.body, '鸣潮识别对照记录', V['ww_skill_shadow'], '在日志记录新模型和现有技能判定的分歧。启用技能识别后可用，重启触感引擎生效。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '科考摩托 R1／R2 互换', V['ww_bike_swap'], '原生透传识别到科考摩托的 R1 加速提示时，实体 R2 加速，实体 R1 执行原 R2 动作。离开摩托界面恢复。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '摩托氮气随声音增加阻力', V['ww_bike_audio'], '使用鸣潮进程声音的 45–140 Hz 低频调节 R2 阻力。没有进程声音时使用基础阻力。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '扳机按到咔哒点才释放', V['ww_click_gate'], '技能就绪时，扳机要按过咔哒点游戏才收到按键，不会误放技能（仅原生透传）', color=GREEN, wrap=820).pack(fill='x', pady=px(4))

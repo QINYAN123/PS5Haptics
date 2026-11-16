@@ -16,6 +16,7 @@ Events (kind 'ww'):
                                    e.g. Jinhsi; ok-ww's forte_full box, white fraction)
 """
 import collections
+from pathlib import Path
 import threading
 import time
 import numpy as np
@@ -259,7 +260,7 @@ def body_brightness(bgra):
 
 
 class WWVision:
-    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True):
+    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True, skill_shadow=False):
         """inputs(): returns (l2, r2) pressed 0..1 from the real pad. mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
         self.bike = BikeHud() if bike else None
@@ -281,6 +282,17 @@ class WWVision:
         # charged liberation from a grey, uncharged one. ocr=False disables (tests / no model).
         self.ocr = ocr; self.cd = {k: None for k in ROIS}; self.cd_seen = {k: False for k in ROIS}; self.final = {k: Debounced(2) for k in ROIS}
         self.shots_dir = shots_dir; self.shot_due = []; self.shots = 0
+        self.shadow = None
+        if skill_shadow and skills and self.trace is not None:
+            try:
+                from ww_skill_visual import SkillShadow
+                self.shadow = SkillShadow(
+                    Path(__file__).resolve().parent / 'models' / 'ww-skill-visual.json',
+                    self.trace,
+                    Path(trace_path).with_suffix('') if shots_dir else None,
+                )
+            except (OSError, ValueError, KeyError) as exc:
+                self.trace.write(f'{int(time.time() * 1000)}\tshadow_error\t{exc!r}\n')
         self.pad = None; self.pad_time = -9.0; self.layout = '-'
         self.cd_last = {}; self.ready_since = {}; self.ring_val = {}; self.shot_error = None
         self.lib_badges_until = 0.0
@@ -501,6 +513,12 @@ class WWVision:
             f = self.final[k].update(want)
             if f is not None:
                 flips[k] = f
+        if self.shadow is not None and pad_on and now >= self.settle_until and now < self.lib_badges_until:
+            for skill, slot_y in self.pad.items():
+                cx, cy = self._pad_xy(PAD_X, slot_y)
+                self.shadow.sample(frame, cx, cy, int(round(96 * self.sx)), skill,
+                                   self.final[skill].state, self.cd[skill] is not None, layout='gamepad')
+
         x, y, w, h = self.forte_box
         fy = luminance(frame[y:y + h, x:x + w])
         forte_ev = self.forte.update(float((fy > 225).mean()), now)
