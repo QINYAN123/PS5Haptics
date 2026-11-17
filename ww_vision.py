@@ -191,7 +191,8 @@ class ForteState:
         was = self.full
         self.full = False
         # released: was full (for a moment, not a flicker) and emptied within 0.5 s
-        if was and frac <= 0.02 and self.full_since is not None and self.last_full - self.full_since >= 0.15:
+        if (was and frac <= 0.02 and now - self.last_full <= 0.5
+                and self.full_since is not None and self.last_full - self.full_since >= 0.15):
             return 'release'
         return None
 
@@ -284,6 +285,7 @@ class WWVision:
         self.scanned_switch = None
         self.input_hat = None
         self.attack_buttons = 0
+        self.last_attack_input = -9.0
         self.basic_hold_started = None
         self.liberation_rescan = None
         self.scanned_liberation = None
@@ -490,6 +492,7 @@ class WWVision:
         self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
         self.refresh_badges_after = self.settle_until
         self.slot = hat
+        self.forte = ForteState()
         for skill in SWITCH_SKILLS:
             self._reset_skill(skill)
         self.lib_badges_until = 0.0
@@ -575,7 +578,10 @@ class WWVision:
                     self.events.append(('ww', k, 'ready'))
                 elif SIDE_OF.get(k) and now - self.last_press[SIDE_OF[k]] <= CAST_WINDOW:
                     self._cast(k, now)
-            if forte_ev and not flips:
+            # A HUD transition can empty the highlighted pixels without an attack.
+            if forte_ev and not flips and (self.buttons is None or (
+                    0.0 <= now - self.last_attack_input <= CAST_WINDOW
+                    and (now < self.lib_badges_until if pad_on else not hud_hidden))):
                 self.events.append(('ww', 'forte', forte_ev))
         # validation snapshots: the full-resolution skill row at a press and 0.5 s later
         if self.shots_dir and self.shots < 300:
@@ -686,19 +692,23 @@ class WWVision:
         if report[6] >= TRIGGER_ATTACK_LEVEL:
             buttons |= LIBERATION_ATTACK
         pressed = buttons & ~self.attack_buttons
+        normal_released = self.attack_buttons & NORMAL_ATTACK and not buttons & NORMAL_ATTACK
         self.attack_buttons = buttons
         if self.after_bike or self.switch_request is not previous_switch:
             self.basic_hold_started = None
+            self.last_attack_input = -9.0
             return
+        if pressed or normal_released:
+            self.last_attack_input = time.monotonic()
         if self.basic_hold_started is not None and (
                 not buttons & NORMAL_ATTACK or pressed & OTHER_ATTACKS):
-            now = time.monotonic()
+            now = self.last_attack_input
             if now - self.basic_hold_started >= HOLD_S:
                 self.liberation_rescan = now
                 self.scan_wake.set()
             self.basic_hold_started = None
         elif pressed & NORMAL_ATTACK and not buttons & OTHER_ATTACKS:
-            self.basic_hold_started = time.monotonic()
+            self.basic_hold_started = self.last_attack_input
 
     def _switch_pending(self):
         """A switch press since the last frame: grab the next frame right away."""

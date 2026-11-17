@@ -538,6 +538,23 @@ def test_deps_checks():
     assert 'usbip' in xds.USBIP_HELP and '重启' in xds.USBIP_HELP
 
 
+def test_native_motor_mode_switch():
+    from xds import VirtualDualSense
+
+    pad = VirtualDualSense()
+
+    def report(flags, flags2=0, left=80, right=40):
+        payload = bytes([flags, 0, right, left, flags2]) + bytes(25)
+        pad._on_raw(bytes([1, len(payload), 0]) + payload)
+        return pad.feedback()[:2]
+
+    assert report(0x03) == ((80, 40), True)
+    assert report(0x04) == ((80, 40), True)  # Trigger-only report preserves motor state.
+    assert report(0x02) == ((0, 0), False)   # Audio haptics ignore the motor bytes.
+    assert report(0x02, 0x04) == ((80, 40), True)
+    assert report(0x02, 0x04, 0, 0) == ((0, 0), True)
+
+
 def test_stuck_guard():
     import ps5_haptics_app as A
     import numpy as np
@@ -578,6 +595,9 @@ def test_stuck_guard():
     assert render(6.5, plateau)[-1]
     assert not render(0.2, lambda s: (0.0, 0.0))[-1]    # silence rearms the guard
     assert not any(render(0.5, plateau))
+    g.reset()
+    assert not g.wave_muted and not g.seen
+    assert g.trigger('R', vib, 62.0) == vib
 
 
 def test_volume():
@@ -639,6 +659,7 @@ def test_live():
 
 
 if __name__ == '__main__':
+    test_native_motor_mode_switch()
     test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks(); test_stuck_guard()
     print('offline tests ok')
     if '--live' in sys.argv:

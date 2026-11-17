@@ -421,8 +421,32 @@ def test_hold_arms_only_liberation_and_rescans_on_release_or_attack():
         assert v.poll() == []
 
 
+def test_visual_forte_ignores_idle_and_hidden_hud():
+    from unittest.mock import patch
+
+    v = WWVision(lambda: (0, 0), camera=FakeCam(), ocr=False, buttons=lambda: 0)
+    v._setup()
+    shown = make_frame(v, {'resonance': True, 'echo': False, 'liberation': False})
+    hidden = np.zeros_like(shown)
+    with patch.object(v.forte, 'update', return_value='release'):
+        v.step(shown, 20.0)
+        assert v.poll() == []
+        report = bytearray(64)
+        report[8] = 0x18
+        with patch('ww_vision.time.monotonic', return_value=20.1):
+            v.notify_input(report)
+        v.step(hidden, 20.2)
+        assert v.poll() == []
+        v.step(shown, 20.3)
+        assert v.poll() == [('ww', 'forte', 'release')]
+        v.step(shown, 21.0)
+        assert v.poll() == []
+
+
 if __name__ == '__main__':
     for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
         f(); print('ok', f.__name__)
     test_hold_arms_only_liberation_and_rescans_on_release_or_attack()
     print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')
+    test_visual_forte_ignores_idle_and_hidden_hud()
+    print('ok test_visual_forte_ignores_idle_and_hidden_hud')

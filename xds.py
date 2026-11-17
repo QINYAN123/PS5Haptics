@@ -134,8 +134,10 @@ class VirtualDualSense:
                 with self.lock:
                     if e1 & 0x04: self.right_effect = bytes(p[5:16]); self.trigger_seq += 1
                     if e1 & 0x08: self.left_effect = bytes(p[16:27]); self.trigger_seq += 1
-                    if e1 & 0x03:
-                        self.rumble = (p[3], p[2]); self.compat_rumble = (e1 & 0x02) == 0 or (e1 & 0x01) != 0
+                    compatible = bool(e1 & 0x01 or p[4] & 0x04)
+                    if compatible or e1 & 0x02:
+                        self.compat_rumble = compatible
+                        self.rumble = (p[3], p[2]) if compatible else (0, 0)
                     if e2 & 0x04: self.color = (p[27], p[28], p[29])
             elif t == 3 and len(p) >= 36:
                 vals = struct.unpack_from('<16h', p, 4)

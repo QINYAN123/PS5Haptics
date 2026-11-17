@@ -63,6 +63,11 @@ class StuckGuard:
         self.wave_samples = 0
         self.wave_muted = False
 
+    def reset(self):
+        self.seen.clear()
+        self.said.clear()
+        self.reset_wave()
+
     def _say(self, what):
         if what not in self.said:
             self.said.add(what); self.log(f'检测到游戏的{what}疑似卡住，已自动松开；游戏换成新的效果时恢复。')
@@ -409,7 +414,7 @@ class Runner:
             late_mark = 0                         # drops counted up to the last normal loop pass
             trig = (0.0, 0.0)                     # a block shorter than one hop (resampled) must not leave it unset
             tl_acc = dict.fromkeys(TL_KEYS, 0.0); tl_t = 0.0; static = (None, None); last_static = static
-            mode_warned = set(); stuck = StuckGuard(self.log)
+            mode_warned = set(); stuck = StuckGuard(self.log); guard_game = None
 
             def ours(i):                          # this side's own effect: a trigger-feel preset, else follow the sound
                 if static[i] is not None:
@@ -679,6 +684,10 @@ class Runner:
                         self.log('科考摩托 R1/R2 已恢复')
                     bike_mode = new_bike_mode
                 self.stats['ww_bike'] = bike_mode
+                new_guard_game = fg if fg == PBZ_EXE or (fg == WW_EXE and bike_mode == 'other') else None
+                if new_guard_game != guard_game:
+                    stuck.reset()
+                    guard_game = new_guard_game
 
                 if native and bike_mode in ('boost', 'air'):
                     if not self.cfg.get('ww_bike_audio', True):
@@ -734,11 +743,12 @@ class Runner:
                         self.stats['voice_closed'] = False
                     if native:
                         (rleft, rright), _, color = vpad.feedback()
-                        if fg == PBZ_EXE:
+                        if guard_game is not None:
                             rleft, rright = stuck.motors(rleft, rright, time.monotonic())
                         large, small = rleft / 255, rright / 255
                         nl, nr = vpad.wave.pull(HOP)                  # game's own voice-coil waveform
-                        if fg == PBZ_EXE and stuck.wave(nl, nr, fx.last_event if fx is not None else 0.0, time.monotonic()):
+                        if guard_game is not None and stuck.wave(
+                                nl, nr, fx.last_event if fx is not None else 0.0, time.monotonic()):
                             nl = np.zeros_like(nl); nr = np.zeros_like(nr)
                         rl, rr = rum.step(large, small, rgain)         # legacy rumble, if the game uses it
                         nl = nl * rgain + rl; nr = nr * rgain + rr
@@ -841,7 +851,7 @@ class Runner:
                 game_l = game_r = None
                 if native:
                     game_l, game_r, _ = vpad.triggers()
-                    if fg == PBZ_EXE:
+                    if guard_game is not None:
                         tnow = time.monotonic()
                         game_l = stuck.trigger('L', game_l, tnow); game_r = stuck.trigger('R', game_r, tnow)
                     if trace is not None and (game_l, game_r) != trace_trig:
