@@ -121,6 +121,8 @@ class VirtualDualSense:
         # send their authored speaker sounds there.
         self.spk_peak = 0; self.spk_frames = 0
         self.gate = {'L': None, 'R': None}; self._gate_down = {'L': False, 'R': False}
+        self._gate_pull = {}
+        self.trigger_input = (0.0, 0.0)
         self.bike_input = BikeInput()
         self.bike_context = None
         self.ready = threading.Event(); self.error = None
@@ -215,19 +217,23 @@ class VirtualDualSense:
     # gate[side] = raw threshold (0..255) or None. While set, the game sees that trigger as fully
     # released until the physical trigger passes the threshold (the adaptive "click" point), then
     # fully pressed - so a ready skill fires exactly at the click, not at the game's own early point.
-    gate = {'L': None, 'R': None}
-    _gate_down = {'L': False, 'R': False}
-
     def _apply_gate(self, report):
         r = None
         for side, idx, bit in (('L', 5, 0x04), ('R', 6, 0x08)):
-            thr = self.gate.get(side)
+            raw = report[idx]
+            if raw <= 8:
+                self._gate_pull.pop(side, None)
+                self._gate_down[side] = False
+                thr = self.gate.get(side)
+            else:
+                # Keep the same input mapping throughout a physical pull. A
+                # visual state change must not create a new game-side press.
+                thr = self._gate_pull.setdefault(side, self.gate.get(side))
             if thr is None:
                 self._gate_down[side] = False
                 continue
-            raw = report[idx]
             down = self._gate_down[side]
-            down = raw >= thr if not down else raw >= thr - 40      # hysteresis on release
+            down = raw > 8 and raw >= (thr - 40 if down else thr)    # hysteresis on release
             self._gate_down[side] = down
             if r is None:
                 r = bytearray(report)
@@ -246,6 +252,7 @@ class VirtualDualSense:
         if bike == 'other' and not self.bike_input.wait_release:
             report = self._apply_gate(report)
         else:
+            self._gate_pull.clear()
             self._gate_down.update(L=False, R=False)
         key = bytes(report[1:11])
         if key == getattr(self, '_last_key', None) and now - getattr(self, '_last_fw', 0.0) < 0.004:
@@ -257,6 +264,7 @@ class VirtualDualSense:
                 self.sock.sendall(b'I' + struct.pack('<H', len(state)) + state)
         except Exception:
             return
+        self.trigger_input = (report[5] / 255, report[6] / 255)
         self.frames['in'] += 1
 
     def triggers(self):

@@ -269,7 +269,7 @@ def body_brightness(bgra):
 
 class WWVision:
     def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True, skill_shadow=False):
-        """inputs(): returns (l2, r2) pressed 0..1 from the real pad. mem(): MB, for diagnostics."""
+        """inputs(): returns the L2/R2 values seen by the game (0..1). mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
         self.bike = BikeHud() if bike else None
         self.skills = skills

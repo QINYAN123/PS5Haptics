@@ -107,8 +107,8 @@ def test_forte_release_and_speaker():
 
 def test_click_gate():
     from xds import VirtualDualSense
-    v = VirtualDualSense.__new__(VirtualDualSense)
-    v.gate = {'L': None, 'R': 170}; v._gate_down = {'L': False, 'R': False}
+    v = VirtualDualSense()
+    v.gate['R'] = 170
     rep = bytearray(64); rep[0] = 1; rep[9] = 0x08
     seen = []
     for raw in (40, 120, 165, 175, 200, 150, 120, 60):
@@ -119,8 +119,39 @@ def test_click_gate():
     assert seen[3] == (255, True) and seen[5] == (255, True), seen   # past the click, held with hysteresis
     assert seen[-1] == (0, False), seen
     v.gate['R'] = None
+    rep[6], rep[9] = 135, 0x08
+    assert v._apply_gate(bytes(rep))[6] == 0                     # icon changed mid-pull
+    rep[6], rep[9] = 0, 0
+    v._apply_gate(bytes(rep))
     rep[6] = 90; rep[9] = 0x08
     assert v._apply_gate(bytes(rep))[6] == 90                  # on cooldown: untouched
+    v.gate['R'] = 170
+    assert v._apply_gate(bytes(rep))[6] == 90                  # newly ready: don't interrupt an analog pull
+    rep[6], rep[9] = 0, 0
+    v._apply_gate(bytes(rep))
+    rep[6], rep[9] = 140, 0x08
+    assert v._apply_gate(bytes(rep))[6] == 0                  # fresh pull uses the new click point
+
+
+def test_unforwarded_trigger_does_not_count_as_a_skill_press():
+    from types import SimpleNamespace
+    from xds import VirtualDualSense
+
+    pad = VirtualDualSense()
+    pad.sock = SimpleNamespace(sendall=lambda _: None)
+    pad.gate['R'] = 170
+    vision = WWVision(lambda: pad.trigger_input, camera=FakeCam(), ocr=False)
+    vision._setup()
+    frame = make_frame(vision, {'resonance': False, 'echo': False, 'liberation': False})
+    report = bytearray(64)
+    report[0], report[6], report[8], report[9] = 1, 140, 8, 0x08
+    pad.forward(bytes(report))
+    vision.step(frame, 20.0)
+    assert vision.last_press['R'] < 0
+    report[6] = 175
+    pad.forward(bytes(report))
+    vision.step(frame, 20.1)
+    assert vision.last_press['R'] == 20.1
 
 
 def test_ocr_states():
@@ -450,3 +481,5 @@ if __name__ == '__main__':
     print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')
     test_visual_forte_ignores_idle_and_hidden_hud()
     print('ok test_visual_forte_ignores_idle_and_hidden_hud')
+    test_unforwarded_trigger_does_not_count_as_a_skill_press()
+    print('ok test_unforwarded_trigger_does_not_count_as_a_skill_press')

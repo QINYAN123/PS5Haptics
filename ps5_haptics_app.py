@@ -662,7 +662,8 @@ class Runner:
                                 tp = ROOT / 'traces' / time.strftime('ww-%Y%m%d-%H%M%S.tsv')
                             cd = (ROOT / 'traces' / 'ww-crops') if self.cfg.get('ww_collect', False) else None
                             sd = (ROOT / 'traces' / 'ww-shots') if self.cfg.get('ww_shots', True) else None
-                            vision = WWVision(lambda: (hid.l2 / 255, hid.r2 / 255), dpad=lambda: hid.dpad,
+                            trigger_input = (lambda: vpad.trigger_input) if native else (lambda: (hid.l2 / 255, hid.r2 / 255))
+                            vision = WWVision(trigger_input, dpad=lambda: hid.dpad,
                                               buttons=lambda: hid.held, trace_path=tp, mem=proc_mem_mb,
                                               crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills,
                                               skill_shadow=shadow)
