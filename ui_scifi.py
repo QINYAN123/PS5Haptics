@@ -690,7 +690,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     msgs = queue.Queue(); runner = {'r': None, 't': None}
     pbz = {'status': None, 'started': None, 'checking': False, 'state': 'checking', 'notice': None}
 
+    from pad_input import BUTTON_LABELS, ButtonMap
+    from voice_gate import suppression_enabled
     V = {
+        'suppress_background': tk.BooleanVar(value=suppression_enabled(cfg)),
         'grip_profile': tk.StringVar(value=cfg['grip_profile']), 'trigger_profile': tk.StringVar(value=cfg['trigger_profile']),
         'haptic_style': tk.StringVar(value={'标准': '游戏', '电影': '影院', '音乐': '律动'}.get(cfg.get('haptic_style', '游戏'), cfg.get('haptic_style', '游戏'))),
         'pbz_fx': tk.BooleanVar(value=cfg.get('pbz_fx', cfg.get('event_fx', True))),
@@ -722,11 +725,11 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         return {k: (tk.DoubleVar(value=v * 100) if k in PCT else tk.BooleanVar(value=v) if isinstance(v, bool)
                     else tk.IntVar(value=v) if isinstance(v, int) else tk.StringVar(value=v)) for k, v in vals.items()}
     SCENE_DEF = {
-        '游戏': dict(mode='原生透传', voice_gate=True, fusion='叠加', trigger_mode='自动', custom_fusion='叠加', custom_trigger_mode='叠加', custom_speaker_mode='全部游戏声', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
+        '游戏': dict(mode='原生透传', fusion='叠加', trigger_mode='自动', custom_fusion='叠加', custom_trigger_mode='叠加', custom_speaker_mode='全部游戏声', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
                    rumble_gain=1.0, speaker_mode='特殊事件', speaker_eq='原味', speaker_volume=0.6, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
-        '影院': dict(mode='普通', voice_gate=False, fusion='叠加', trigger_mode='自动', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=0.8,
+        '影院': dict(mode='普通', fusion='叠加', trigger_mode='自动', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=0.8,
                    rumble_gain=1.0, speaker_mode='全部游戏声', speaker_eq='低音饱满', speaker_volume=0.7, capture='自动', skip_center=True, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
-        '音乐': dict(mode='普通', voice_gate=False, fusion='叠加', trigger_mode='自动', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
+        '音乐': dict(mode='普通', fusion='叠加', trigger_mode='自动', grip_profile='均衡', trigger_profile='均衡冲击', grip_gain=1.0, trigger_gain=1.0,
                    rumble_gain=1.0, speaker_mode='全部游戏声', speaker_eq='低音饱满', speaker_volume=0.6, capture='自动', skip_center=False, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
     }
     import trigger_presets as TP
@@ -739,6 +742,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     SV = {}
     for sc in SCENES:
         vals = dict(SCENE_DEF[sc]); vals.update(saved.get(sc, {}))
+        vals.pop('voice_gate', None)
         vals['speaker_mode'] = SPEAKER_MODE_ALIAS.get(vals['speaker_mode'], vals['speaker_mode'])
         if vals.get('fusion') == '仅游戏震动' and 'trigger_mode' not in saved.get(sc, {}):
             vals['trigger_mode'] = '纯用游戏'                 # that old choice also left the triggers to the game
@@ -799,7 +803,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         stop() if running() else start()
 
     # settings that the running engine picks up live (within 0.5 s) vs the ones that need a restart
-    RESTART_KEYS = {'mode': '连接方式', 'capture': '声音来源', 'pbz_fx': '影之刃零事件特调', 'ww_fx': '鸣潮事件特调',
+    RESTART_KEYS = {'button_map': '按键映射', 'mode': '连接方式', 'capture': '声音来源', 'pbz_fx': '影之刃零事件特调', 'ww_fx': '鸣潮事件特调',
                     'ww_vision': '鸣潮扳机', 'ww_skill_icons': '按技能图标就绪', 'ww_skill_shadow': '鸣潮识别对照记录', 'record_native': '录制调校数据', 'foreground_exe': '指定前台游戏',
                     'pbz_log_dir': '事件日志目录'}
     live = {'job': None}
@@ -1388,6 +1392,46 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             GameCaps().reset()
         msgs.put('已清除让位记录，游戏用到时会重新记录。')
 
+    map_summary = tk.StringVar()
+    map_keys = {label: key for key, label in BUTTON_LABELS.items()}
+
+    def show_mapping():
+        mapping = ButtonMap(cfg.get('button_map')).bindings
+        pairs = (f'{BUTTON_LABELS[key]} → {BUTTON_LABELS[target]}' for key, target in mapping.items())
+        map_summary.set('     '.join(pairs) or tr('原始键位'))
+
+    def mapping_panel(f):
+        pnl = Panel(f, '按键映射', 'BUTTON MAP', accent=CYAN)
+        pnl.pack(fill='x', pady=(0, px(10)))
+        tk.Label(pnl.body, text='选择两个实体键，交换它们发给游戏的输入。原生透传、接管和虚拟 Xbox 支持改键；普通模式由游戏直接读取实体手柄。',
+                 bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(870)).pack(fill='x')
+        row = tk.Frame(pnl.body, bg=PANEL)
+        row.pack(anchor='w', pady=px(6))
+        first, second = tk.StringVar(value='R1'), tk.StringVar(value='R2')
+        for var in (first, second):
+            picker = tk.OptionMenu(row, var, *map_keys)
+            picker.configure(width=8, bg=PANEL2, fg=TEXT, highlightthickness=0)
+            picker.pack(side='left', padx=(0, px(8)))
+
+        def save(mapping):
+            cfg['button_map'] = mapping
+            show_mapping()
+            apply_live()
+
+        def swap():
+            a, b = map_keys[first.get()], map_keys[second.get()]
+            if a != b:
+                save(ButtonMap(cfg.get('button_map')).swap(a, b))
+
+        NeonButton(row, '交换键位', swap, w=112, h=32, size=10).pack(side='left', padx=px(4))
+        NeonButton(row, '恢复原始键位', lambda: save({}), w=142, h=32, size=10).pack(side='left', padx=px(4))
+        tk.Label(pnl.body, textvariable=map_summary, bg=PANEL, fg=CYAN, font=(ZH, 10),
+                 anchor='w', justify='left', wraplength=px(890)).pack(fill='x')
+        tk.Label(pnl.body, text='映射在下次启动触感引擎时生效。自定义 R1 或 R2 后，鸣潮摩托优先使用你的键位。',
+                 bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', wraplength=px(880)).pack(fill='x')
+
+    show_mapping()
+
     def pad_panel(f):
         pnl = Panel(f, '手柄输入', 'INPUT', accent=CYAN); pnl.pack(fill='x', pady=(0, px(10)))
         Slider(pnl.body, '左摇杆死区', V['stick_dz_l'], 0, 30).pack(fill='x', pady=px(2))
@@ -1506,8 +1550,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         tk.Label(pnl.body, text='扳机风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['trigger_profile'], TRIGGER_PROFILES, cell=116, color=MAG, rec='均衡冲击').pack(anchor='w', pady=(px(4), px(10)))
         Toggle(pnl.body, '忽略中置声道', sv['skip_center'], '5.1/7.1 时对白（中置）不触发震动', wrap=300).pack(fill='x', pady=px(4))
-        Toggle(pnl.body, '抑制人声和背景音乐' if sc == '游戏' else '纯人声时不震', sv['voice_gate'],
-               '压低台词和持续配乐产生的震动，遇到突出的技能或打击音时短暂放行。' if sc == '游戏' else '压低由台词、旁白产生的声音触感。', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
+        Toggle(pnl.body, '抑制人声和背景音乐', V['suppress_background'],
+               '所有场景共用。压低台词和配乐产生的震动，突出打击和爆炸。想让手柄跟随音乐律动时可关闭。', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
         trigger_panel(f, sv)
         pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
@@ -1547,8 +1591,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         tk.Label(fr, text=('自动：先截已适配的游戏，其次截前台正在出声的程序' if sc == '游戏' else '自动：截当前正在出声的播放器 / 浏览器 / 音乐软件') +
                  '（按进程截音，开着杜比全景声也能用）；系统混音：截整个系统的声音。',
                  bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(620)).pack(side='left', padx=px(14))
-        if sc == '游戏' and game is None:
-            pad_panel(f)
+        if game is None:
+            mapping_panel(f)
+            if sc == '游戏':
+                pad_panel(f)
 
     settings_page = page('设置', scroll=True)
     scene_frames = {}

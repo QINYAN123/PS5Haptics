@@ -22,7 +22,8 @@ from selfcheck import TL_KEYS
 from haptic_dsp import HapticEngine, HOP, GRIP_PROFILES, TRIGGER_PROFILES, RawSpeaker, SPEAKER_MODES, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
 from button_haptics import ButtonClicks
 from game_caps import GameCaps, NOT_GAMES
-from pad_input import InputFilter
+from pad_input import InputFilter, ButtonMap
+from voice_gate import suppression_enabled
 from takeover import VirtualDS4, VirtualX360, Isolation, RumbleCoil, fuse, FUSION_ALIAS
 from xds import VirtualDualSense
 from event_fx import EventFX, load_config as load_event_fx
@@ -338,6 +339,8 @@ class Runner:
         native = mode == '原生透传'                 # virtual DualSense: game's own triggers + haptics
         xbox = mode == 'Xbox'                       # virtual Xbox pad: games that only accept Xbox controllers
         takeover = mode == '接管' or native or xbox  # any mode that hides the real pad
+        button_map = ButtonMap(self.start_cfg.get('button_map') if takeover else None)
+        logical_report = bytes([1, 128, 128, 128, 128, 0, 0, 0, 8, 0])
         try:
             rescan()                                  # see a pad / audio device plugged in since the app opened
             p, src, stream = self._open_loopback()
@@ -360,11 +363,13 @@ class Runner:
                 vpad.open()
                 self.pad_filter = InputFilter(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
                 def forward_input(report):
+                    nonlocal logical_report
+                    logical_report = button_map.apply(self.pad_filter.apply(report))
                     current = vision
                     if current is not None:
-                        current.notify_input(report)
+                        current.notify_input(logical_report)
                     before = vpad.trigger_press_times if native and current is not None else None
-                    vpad.forward(self.pad_filter.apply(report))
+                    vpad.forward(logical_report)
                     if before is not None and before is not vpad.trigger_press_times:
                         for side, old, stamp in zip(('L', 'R'), before, vpad.trigger_press_times):
                             if stamp != old:
@@ -424,7 +429,7 @@ class Runner:
                 if bike_window != foreground_window():
                     return 'unknown'
                 context, _ = current.bike_state()
-                if context in ('boost', 'air') and not self.cfg.get('ww_bike_swap', True):
+                if context in ('boost', 'air') and (not self.cfg.get('ww_bike_swap', True) or button_map.uses_right_shoulder):
                     return 'bike'
                 return context
 
@@ -453,6 +458,8 @@ class Runner:
             trig = (0.0, 0.0)                     # a block shorter than one hop (resampled) must not leave it unset
             tl_acc = dict.fromkeys(TL_KEYS, 0.0); tl_t = 0.0; static = (None, None); last_static = static
             mode_warned = set(); stuck = StuckGuard(self.log); guard_game = None
+
+            suppress_background = suppression_enabled(self.base)
 
             def ours(i):                          # this side's own effect: a trigger-feel preset, else follow the sound
                 if static[i] is not None:
@@ -612,6 +619,7 @@ class Runner:
                         ep_gain = 1.0
                     if self.live_ver != live_seen:              # settings changed in the UI: apply what can change live
                         live_seen = self.live_ver
+                        suppress_background = suppression_enabled(self.base)
                         vol = self.cfg.get('speaker_volume', 0.6)
                         spk_mode = SPEAKER_MODE_ALIAS.get(self.cfg.get('speaker_mode', '全部游戏声'), self.cfg.get('speaker_mode', '全部游戏声'))
                         spk_eq = self.cfg.get('speaker_eq', '原味'); spk_assert = 0.0   # output path applies at once
@@ -700,8 +708,15 @@ class Runner:
                             cd = (ROOT / 'traces' / 'ww-crops') if self.cfg.get('ww_collect', False) else None
                             sd = (ROOT / 'traces' / 'ww-shots') if self.cfg.get('ww_shots', True) else None
                             trigger_input = (lambda: vpad.trigger_input) if native else (lambda: (hid.l2 / 255, hid.r2 / 255))
-                            vision = WWVision(trigger_input, dpad=lambda: hid.dpad,
-                                              buttons=lambda: hid.held, trace_path=tp, mem=proc_mem_mb,
+                            hat_input = lambda: hid.dpad
+                            held_input = lambda: hid.held
+                            if takeover and button_map.bindings:
+                                hat_input = lambda: logical_report[8] & 15
+                                held_input = lambda: (logical_report[8] >> 4) | ((logical_report[9] & 3) << 4)
+                                if not native:
+                                    trigger_input = lambda: (logical_report[5] / 255, logical_report[6] / 255)
+                            vision = WWVision(trigger_input, dpad=hat_input,
+                                              buttons=held_input, trace_path=tp, mem=proc_mem_mb,
                                               crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills,
                                               skill_shadow=shadow, skill_icons=skill_icons,
                                               trigger_presses=(lambda: vpad.trigger_press_times) if native else None)
@@ -770,7 +785,7 @@ class Runner:
                         bl = np.clip(bl * ep_gain, -1, 1); br = np.clip(br * ep_gain, -1, 1)
                     wl, wr, trig = eng.process(bl, br, press)
                     vg = 1.0
-                    if self.cfg.get('voice_gate'):
+                    if suppress_background:
                         if voice_gate is None:
                             try:
                                 from voice_gate import VoiceGate
@@ -780,15 +795,11 @@ class Runner:
                                 self.log('人声识别不可用：' + str(exc))
                         if voice_gate:
                             vg = voice_gate.gain(bl, br)
-                        if self.cfg.get('scene', '游戏') == '游戏':
-                            if music_gate is None:
-                                from voice_gate import GameSoundGate
-                                music_gate = GameSoundGate()
-                            attack = (vision is not None and bike_mode == 'other'
-                                      and 0 <= now - vision.last_attack_input < 0.22)
-                            vg = min(vg, music_gate.gain(bl, br, attack))
-                        else:
-                            music_gate = None
+                        if music_gate is None:
+                            from voice_gate import GameSoundGate
+                            music_gate = GameSoundGate()
+                        recent_action = 0 <= now - hid.buttons.last_action < 0.22
+                        vg = min(vg, music_gate.gain(bl, br, recent_action))
                     else:
                         music_gate = voice_gate = None
                     self.stats['voice_closed'] = vg < 0.15
@@ -920,11 +931,12 @@ class Runner:
                             and self.caps.note(fg, 'trigger') and trig_mode == '自动'):
                         self.log(f'检测到 {fg} 自己在用自适应扳机，之后这款游戏不再叠加扳机震动')
                     last_game_trig = (game_l, game_r)
+                    game_l, game_r = button_map.trigger_effects(game_l, game_r)
                     if trig_mode == '纯用游戏':                       # ours is off: exactly what the game sends
                         hid.set_triggers(game_l or effect_off(), game_r or effect_off())
                         last_trig = (-1, -1); amp = None
                     elif control_triggers is not None:
-                        hid.set_triggers(*control_triggers)
+                        hid.set_triggers(*button_map.trigger_effects(*control_triggers, off=effect_off()))
                         last_trig = (-1, -1); amp = None
                     elif bike_mode != 'other':
                         left = game_l or effect_off()
@@ -934,19 +946,19 @@ class Runner:
                             # belongs to the pitch action now on the physical shoulder.
                             right_gain = self.cfg.get('trigger_gain', 1.0) * self.cfg.get('trigger_right_gain', 1.0)
                             right = boost.effect(vpad.bike_input.boost_pressed, now, right_gain)
-                            if bike_mode == 'air' and off(game_l):
+                            if bike_mode == 'air' and 'L2' not in button_map.bindings and off(game_l):
                                 gain = min(1.0, max(0.0, self.cfg.get('trigger_gain', 1.0) * self.cfg.get('trigger_left_gain', 1.0)))
                                 left = effect_zones(round(force * gain) for force in DIVE_EFFECT) if hid.l2 > 8 else effect_off()
                         hid.set_triggers(left, right)
                         last_trig = (-1, -1); amp = None
                     elif trig_mode == '自动' and (game_trig or self.caps.has(fg, 'trigger')):
                         # the game drives the triggers: pass its effects through untouched
-                        ov_l, ov_r = fx.triggers() if fx is not None else (None, None)
+                        ov_l, ov_r = button_map.trigger_effects(*fx.triggers()) if fx is not None else (None, None)
                         hid.set_triggers(ov_l or game_l or effect_off(), ov_r or game_r or effect_off())
                         last_trig = (-1, -1); amp = None
                     elif trig_mode == '叠加' and game_trig:
                         # a trigger runs one effect at a time: a side the game is using stays the game's, the other is ours
-                        ov_l, ov_r = fx.triggers() if fx is not None else (None, None)
+                        ov_l, ov_r = button_map.trigger_effects(*fx.triggers()) if fx is not None else (None, None)
                         lf = ov_l or (game_l if not off(game_l) else ours(0))
                         rf = ov_r or (game_r if not off(game_r) else ours(1))
                         hid.set_triggers(lf, rf); last_trig = (-1, -1); amp = None
@@ -956,13 +968,13 @@ class Runner:
                         hid.set_triggers(effect_off(), effect_off(), force=True); trig_released = True; last_trig = (-1, -1)
                     amp = None
                 elif control_triggers is not None:
-                    hid.set_triggers(*control_triggers)
+                    hid.set_triggers(*button_map.trigger_effects(*control_triggers, off=effect_off()))
                     trig_released = False
                     last_trig = (-1, -1); amp = None
                 else:
                     trig_released = False
                 if amp is not None and fx is not None:
-                    ov_l, ov_r = fx.triggers()
+                    ov_l, ov_r = button_map.trigger_effects(*fx.triggers())
                     if ov_l or ov_r:                                 # event trigger effect wins for its duration
                         lf = ov_l or ours(0)
                         rf = ov_r or ours(1)

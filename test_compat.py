@@ -632,7 +632,7 @@ def test_equal_peak_wave_changes():
     assert not any(render(10, pulses))
 
 
-def test_silent_source_releases_audio_triggers():
+def test_silent_source_releases_audio_triggers(scene="游戏", suppress=False):
     from contextlib import ExitStack
     from tempfile import TemporaryDirectory
     from unittest.mock import Mock, patch
@@ -640,7 +640,7 @@ def test_silent_source_releases_audio_triggers():
 
     logs = []
     cfg = dict(app.DEFAULTS, mode='普通', capture='系统', speaker_mode='关闭', source_hint='loop',
-               pbz_fx=False, ww_fx=False, ww_vision=False)
+               pbz_fx=False, ww_fx=False, ww_vision=False, scene=scene, suppress_background=suppress)
     runner = app.Runner(cfg, logs.append)
     clock = [100.]
     first = True
@@ -660,6 +660,7 @@ def test_silent_source_releases_audio_triggers():
     hid.l2 = hid.r2 = 0
     hid.last = (None, None)
     hid.poll_input.return_value = (0., 0.)
+    hid.buttons.last_action = -100.
     hid.buttons.drain.return_value = ()
     engine.process.side_effect = lambda l, r, _: (l, r, (float(l.max()), float(r.max())))
     output.dev = {'name': 'test pad'}
@@ -675,7 +676,10 @@ def test_silent_source_releases_audio_triggers():
         runner.run()
         assert not (pathlib.Path(tmp) / 'last-error.txt').exists(), logs
     effects = [args[0][0][0] for args in hid.set_triggers.call_args_list]
-    assert effects[0] == 0x26 and effects[-1] == app.effect_off()[0], effects
+    if suppress:
+        assert effects and all(e == app.effect_off()[0] for e in effects), (scene, effects)
+    else:
+        assert effects[0] == 0x26 and effects[-1] == app.effect_off()[0], effects
 
 
 def test_audio_reset_and_failed_start_cleanup():
@@ -794,7 +798,72 @@ def test_game_music_gate():
     assert max(outputs[365:]) == 0, 'gate failed to close'
 
 
+def test_shared_suppression():
+    from voice_gate import suppression_enabled
+    for scene in ('游戏', '影院', '音乐'):
+        old = dict(scene=scene, scenes={scene: {'voice_gate': False}}, voice_gate=True)
+        assert not suppression_enabled(old)
+        assert suppression_enabled(dict(old, suppress_background=True))
+        test_silent_source_releases_audio_triggers(scene, suppress=True)
+
+
+def test_button_map():
+    from itertools import combinations
+    from button_haptics import BUTTONS
+    from pad_input import ButtonMap, BUTTON_LABELS
+    from takeover import ds4_report, x360_report
+    from xds import asb_input
+    from ww_bike import BikeInput
+
+    neutral = bytearray(64)
+    neutral[0], neutral[8], neutral[10] = 1, 8, 7
+    neutral[1:5] = bytes([128]*4)
+    neutral[12:] = bytes(range(52))
+    def held(key):
+        data = bytearray(neutral)
+        if key in ('up', 'right', 'down', 'left'):
+            data[8] = ('up', 'right', 'down', 'left').index(key)*2
+        elif key in ('L2', 'R2'):
+            data[5 if key == 'L2' else 6] = 255
+            data[9] |= 4 if key == 'L2' else 8
+        else:
+            byte, bit = BUTTONS[key][:2]
+            data[byte] |= bit
+        return data
+    assert ButtonMap({'R1': 'R2'}).apply(neutral) is neutral
+    for a, b in combinations(BUTTON_LABELS, 2):
+        mapper = ButtonMap(ButtonMap().swap(a, b))
+        for physical, target in ((a,b),(b,a)):
+            mapped = mapper.apply(held(physical))
+            expect = held(target)
+            assert mapped == expect, (physical,target)
+            assert asb_input(mapped) == asb_input(expect)
+            assert bytes(ds4_report(mapped, 0)) == bytes(ds4_report(expect, 0))
+            assert bytes(x360_report(mapped)) == bytes(x360_report(expect))
+            assert mapper.apply(neutral) == neutral
+    triggers = ButtonMap({'L2':'R2','R2':'L2'})
+    press = held('L2'); press[5] = 73
+    assert triggers.apply(press)[5:7] == bytes([0,73])
+    assert triggers.trigger_effects('left','right') == ('right','left')
+    shoulder = ButtonMap({'R1':'R2','R2':'R1'})
+    press = held('R2')
+    for val, down in ((80,False),(128,True),(105,True),(95,False)):
+        press[6] = val
+        assert bool(shoulder.apply(press)[9] & 2) == down
+    swap = BikeInput()
+    assert shoulder.uses_right_shoulder and not ButtonMap().uses_right_shoulder
+    assert swap.apply(shoulder.apply(held('R2')), not shoulder.uses_right_shoulder) == held('R1')
+    assert shoulder.trigger_effects('left','right') == ('left',None)
+    direction = ButtonMap({'cross':'up','up':'cross'})
+    diagonal = held('right'); diagonal[8] |= 0x20
+    assert direction.apply(diagonal)[8] == 1
+    opposed = held('down'); opposed[8] |= 0x20
+    assert direction.apply(opposed)[8] == 8
+
+
 if __name__ == '__main__':
+    test_shared_suppression()
+    test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()
     test_audio_reset_and_failed_start_cleanup()

@@ -15,6 +15,15 @@ WINDOW = 512              # 32 ms at 16 kHz, what the model takes
 CONTEXT = 64
 
 
+def suppression_enabled(config):
+    """Use the active scene's old preference until the shared switch is saved."""
+    if 'suppress_background' in config:
+        return bool(config['suppress_background'])
+    scene = config.get('scene', '游戏')
+    previous = (config.get('scenes') or {}).get(scene, {})
+    return bool(previous.get('voice_gate', config.get('voice_gate', scene == '游戏')))
+
+
 class VoiceDetector:
     """48 kHz mono blocks in, speech probability out."""
 

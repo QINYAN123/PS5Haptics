@@ -6,6 +6,7 @@ Triggers use the analog value with hysteresis: their digital bit fires at the sl
 """
 from collections import deque
 import math
+import time
 
 import numpy as np
 
@@ -42,6 +43,7 @@ class ControlTracker:
     Events: (group, side, kind, pressed), group = button / trigger / stick / touch."""
 
     def __init__(self):
+        self.last_action = -float("inf")
         self.prev = None; self.events = deque(maxlen=64)
         self.trig = {'L': False, 'R': False}; self.stick = {'L': False, 'R': False}
 
@@ -59,6 +61,8 @@ class ControlTracker:
             return
         for name, (_b, _m, side, kind) in BUTTONS.items():
             if state[name] != prev[name]:
+                if state[name] and name in ('square', 'cross', 'circle', 'triangle', 'L1', 'R1'):
+                    self.last_action = time.monotonic()
                 self.events.append(('button', side, kind, state[name]))
         if state['dpad'] != prev['dpad']:
             self.events.append(('button', 'L', 'dpad', state['dpad'] is not None))
@@ -73,6 +77,8 @@ class ControlTracker:
             if on != self.trig[side]:
                 self.trig[side] = on
                 if emit:
+                    if on:
+                        self.last_action = time.monotonic()
                     self.events.append(('trigger', side, 'trigger', on))
         for side, (x, y) in (('L', (r[1], r[2])), ('R', (r[3], r[4]))):
             m = math.hypot((x - 128) / 127, (y - 128) / 127)
