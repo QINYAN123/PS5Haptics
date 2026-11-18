@@ -16,6 +16,7 @@ Events (kind 'ww'):
                                    e.g. Jinhsi; ok-ww's forte_full box, white fraction)
 """
 import collections
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from functools import lru_cache
 import threading
@@ -313,6 +314,8 @@ class WWVision:
         # charged liberation from a grey, uncharged one. ocr=False disables (tests / no model).
         self.ocr = ocr; self.cd = {k: None for k in ROIS}; self.cd_seen = {k: False for k in ROIS}; self.final = {k: Debounced(2) for k in ROIS}
         self.shots_dir = shots_dir; self.shot_due = []; self.shots = 0
+        self.shot_writer = None
+        self.pending_shots = collections.deque()
         self.shadow = None
         if skill_shadow and skills and self.trace is not None:
             try:
@@ -423,7 +426,13 @@ class WWVision:
             if k == 'liberation' and now < self.liberation_settle_until:
                 continue
             cx, cy = self._pad_xy(PAD_X, y)
-            self.cd[k] = self.ocr.cooldown(frame[max(0, cy - hy):cy + hy, max(0, cx - hx):cx + hx])
+            # Echo countdowns sit on a single centered row. Crop away the outer glyph
+            # and highlights that can become white blobs in the OCR mask.
+            text_x, text_y = hx, hy
+            if k == 'echo':
+                text_x, text_y = max(1, round(hx * 66 / 80)), max(1, round(hy * 22 / 80))
+            self.cd[k] = self.ocr.cooldown(frame[max(0, cy - text_y):cy + text_y,
+                                                 max(0, cx - text_x):cx + text_x])
             if self.cd[k] is not None:
                 self.cd_last[k] = (now, self.cd[k])
             t_cd, v_cd = self.cd_last.get(k, (-9.0, 0.0))
@@ -718,20 +727,32 @@ class WWVision:
             self.trace.write(f'{int(time.time() * 1000)}\tflip\t{flips} forte={forte_ev}\n')
             self.trace.flush()
 
-    def _snapshot(self, frame, tag):
-        try:
-            import pathlib
-            from PIL import Image
-            d = pathlib.Path(self.shots_dir); d.mkdir(parents=True, exist_ok=True)
-            cds = '_'.join(f'{k[:3]}{self.cd[k] if self.cd[k] is not None else "-"}' for k in ROIS)
-            Image.fromarray(frame[..., 2::-1]).save(d / f'{time.strftime("%H%M%S")}-{self.shots:03d}-{tag}-{cds}.png')
-            self.shots += 1
-        except Exception as exc:                                # used to fail silently: say why in the trace
-            self.shots += 1
-            if self.shot_error is None:
-                self.shot_error = repr(exc)
+    @staticmethod
+    def _save_snapshot(path, rgb):
+        from PIL import Image
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(rgb).save(path)
+
+    def _collect_shots(self):
+        while self.pending_shots and self.pending_shots[0].done():
+            error = self.pending_shots.popleft().exception()
+            if error is not None and self.shot_error is None:
+                self.shot_error = repr(error)
                 if self.trace is not None:
                     self.trace.write(f'{int(time.time() * 1000)}\tshot_error\t{self.shot_error}\n')
+
+    def _snapshot(self, frame, tag):
+        self._collect_shots()
+        if len(self.pending_shots) >= 2 or self.shots >= 300:
+            return
+        if self.shot_writer is None:
+            self.shot_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix='WW-snapshot')
+        cds = '_'.join(f'{k[:3]}{self.cd[k] if self.cd[k] is not None else "-"}' for k in ROIS)
+        name = f'{time.strftime("%H%M%S")}-{self.shots:03d}-{tag}-{cds}.png'
+        # DXcam can reuse its capture buffer before PNG encoding finishes.
+        rgb = frame[..., 2::-1].copy()
+        self.pending_shots.append(self.shot_writer.submit(self._save_snapshot, Path(self.shots_dir) / name, rgb))
+        self.shots += 1
 
     def _loop(self):
         try:
@@ -842,6 +863,10 @@ class WWVision:
             self._close_outputs()
 
     def _close_outputs(self):
+        if self.shot_writer is not None:
+            self.shot_writer.shutdown(wait=True)
+            self._collect_shots()
+            self.shot_writer = None
         if self.recorder is not None:
             try: self.recorder.flush()
             except Exception: pass

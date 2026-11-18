@@ -474,6 +474,68 @@ def test_visual_forte_ignores_idle_and_hidden_hud():
         assert v.poll() == []
 
 
+def test_gamepad_echo_reads_centered_countdown_at_two_resolutions():
+    from PIL import Image, ImageDraw, ImageFont
+    from ww_ocr import CDReader
+    import ww_vision as W
+
+    reader = CDReader()
+    tile = Image.new('RGB', (160, 160), (82, 85, 91))
+    brush = ImageDraw.Draw(tile)
+    brush.rectangle((0, 0, 159, 46), fill='white')
+    brush.rectangle((0, 111, 159, 159), fill='white')
+    brush.text((80, 80), '19.6', anchor='mm', fill='white',
+               font=ImageFont.truetype('C:/Windows/Fonts/arialbd.ttf', 44))
+    for width, height in ((3840, 2160), (1920, 1080)):
+        class Camera:
+            pass
+        cam = Camera()
+        cam.width, cam.height = width, height
+        vision = WWVision(lambda: (0., 0.), camera=cam, ocr=reader)
+        vision._setup()
+        vision.pad = {'echo': W.PAD_SLOTS[1], 'liberation': W.PAD_SLOTS[2]}
+        frame = make_frame(vision, dict.fromkeys(ROIS, False))
+        x, y = vision._pad_xy(W.PAD_X, vision.pad['echo'])
+        r = round(80 * vision.sx)
+        frame[y-r:y+r, x-r:x+r, :3] = np.asarray(tile.resize((2*r, 2*r)))[..., ::-1]
+        assert vision._pad_wants(frame, 4.)['echo'] is False
+        assert vision.cd['echo'] == 19.6
+
+
+def test_diagnostic_snapshots_own_pixels_and_bound_pending_writes():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from threading import Event
+    from unittest.mock import patch
+    from PIL import Image
+
+    with TemporaryDirectory() as directory:
+        v = WWVision(lambda: (0., 0.), shots_dir=directory, ocr=False)
+        frame = np.zeros((12, 12, 4), np.uint8)
+        frame[..., 2] = 210
+        save, release = v._save_snapshot, Event()
+        def slow_save(path, rgb):
+            assert release.wait(5)
+            save(path, rgb)
+
+        try:
+            with patch.object(v, '_save_snapshot', side_effect=slow_save):
+                v._snapshot(frame, 'first')
+                frame[..., 2] = 93
+                v._snapshot(frame, 'second')
+                frame[..., 2] = 0
+                v._snapshot(frame, 'busy')
+                assert v.shots == 2
+        finally:
+            release.set()
+            v.stop()
+        images = sorted(Path(directory).glob('*.png'))
+        assert len(images) == 2 and not v.pending_shots and v.shot_error is None
+        for path, expected in zip(images, (210, 93)):
+            with Image.open(path) as image:
+                assert image.getpixel((0, 0)) == (expected, 0, 0)
+
+
 def test_ocr_cache_requires_identical_network_input():
     from collections import OrderedDict
     from unittest.mock import Mock
@@ -672,7 +734,7 @@ def test_dismount_recovers_without_ocr():
 
 
 if __name__ == '__main__':
-    for f in (test_ocr_cache_requires_identical_network_input, test_gamepad_model_respects_cooldown_badges_and_model_fallback, test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
+    for f in (test_gamepad_echo_reads_centered_countdown_at_two_resolutions, test_diagnostic_snapshots_own_pixels_and_bound_pending_writes, test_ocr_cache_requires_identical_network_input, test_gamepad_model_respects_cooldown_badges_and_model_fallback, test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
         f(); print('ok', f.__name__)
     test_hold_arms_only_liberation_and_rescans_on_release_or_attack()
     print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')
