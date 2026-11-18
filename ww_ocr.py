@@ -6,9 +6,10 @@ fixed icon crop - no text detection needed because the icon positions are known.
 '12.3'-style text (ok-ww's cd_regex \\d{1,2}\\.\\d). Only onnxruntime + numpy + Pillow are needed.
 
 HDR: the white level of the captured UI may sit below SDR's 244; the threshold adapts to the
-brightest pixels of the crop (but never below 200), and the regex rejects anything that is not a
+brightest pixels of a sufficiently contrasted crop, and the regex rejects anything that is not a
 countdown, so bright icon art cannot be read as a cooldown.
 """
+from collections import OrderedDict
 import pathlib
 import re
 import sys
@@ -33,14 +34,17 @@ class CDReader:
         so = ort.SessionOptions(); so.intra_op_num_threads = 1; so.inter_op_num_threads = 1
         self.sess = ort.InferenceSession(str(d / 'rec' / 'rec.onnx'), so, providers=['CPUExecutionProvider'])
         chars = (d / 'ppocrv5_dict.txt').read_text('utf8').splitlines()
+        self.cache = OrderedDict()
         self.chars = ['<blank>'] + chars + [' ']
         self.inp = self.sess.get_inputs()[0].name
 
     @staticmethod
     def white_mask(bgra, floor=200):
-        rgb = bgra[..., :3].astype(np.int16)
-        mn = rgb.min(axis=-1)                                  # white = all three channels high
+        mn = np.minimum(np.minimum(bgra[..., 0], bgra[..., 1]), bgra[..., 2])                                  # white = all three channels high
         top = np.percentile(mn, 99.7)
+        if 120 <= top < floor and top - float(mn.mean()) >= 45:
+            # A dim HUD can put the entire countdown below the SDR white floor.
+            return mn >= top - 8
         thr = max(floor, min(244, top - 10))
         return mn >= thr
 
@@ -58,7 +62,14 @@ class CDReader:
         """img: uint8 HxW grayscale, dark text on a light background -> recognized string."""
         h, w = img.shape
         nw = max(16, min(320, int(round(48 * w / max(1, h)))))
-        im = Image.fromarray(img).convert('RGB').resize((nw, 48), Image.BILINEAR)
+        im = Image.fromarray(img).resize((nw, 48), Image.BILINEAR)
+        # Cache the exact grayscale network input, including empty recognitions.
+        # A single changed digit must go through OCR again.
+        key = im.tobytes()
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        im = im.convert('RGB')
         x = (np.asarray(im, np.float32) / 255.0 - 0.5) / 0.5
         x = x.transpose(2, 0, 1)[None]
         out = self.sess.run(None, {self.inp: x})[0][0]                     # T x classes
@@ -68,7 +79,11 @@ class CDReader:
             if i != prev and i != 0:
                 text.append(self.chars[i] if i < len(self.chars) else '')
             prev = i
-        return ''.join(text)
+        result = ''.join(text)
+        self.cache[key] = result
+        if len(self.cache) > 48:
+            self.cache.popitem(last=False)
+        return result
 
     def cooldown(self, bgra):
         """Seconds of cooldown shown on the icon, or None if there is no countdown."""

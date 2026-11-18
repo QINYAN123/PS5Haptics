@@ -474,6 +474,69 @@ def test_visual_forte_ignores_idle_and_hidden_hud():
         assert v.poll() == []
 
 
+def test_ocr_cache_requires_identical_network_input():
+    from collections import OrderedDict
+    from unittest.mock import Mock
+    from ww_ocr import CDReader
+
+    reader = CDReader.__new__(CDReader)
+    reader.cache = OrderedDict()
+    reader.sess = Mock()
+    reader.inp = 'input'
+    reader.chars = ['<blank>', '2']
+    reader.sess.run.return_value = [np.array([[[0., 1.]]])]
+    img = np.zeros((48, 64), np.uint8)
+    for _ in range(2):
+        assert reader.read_gray(img) == '2'
+    assert reader.sess.run.call_count == 1
+    for i in range(1, 51):
+        img[22, 30] = i
+        reader.read_gray(img)
+    assert reader.sess.run.call_count == 51 and len(reader.cache) == 48
+    img[22, 30] = 0
+    reader.read_gray(img)
+    assert reader.sess.run.call_count == 52
+
+
+def test_gamepad_model_respects_cooldown_badges_and_model_fallback():
+    from unittest.mock import Mock, patch
+    import ww_vision as W
+    from ww_skill_visual import gamepad_models
+    assert set(gamepad_models()) == {'echo', 'liberation'}
+    ocr = Mock()
+    v = WWVision(lambda: (0., 0.), camera=FakeCam(), ocr=ocr)
+    v._setup()
+    frame = make_frame(v, dict.fromkeys(ROIS, False))
+    ocr.read_gray.side_effect = ['R1', 'L2', 'R2', '', 'L2', 'R2', 'R1', 'L2', '', 'R2']
+    v._pad_update(frame, 1.)
+    v._pad_update(frame, 1.1)
+    assert ocr.read_gray.call_count == 6
+    v._pad_update(frame, 1.2)
+    assert v.pad == {'echo': W.PAD_SLOTS[2], 'liberation': W.PAD_SLOTS[3]}
+    v.ready_since['echo'] = 0.5
+    scores = {'echo': 0.1, 'liberation': 0.95}
+    with patch.object(W, 'disc_stats', return_value=(0., 0.6)), patch.object(W, 'ring_fill', return_value=0.1), \
+            patch.object(W, 'gamepad_score', side_effect=lambda *args: scores[args[-1]]) as model:
+        ocr.cooldown.return_value = None
+        wants = v._pad_wants(frame, 1.3)
+        assert not wants['echo'] and wants['liberation']
+        model.reset_mock()
+        ocr.cooldown.return_value = 3.
+        wants = v._pad_wants(frame, 1.4)
+        assert not wants['echo'] and not wants['liberation']
+        model.assert_not_called()
+        v.cd_last.clear()
+        ocr.cooldown.return_value = None
+        v.ready_since['echo'] = 0.5
+        wants = v._pad_wants(frame, 2.5)
+        model.assert_not_called()
+        assert wants['echo'] and not wants['liberation']
+        v.lib_badges_until = 4.
+        scores.update(echo=None, liberation=None)
+        wants = v._pad_wants(frame, 2.6)
+        assert wants['echo'] and not wants['liberation']
+
+
 def test_black_capture_releases_cached_gamepad_state():
     from unittest.mock import Mock
     v = WWVision(lambda: (0., 1.), camera=FakeCam(), ocr=Mock())
@@ -609,7 +672,7 @@ def test_dismount_recovers_without_ocr():
 
 
 if __name__ == '__main__':
-    for f in (test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
+    for f in (test_ocr_cache_requires_identical_network_input, test_gamepad_model_respects_cooldown_badges_and_model_fallback, test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
         f(); print('ok', f.__name__)
     test_hold_arms_only_liberation_and_rescans_on_release_or_attack()
     print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')

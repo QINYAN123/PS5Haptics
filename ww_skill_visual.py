@@ -1,5 +1,6 @@
 """Read-only visual evidence for one Wuthering Waves skill icon."""
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 from pathlib import Path
 import time
@@ -34,6 +35,30 @@ def normalize(pixels):
     return np.clip((value-low)/max(high-low,.16),0,1)
 
 
+@lru_cache(maxsize=1)
+def gamepad_models():
+    try:
+        data = json.loads((Path(__file__).resolve().parent / 'models' / 'ww-skill-visual.json').read_text('utf-8'))
+        models = {}
+        for skill in ('echo', 'liberation'):
+            model = {k: np.asarray(data[skill]['relative'][k], dtype=float)
+                     for k in ('center', 'scale', 'weights')}
+            if ([v.shape for v in model.values()] != [(9,), (9,), (10,)]
+                    or not all(np.isfinite(v).all() for v in model.values()) or np.any(model['scale'] <= 0)):
+                return {}
+            models[skill] = model
+        return models
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def gamepad_score(frame, x, y, radius, skill):
+    model = gamepad_models().get(skill)
+    if model is None:
+        return None
+    return probability(features(crop_icon(frame, x, y, radius)), model)
+
+
 def features(crop, relative=True):
     """Extract from an unsigned 8-bit square icon crop with its ring."""
     if crop is None or crop.dtype != np.uint8 or min(crop.shape[:2]) < 16:
@@ -56,9 +81,10 @@ def features(crop, relative=True):
         strong=(value>.78)&neutral
         edges = (np.abs(np.diff(value,axis=0))[Y_GRAD].mean() +
                  np.abs(np.diff(value,axis=1))[X_GRAD].mean()) / 2
+        mid, high = np.quantile(value[DISC], (.4, .9))
         return np.array([
             strong[DISC].mean(), (value[DISC]<.25).mean(), value[INNER].mean()-value[OUTER].mean(),
-            np.quantile(value[DISC],.9), np.quantile(value[DISC],.9)-np.quantile(value[DISC],.4),
+            high, high-mid,
             edges, (value[RING]>.75).mean(), value[RING].mean()-value[DISC].mean(),
             (value[DISC]>.94).mean()])
     inner=value[DISC]; border=value[RING]

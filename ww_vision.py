@@ -17,10 +17,12 @@ Events (kind 'ww'):
 """
 import collections
 from pathlib import Path
+from functools import lru_cache
 import threading
 import time
 import numpy as np
 
+from ww_skill_visual import gamepad_score
 from ww_bike import BikeHud, HUD_BOXES, HUD_TTL
 
 REF_W, REF_H = 3840, 2160
@@ -75,14 +77,14 @@ def badge_layout(labels):
     return {'echo': r2 - 1, 'liberation': r2}
 
 
-def ring_fill(bgra, cx, cy, r0, r1):
+def ring_fill(bgra, cx, cy, r0, r1, white_scale=1.0):
     """Fraction of the circle around (cx, cy) covered by a bright / coloured ring (liberation energy)."""
     h, w = bgra.shape[:2]
     a = np.linspace(0, 2 * np.pi, 72, endpoint=False)[:, None]; rad = np.arange(r0, r1, 3)[None, :]
     xs = np.clip((cx + rad * np.cos(a)).astype(int), 0, w - 1); ys = np.clip((cy + rad * np.sin(a)).astype(int), 0, h - 1)
     q = bgra[ys, xs, :3].astype(np.int32)                       # 72 angles x radii x 3, one numpy gather
     score = q.max(-1) - q.min(-1) + q.max(-1) // 3
-    return float((score.max(1) > 150).mean())
+    return float((score.max(1) > 150 * white_scale).mean())
 
 
 def lit_fraction(bgra, lo=225, spread=25):
@@ -99,18 +101,26 @@ LIT_ON, LIT_OFF = 0.12, 0.08       # share of near-white pixels in the icon disc
 PAD_DISC = 66                      # icon disc radius at 3840x2160 (inside the energy ring)
 
 
-def disc_stats(bgra, cx, cy, r):
+@lru_cache(maxsize=16)
+def _disc_mask(r):
+    ys, xs = np.ogrid[-r:r, -r:r]
+    return xs * xs + ys * ys < r * r
+
+
+def disc_stats(bgra, cx, cy, r, white_scale=1.0):
     """(white, dark) shares inside the icon disc. Measured on 600 skill-bar snapshots (RenoDX HDR10, UI 203 nits):
     a usable ultimate is a white glyph on a dark disc (white 0.19-0.43); an unusable one is grey (white 0);
     countdown digits are white too (0.05-0.08); screen flashes are white without the dark disc."""
     h, w = bgra.shape[:2]
     if r <= 0 or cx - r < 0 or cy - r < 0 or cx + r > w or cy + r > h:
         return 0.0, 0.0
-    ys, xs = np.ogrid[-r:r, -r:r]
-    m = xs * xs + ys * ys < r * r
-    q = bgra[cy - r:cy + r, cx - r:cx + r, :3].astype(np.int16)[m]
-    mn, mx = q.min(-1), q.max(-1)
-    return float(((mn >= 225) & (mx - mn <= 25)).mean()), float((mx < 100).mean())
+    q = bgra[cy-r:cy+r, cx-r:cx+r]
+    mask = _disc_mask(r)
+    mn = np.minimum(np.minimum(q[..., 0], q[..., 1]), q[..., 2])
+    mx = np.maximum(np.maximum(q[..., 0], q[..., 1]), q[..., 2])
+    count = np.count_nonzero(mask)
+    return (np.count_nonzero(mask & (mn >= round(225 * white_scale)) & (mx - mn <= round(25 * white_scale))) / count,
+            np.count_nonzero(mask & (mx < round(100 * white_scale))) / count)
 
 
 def icon_lit(white, dark, ring, was_on=False, confirmed_badges=False):
@@ -263,8 +273,10 @@ def luminance(bgra):
 
 def body_brightness(bgra):
     """Mean luminance without the brightest 10 % (countdown digits / glints)."""
-    flat = np.sort(luminance(bgra).ravel())
-    return float(flat[: int(len(flat) * 0.9)].mean())
+    flat = luminance(bgra).ravel()
+    keep = int(len(flat) * 0.9)
+    flat.partition(keep)
+    return float(flat[:keep].mean())
 
 
 class WWVision:
@@ -356,11 +368,26 @@ class WWVision:
     def _pad_update(self, frame, now):
         """Read the button badges; remember where the L2 / R2 icons are."""
         hb, wb = int(30 * self.sy), int(42 * self.sx)
-        labels = []
-        for y in PAD_SLOTS:
-            bx, by = self._pad_xy(PAD_BADGE_X, y)
+        labels = [''] * len(PAD_SLOTS)
+
+        def read(slot):
+            bx, by = self._pad_xy(PAD_BADGE_X, PAD_SLOTS[slot])
             crop = frame[max(0, by - hb):by + hb, max(0, bx - wb):bx + wb, :3]
-            labels.append(self.ocr.read_gray(crop.mean(-1).astype(np.uint8)) if crop.size else '')
+            return self.ocr.read_gray(crop.mean(-1).astype(np.uint8)) if crop.size else ''
+
+        checked = set()
+        if self.pad is not None:
+            for skill in ('echo', 'liberation'):
+                slot = PAD_SLOTS.index(self.pad[skill])
+                labels[slot] = read(slot)
+                checked.add(slot)
+        # If the previous pair is still explicitly L2/R2, its position is confirmed.
+        # Otherwise read the remaining slots in this same frame (e.g. after a switch).
+        if self.pad is None or any(labels[PAD_SLOTS.index(self.pad[skill])].upper().replace(' ', '') != badge
+                                   for skill, badge in (('echo', 'L2'), ('liberation', 'R2'))):
+            for slot in range(len(labels)):
+                if slot not in checked:
+                    labels[slot] = read(slot)
         lay = badge_layout(labels)
         if lay:
             self.pad = {k: PAD_SLOTS[i] for k, i in lay.items()}; self.pad_time = now
@@ -369,40 +396,71 @@ class WWVision:
         confirmed = lay is not None and normalized[lay['echo']] == 'L2' and normalized[lay['liberation']] == 'R2'
         self.lib_badges_until = now + 0.65 if confirmed else 0.0
 
+    def _badge_white_scale(self, frame):
+        # The two confirmed button labels provide a white reference independent
+        # of character art. Ignore missing, clipped, or disagreeing references.
+        levels = []
+        dx, dy = max(1, round(32 * self.sx)), max(1, round(20 * self.sy))
+        for slot_y in self.pad.values():
+            x, y = self._pad_xy(PAD_BADGE_X, slot_y)
+            patch = frame[max(0, y-dy):y+dy:2, max(0, x-dx):x+dx:2, :3]
+            if not patch.size:
+                return 1.0
+            neutral = patch.min(axis=-1)
+            levels.append(float(np.percentile(neutral, 98)))
+        if min(levels) < 128 or max(levels) > 240 or max(levels) - min(levels) > 12:
+            return 1.0
+        return sum(levels) / (len(levels) * 255)
+
     def _pad_wants(self, frame, now):
         """A visible countdown blocks readiness. For R2, confirm the current glyph
         promptly so short conditional liberation windows can still arm the trigger."""
         wants = {'resonance': None}
         hx, hy = int(PAD_HALF * self.sx), int(PAD_HALF * self.sy)
+        confirmed = 0.0 < now < self.lib_badges_until
+        white_scale = self._badge_white_scale(frame) if confirmed else 1.0
         for k, y in self.pad.items():
             if k == 'liberation' and now < self.liberation_settle_until:
                 continue
             cx, cy = self._pad_xy(PAD_X, y)
-            if self.frames % 1 == 0:
-                self.cd[k] = self.ocr.cooldown(frame[max(0, cy - hy):cy + hy, max(0, cx - hx):cx + hx])
-                if self.cd[k] is not None:
-                    self.cd_last[k] = (now, self.cd[k])
+            self.cd[k] = self.ocr.cooldown(frame[max(0, cy - hy):cy + hy, max(0, cx - hx):cx + hx])
+            if self.cd[k] is not None:
+                self.cd_last[k] = (now, self.cd[k])
             t_cd, v_cd = self.cd_last.get(k, (-9.0, 0.0))
             burst = now < self.burst_until
             keep = 0.25 if burst else 0.8
             if k == 'liberation':
                 # Let consistent fresh glyph evidence override an old countdown.
                 keep = 0.12
-                ic = frame[max(0, cy - hy // 2):cy + hy // 2, max(0, cx - hx // 2):cx + hx // 2, :3].astype(np.int16)
-                self.lib_color = float((ic.max(-1) - ic.min(-1)).mean()) if ic.size else -1.0
-                self.lib_disc = disc_stats(frame, cx, cy, int(PAD_DISC * self.sx))
+                ic = frame[max(0, cy - hy // 2):cy + hy // 2, max(0, cx - hx // 2):cx + hx // 2, :3]
+                if ic.size:
+                    b, g, r = ic.transpose(2, 0, 1)
+                    self.lib_color = float((np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)).mean())
+                else:
+                    self.lib_color = -1.0
+                self.lib_disc = disc_stats(frame, cx, cy, int(PAD_DISC * self.sx), white_scale)
                 self.lib_lit = self.lib_disc[0]
-                self.ring_val[k] = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx))
+                self.ring_val[k] = ring_fill(frame, cx, cy, int(PAD_RING[0] * self.sx), int(PAD_RING[1] * self.sx), white_scale)
             in_cd = self.cd[k] is not None or (now - t_cd < keep and v_cd > 0.8)
             raw = not in_cd
             if k == 'liberation':
                 raw = raw and icon_lit(*self.lib_disc, self.ring_val[k], self.lit_on.get(k, False),
-                                       confirmed_badges=0.0 < now < self.lib_badges_until)
+                                       confirmed_badges=confirmed)
+                white, dark = self.lib_disc
+                if not raw and not in_cd and confirmed and dark >= 0.15 and white <= 0.55:
+                    score = gamepad_score(frame, cx, cy, round(96 * self.sx), k)
+                    raw = score is not None and score >= (0.65 if self.ring_val[k] >= 0.93 else 0.80)
                 self.lit_on[k] = raw
                 # Debounced already requires two frames. Keep one readiness debounce
                 # for R2 instead of stacking it after another 0.4 s hold.
                 wants[k] = raw
                 continue
+            if raw and confirmed:
+                white, dark = disc_stats(frame, cx, cy, int(PAD_DISC * self.sx), white_scale)
+                if white < 0.02 and dark >= 0.23:
+                    score = gamepad_score(frame, cx, cy, round(96 * self.sx), k)
+                    if score is not None and score < 0.50:
+                        raw = False
             if raw:
                 self.ready_since[k] = self.ready_since.get(k) or now
                 held = now - self.ready_since[k] >= (0.05 if burst else 0.4)
