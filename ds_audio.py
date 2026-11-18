@@ -53,6 +53,20 @@ def pa_open(p, **kw):
         return p.open(**kw)
 
 
+def close_stream(stream):
+    """An unplugged WASAPI stream may already refuse stop_stream()."""
+    if stream is None:
+        return
+    try:
+        stream.stop_stream()
+    except Exception:
+        pass
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
 def _wasapi(p):
     return p.get_host_api_info_by_type(pa.paWASAPI)
 
@@ -87,15 +101,19 @@ class HapticOut:
         # Own the PortAudio instance when none is passed, and always terminate it in close():
         # a leaked instance initialised on a finished thread breaks every later WASAPI open.
         self.own = p is None
-        self.p = p or pa_new()
-        self.dev = find_dualsense_output(self.p, name)
-        if self.dev is None:
-            if self.own: pa_end(self.p)
-            raise RuntimeError('没有找到 DualSense 音频设备（需要 USB 线或 DS5Dongle 接收器，普通蓝牙不行）')
-        self.stream = pa_open(self.p, format=pa.paFloat32, channels=4, rate=RATE, output=True,
-                                  output_device_index=self.dev['index'], frames_per_buffer=960)   # 20 ms periods: rides out short stalls of the main loop (10-20 ms gaps = crackle)
-        self.lock = threading.Lock(); self.xruns = 0
-        self.speaker_safety = SpeakerSafety()
+        self.p = pa_new() if self.own else p
+        try:
+            self.dev = find_dualsense_output(self.p, name)
+            if self.dev is None:
+                raise RuntimeError('没有找到 DualSense 音频设备（需要 USB 线或 DS5Dongle 接收器，普通蓝牙不行）')
+            self.lock = threading.Lock(); self.xruns = 0
+            self.speaker_safety = SpeakerSafety()
+            self.stream = pa_open(self.p, format=pa.paFloat32, channels=4, rate=RATE, output=True,
+                                  output_device_index=self.dev['index'], frames_per_buffer=960)
+        except Exception:
+            if self.own:
+                pa_end(self.p)
+            raise
 
     def feed(self, left, right, speaker=None, headset=False):
         n = len(left)
@@ -113,11 +131,13 @@ class HapticOut:
             self.xruns += 1                     # output ran dry before this block: an audible gap
 
     def close(self):
-        try:
-            self.feed(np.zeros(2400, np.float32), np.zeros(2400, np.float32))
-            self.stream.stop_stream(); self.stream.close()
-        except Exception:
-            pass
+        if self.stream is not None:
+            try:
+                self.feed(np.zeros(2400, np.float32), np.zeros(2400, np.float32))
+            except Exception:
+                pass
+            close_stream(self.stream)
+            self.stream = None
         if self.own:
             try: pa_end(self.p)
             except Exception: pass

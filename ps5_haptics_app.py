@@ -15,7 +15,7 @@ import tkinter as tk
 import numpy as np
 import pyaudiowpatch as pa
 from scipy.signal import butter, sosfilt, sosfilt_zi
-from ds_audio import HapticOut, RATE, pa_new, pa_end, pa_open, rescan
+from ds_audio import HapticOut, RATE, pa_new, pa_end, pa_open, rescan, close_stream
 from ds_hid import DualSenseHID, effect_vibration, effect_off, effect_zones
 import trigger_presets
 from selfcheck import TL_KEYS
@@ -273,6 +273,21 @@ class Runner:
         return pa_open(p, format=pa.paFloat32, channels=src['maxInputChannels'], rate=rate, input=True,
                       input_device_index=src['index'], frames_per_buffer=int(rate * 0.005), stream_callback=self._audio_cb)
 
+    def _refresh_stream(self, stream, p, src):
+        if stream is not None:
+            try:
+                if stream.is_active():
+                    return stream
+            except OSError:
+                pass
+            close_stream(stream)
+        try:
+            stream = self._open_stream(p, src)
+        except OSError:
+            return None
+        self.log('声音设备刚才重置过，已重新连接。')
+        return stream
+
     def _open_loopback(self, hint_override=None):
         """Find the default output's loopback and open it. Right after a device change (pad re-plugged,
         audio device disabled) WASAPI can fail for a few seconds: re-enumerate and retry."""
@@ -280,12 +295,12 @@ class Runner:
         for attempt in range(8):
             if self.stop_ev.is_set():
                 raise RuntimeError('已取消')
-            p = pa_new()
+            p = None
             try:
+                p = pa_new()
                 w = p.get_host_api_info_by_type(pa.paWASAPI)
                 default_name = p.get_device_info_by_index(w['defaultOutputDevice'])['name']
                 if not (hint_override or self.cfg.get('source_hint')) and 'DualSense' in default_name:
-                    pa_end(p)
                     raise PermissionError('默认声音输出设备是 PS5 手柄本身。请在 Windows 声音设置里把默认输出改回音箱/电视，再点开始。')
                 hint = hint_override or self.cfg.get('source_hint') or default_name
                 src = next((d for d in p.get_loopback_device_info_generator() if hint in d['name'] and 'DualSense' not in d['name']), None)
@@ -293,13 +308,17 @@ class Runner:
                     raise LookupError('找不到声音输出设备的环回（loopback）：' + hint)
                 return p, src, self._open_stream(p, src)
             except PermissionError as exc:
-                raise RuntimeError(str(exc))
+                if p is not None:
+                    pa_end(p)
+                raise RuntimeError(str(exc)) from exc
             except Exception as exc:
                 last = exc
-                try: pa_end(p)
-                except Exception: pass
-                self.log(f'声音设备还没准备好，正在重试（{attempt + 1}/8）…')
-                time.sleep(1.5)
+                if p is not None:
+                    try: pa_end(p)
+                    except Exception: pass
+                if attempt < 7:
+                    self.log(f'声音设备还没准备好，正在重试（{attempt + 1}/8）…')
+                    self.stop_ev.wait(1.5)
         raise RuntimeError('打开声音设备失败：' + str(last))
 
     def run(self):
@@ -419,7 +438,6 @@ class Runner:
             pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
             last_trig = (-1, -1); want_exe = self.cfg.get('foreground_exe', '').strip().lower()
             fg_check = 0.0; active = True; last_color = None
-            keep_running = takeover or spk is not None
             clock0 = time.monotonic(); produced = 0       # haptic samples emitted vs wall clock
             alive_check = time.monotonic(); heard = time.monotonic(); last_blk = 0.0; rs = Resampler()
             diag_t = diag_prev = time.monotonic(); diag_loop = 0.0; live_seen = 0; spk_eff = spk_mode
@@ -462,8 +480,7 @@ class Runner:
                         # default output switched (e.g. laptop speakers -> TV): PortAudio only sees the new
                         # default after a full re-initialisation, so close everything audio and reopen
                         default_id = now_id; prev = src['name'].replace(' [Loopback]', '')
-                        try: stream.stop_stream(); stream.close()
-                        except Exception: pass
+                        close_stream(stream); stream = None
                         try: out.close()
                         except Exception: pass
                         pa_end(p); p = None; rescan()
@@ -482,17 +499,16 @@ class Runner:
                         clock0 = time.monotonic(); produced = 0
                         self.log('默认声音输出已切换，触感声源跟随到：' + self.stats['source'])
                         continue
-                    if not stream.is_active():
-                        try: stream.close()
-                        except Exception: pass
-                        try:
-                            stream = self._open_stream(p, src); self.log('声音设备刚才重置过，已重新连接。')
-                        except Exception:
-                            pass
+                    stream = self._refresh_stream(stream, p, src)
                 if hid.read_error is not None:
                     raise RuntimeError('PS5 手柄断开了（' + str(hid.read_error) + '）')
+                # WASAPI loopback may stop delivering packets altogether during silence.
+                # Keep processing until the last audio-driven trigger has actually been released.
+                needs_idle_audio = (takeover or vision is not None or max(last_trig) > 0
+                                    or any(self.cfg.get(k) for k in CONTROL_HAPTICS.values())
+                                    or (fx is not None and (fx.voices or any(fx.triggers()))))
                 try:
-                    blk = self.q.get(timeout=0.01 if keep_running or self.cfg.get('button_haptics') or self.cfg.get('trigger_haptics') or self.cfg.get('stick_haptics') or self.cfg.get('touch_haptics') else 0.2)
+                    blk = self.q.get(timeout=0.01 if needs_idle_audio or spk is not None else 0.2)
                     tnow = time.monotonic()
                     if tnow - diag_t > 30:              # audio health line in the log every 30 s
                         pr = self.proc
@@ -547,7 +563,7 @@ class Runner:
                         l, r = rs.process(l, r, brate / RATE * speed)
                     last_blk = time.monotonic()
                     pend_l = np.concatenate([pend_l, l]); pend_r = np.concatenate([pend_r, r])
-                elif ((takeover or any(self.cfg.get(k) for k in CONTROL_HAPTICS.values())) and len(pend_l) < HOP and time.monotonic() - last_blk > 0.1
+                elif (needs_idle_audio and len(pend_l) < HOP and time.monotonic() - last_blk > 0.1
                       and (time.monotonic() - clock0) * RATE - produced > 4 * HOP):
                     # only when the source has really stopped (0.1 s): padding inside a stream of 10 ms
                     # packets inserted gaps = the speaker crackled and stuttered
@@ -936,21 +952,14 @@ class Runner:
         except Exception as exc:
             error = str(exc); self.log('出错：' + error); (ROOT / 'last-error.txt').write_text(traceback.format_exc(), 'utf8')
         finally:
-            for o in (stream,):
-                try:
-                    if o: o.stop_stream(); o.close()
-                except Exception: pass
+            self.stop_ev.set()  # the capture helpers also need to stop when a device fails
+            close_stream(stream)
             try:
                 if trace is not None: trace.close()
             except Exception: pass
             if vision is not None:
                 vision.stop()
-            try:
-                if watcher is not None: watcher.close()
-                if spk_clip is not None: spk_clip.close()
-                if volume is not None: volume.close()
-            except Exception: pass
-            for o in (hid, vpad):
+            for o in (watcher, spk_clip, volume, hid, vpad):
                 try:
                     if o: o.close()
                 except Exception: pass

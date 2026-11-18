@@ -939,16 +939,26 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
         def work():
             import tempfile, updater
+            dst = None
             try:
-                dst = pathlib.Path(tempfile.gettempdir()) / (info.get('name') or 'PS5Haptics-update.zip')
+                with tempfile.NamedTemporaryFile(prefix='PS5Haptics-', suffix='.zip', delete=False) as tmp:
+                    dst = pathlib.Path(tmp.name)
+                last_progress = None
                 def prog(done, total):
+                    nonlocal last_progress
                     pct = f'{done * 100 // total}%' if total else f'{done >> 20} MB'
+                    if pct == last_progress:
+                        return
+                    last_progress = pct
                     root.after(0, lambda: ubar_lb.configure(text=f'正在下载 v{info["version"]} … {pct}'))
-                updater.download(info['url'], dst, prog)
+                updater.download(info['url'], dst, prog, expected_size=info.get('size'), digest=info.get('digest'))
                 root.after(0, lambda: ubar_lb.configure(text='下载完成，正在准备更新…'))
-                script = updater.prepare(dst)
-                root.after(0, lambda: finish(script))
+                updater.start_update(dst)
+                dst = None  # the detached updater now owns this ZIP
+                root.after(0, finish)
             except Exception as exc:
+                if dst is not None:
+                    dst.unlink(missing_ok=True)
                 err = str(exc)
                 def fail():
                     upd['busy'] = False
@@ -956,10 +966,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 root.after(0, fail)
         threading.Thread(target=work, daemon=True).start()
 
-    def finish(script):
-        import updater
+    def finish():
         msgs.put('更新已就绪：软件将关闭并自动更新，完成后会重新打开。')
-        updater.run_script(script)
         root.after(300, close)
 
     for txt, fn, filled in (('忽略此版本', upd_skip, False), ('GitHub 下载', upd_manual, False), ('在线更新', upd_online, True), ('更新日志', upd_notes, False)):

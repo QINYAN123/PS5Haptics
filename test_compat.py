@@ -632,6 +632,91 @@ def test_equal_peak_wave_changes():
     assert not any(render(10, pulses))
 
 
+def test_silent_source_releases_audio_triggers():
+    from contextlib import ExitStack
+    from tempfile import TemporaryDirectory
+    from unittest.mock import Mock, patch
+    import ps5_haptics_app as app
+
+    logs = []
+    cfg = dict(app.DEFAULTS, mode='普通', capture='系统', speaker_mode='关闭', source_hint='loop',
+               pbz_fx=False, ww_fx=False, ww_vision=False)
+    runner = app.Runner(cfg, logs.append)
+    clock = [100.]
+    first = True
+    def get(timeout):
+        nonlocal first
+        clock[0] += timeout
+        if first:
+            first = False
+            return np.ones(2 * app.HOP, np.float32)
+        if clock[0] >= 101.:
+            runner.stop_ev.set()
+        raise app.queue.Empty
+
+    hid, engine, output = Mock(), Mock(), Mock()
+    hid.firmware_info.return_value = None
+    hid.read_error = None
+    hid.l2 = hid.r2 = 0
+    hid.last = (None, None)
+    hid.poll_input.return_value = (0., 0.)
+    hid.buttons.drain.return_value = ()
+    engine.process.side_effect = lambda l, r, _: (l, r, (float(l.max()), float(r.max())))
+    output.dev = {'name': 'test pad'}
+    src = {'name': 'loop', 'defaultSampleRate': app.RATE, 'maxInputChannels': 2}
+    with TemporaryDirectory() as tmp, ExitStack() as ctx:
+        for name, value in [('rescan', Mock()), ('foreground_window', lambda: 1), ('foreground_exe', lambda *_: ''),
+                            ('HapticOut', Mock(return_value=output)), ('DualSenseHID', Mock(return_value=hid)),
+                            ('pa_end', Mock()), ('HapticEngine', Mock(return_value=engine)), ('ROOT', pathlib.Path(tmp))]:
+            ctx.enter_context(patch.object(app, name, value))
+        ctx.enter_context(patch.object(runner, '_open_loopback', return_value=(Mock(), src, Mock())))
+        ctx.enter_context(patch.object(runner.q, 'get', side_effect=get))
+        ctx.enter_context(patch.object(app.time, 'monotonic', side_effect=lambda: clock[0]))
+        runner.run()
+        assert not (pathlib.Path(tmp) / 'last-error.txt').exists(), logs
+    effects = [args[0][0][0] for args in hid.set_triggers.call_args_list]
+    assert effects[0] == 0x26 and effects[-1] == app.effect_off()[0], effects
+
+
+def test_audio_reset_and_failed_start_cleanup():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from unittest.mock import Mock, patch
+    import ds_audio
+    import ps5_haptics_app as app
+
+    backend = Mock()
+    with patch.object(ds_audio, 'pa_new', return_value=backend), patch.object(ds_audio, 'pa_end') as end, \
+            patch.object(ds_audio, 'find_dualsense_output', return_value={'index': 1}), \
+            patch.object(ds_audio, 'pa_open', side_effect=OSError('endpoint reset')):
+        for supplied in (None, backend):
+            try:
+                ds_audio.HapticOut(supplied)
+            except OSError:
+                pass
+            else:
+                raise AssertionError('simulated device loss must fail the open')
+        end.assert_called_once_with(backend)
+
+    runner = app.Runner(dict(app.DEFAULTS), lambda _: None)
+    stream, reopened, src = Mock(), Mock(), {'name': 'loop', 'defaultSampleRate': 48000, 'maxInputChannels': 2}
+    stream.is_active.side_effect = stream.stop_stream.side_effect = OSError('disconnected')
+    with patch.object(runner, '_open_stream', side_effect=[OSError('still unavailable'), reopened]):
+        assert runner._refresh_stream(stream, backend, src) is None
+        assert runner._refresh_stream(None, backend, src) is reopened
+        assert runner._refresh_stream(reopened, backend, src) is reopened
+    stream.close.assert_called_once()
+
+    with TemporaryDirectory() as tmp, patch.object(app, 'ROOT', Path(tmp)), \
+            patch.object(app, 'foreground_exe', return_value=''), patch.object(app, 'rescan'), \
+            patch.object(runner, '_open_loopback', return_value=(backend, src, reopened)), \
+            patch.object(app, 'HapticOut', side_effect=RuntimeError('output lost')), patch.object(app, 'pa_end') as end:
+        runner.run()
+        assert runner.stop_ev.is_set()
+        reopened.close.assert_called_once()
+        end.assert_called_once_with(backend)
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -691,6 +776,8 @@ def test_live():
 
 
 if __name__ == '__main__':
+    test_silent_source_releases_audio_triggers()
+    test_audio_reset_and_failed_start_cleanup()
     test_equal_peak_wave_changes()
     test_native_motor_mode_switch()
     test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks(); test_stuck_guard()

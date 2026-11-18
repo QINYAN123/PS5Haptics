@@ -7,6 +7,7 @@ prepare()   -> unpacks it and writes a small updater script; run it, then exit t
                (keeps config.json, traces, covers, the hide receipt) and starts the new version.
 If anything fails, the UI points to the GitHub releases page for a manual update.
 """
+import hashlib
 import json
 import os
 import pathlib
@@ -95,25 +96,45 @@ def check(api=None, local=about.VERSION, timeout=8):
     name = _pick(list(zips), tag.lstrip('vV'))
     pick = zips.get(name)
     return {'version': tag.lstrip('vV'), 'notes': (rel.get('body') or '').strip(), 'page': rel.get('html_url') or about.RELEASES_URL,
-            'url': pick and pick.get('browser_download_url'), 'name': pick and pick.get('name'), 'size': pick and pick.get('size', 0)}
+            'url': pick and pick.get('browser_download_url'), 'name': pick and pick.get('name'), 'size': pick and pick.get('size', 0),
+            'digest': pick and pick.get('digest')}
 
 
-def download(url, dest, progress=None, cancel=None, timeout=20):
+def download(url, dest, progress=None, cancel=None, timeout=20, *, expected_size=0, digest=None):
+    """Replace dest only after checking the completed ZIP and available release metadata."""
     dest = pathlib.Path(dest)
-    with _get(url, timeout) as r, open(dest, 'wb') as f:
-        total = int(r.headers.get('Content-Length') or 0); done = 0
-        while True:
-            if cancel is not None and cancel.is_set():
-                raise RuntimeError('已取消')
-            b = r.read(1 << 16)
-            if not b:
-                break
-            f.write(b); done += len(b)
-            if progress:
-                progress(done, total)
-    if not zipfile.is_zipfile(dest):
-        raise RuntimeError('下载的文件不是有效的压缩包')
-    return dest
+    partial = None
+    try:
+        with _get(url, timeout) as response, tempfile.NamedTemporaryFile(
+                dir=dest.parent, prefix=dest.name + '.', suffix='.part', delete=False) as out:
+            partial = pathlib.Path(out.name)
+            length = int(response.headers.get('Content-Length') or 0)
+            total = expected_size or length
+            checksum = hashlib.sha256() if digest else None
+            done = 0
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError('已取消')
+                block = response.read(1 << 16)
+                if not block:
+                    break
+                out.write(block)
+                done += len(block)
+                if checksum is not None:
+                    checksum.update(block)
+                if progress:
+                    progress(done, total)
+        if (expected_size and done != expected_size) or (length and done != length):
+            raise RuntimeError('更新包下载不完整，请重试')
+        if checksum is not None and 'sha256:' + checksum.hexdigest() != digest.lower():
+            raise RuntimeError('更新包与 GitHub 的文件校验值不一致，请重新下载')
+        if not zipfile.is_zipfile(partial):
+            raise RuntimeError('下载的文件不是有效的压缩包')
+        partial.replace(dest)
+        return dest
+    finally:
+        if partial is not None:
+            partial.unlink(missing_ok=True)
 
 
 def app_dir():
@@ -124,18 +145,26 @@ def app_dir():
 def prepare(zip_path, target=None, pid=None):
     """Unpack the update next to the app and write the updater script. Returns the script path."""
     target = pathlib.Path(target or app_dir())
-    stage = pathlib.Path(tempfile.mkdtemp(prefix='PS5Haptics-update-'))
+    stage = pathlib.Path(tempfile.mkdtemp(prefix='PS5Haptics-update-')).resolve()
+    try:
+        return _prepare_stage(stage, pathlib.Path(zip_path).resolve(), target.resolve(), pid or os.getpid())
+    except Exception:
+        shutil.rmtree(stage)
+        raise
+
+
+def _prepare_stage(stage, zip_path, target, pid):
     with zipfile.ZipFile(zip_path) as z:
         for m in z.namelist():                         # no paths escaping the stage folder
             p = (stage / m).resolve()
-            if not str(p).startswith(str(stage.resolve())):
+            if not p.is_relative_to(stage):
                 raise RuntimeError('更新包里有非法路径')
         z.extractall(stage)
     exe = next(iter(sorted(stage.rglob('PS5Haptics.exe'), key=lambda p: len(p.parts))), None)
     if exe is None:
         raise RuntimeError('更新包里没有 PS5Haptics.exe')
     new = exe.parent
-    if not (new / '_internal').exists():
+    if not (new / '_internal').is_dir():
         raise RuntimeError('更新包不完整（缺少 _internal）')
     log = target / 'traces' / 'update-log.txt'
     q = lambda x: "'" + str(x).replace("'", "''") + "'"           # PowerShell single-quoted literal
@@ -147,18 +176,22 @@ $log = {q(log)}
 New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
 function L($m) {{ Add-Content -LiteralPath $log -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $m) -Encoding UTF8 }}
 L '开始更新到新版本'
-try {{ Wait-Process -Id {pid or os.getpid()} -Timeout 60 -ErrorAction Stop }} catch {{ }}
-Start-Sleep -Seconds 1
-$xd = @({xd}); $xf = @({xf})
-$rc = @({q(new)}, {q(target)}, '/E', '/R:5', '/W:1', '/NP', '/NJH', '/NJS', '/XD') + $xd + @('/XF') + $xf
-& robocopy.exe @rc | Out-Null
-$code = $LASTEXITCODE
-if ($code -ge 8) {{
-    L ('复制失败（robocopy ' + $code + '），请到 {about.RELEASES_URL} 手动下载')
-    Start-Process {q(about.RELEASES_URL)}
+$app = Get-Process -Id {pid} -ErrorAction SilentlyContinue
+if ($app) {{ $app | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue }}
+if ($app -and -not $app.HasExited) {{
+    L '原程序仍在运行，已取消复制。请退出程序后重新更新。'
 }} else {{
-    L ('更新完成（robocopy ' + $code + '），重新启动')
-    Start-Process -FilePath {q(target / 'PS5Haptics.exe')} -WorkingDirectory {q(target)}
+    $xd = @({xd}); $xf = @({xf})
+    $rc = @({q(new)}, {q(target)}, '/E', '/R:5', '/W:1', '/NP', '/NJH', '/NJS', '/XD') + $xd + @('/XF') + $xf
+    & robocopy.exe @rc | Out-Null
+    $code = $LASTEXITCODE
+    if ($code -ge 8) {{
+        L ('复制失败（robocopy ' + $code + '），请到 {about.RELEASES_URL} 手动下载')
+        Start-Process {q(about.RELEASES_URL)}
+    }} else {{
+        L ('更新完成（robocopy ' + $code + '），重新启动')
+        Start-Process -FilePath {q(target / 'PS5Haptics.exe')} -WorkingDirectory {q(target)}
+    }}
 }}
 Set-Location $env:TEMP
 Start-Sleep -Seconds 1
@@ -173,3 +206,13 @@ def run_script(script):
     """Start the updater detached and hidden (it outlives this process)."""
     subprocess.Popen(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', str(script)],
                      creationflags=0x00000200 | 0x08000000, close_fds=True, cwd=tempfile.gettempdir())   # NEW_PROCESS_GROUP, NO_WINDOW (a hidden console: PowerShell needs one); cwd outside the stage so it can be deleted
+
+
+def start_update(zip_path):
+    """Transfer ownership of the prepared files only when the helper starts."""
+    script = prepare(zip_path)
+    try:
+        run_script(script)
+    except OSError:
+        shutil.rmtree(script.parent)
+        raise
