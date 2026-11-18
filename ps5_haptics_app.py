@@ -678,7 +678,8 @@ class Runner:
                             vision = WWVision(trigger_input, dpad=lambda: hid.dpad,
                                               buttons=lambda: hid.held, trace_path=tp, mem=proc_mem_mb,
                                               crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills,
-                                              skill_shadow=shadow)
+                                              skill_shadow=shadow,
+                                              trigger_presses=(lambda: vpad.trigger_press_times) if native else None)
                             bike_window = hwnd
                             if native:
                                 vpad.bike_context = bike_context

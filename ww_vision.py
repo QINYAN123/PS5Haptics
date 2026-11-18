@@ -268,16 +268,19 @@ def body_brightness(bgra):
 
 
 class WWVision:
-    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True, skill_shadow=False):
+    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True, skill_shadow=False, trigger_presses=None):
         """inputs(): returns the L2/R2 values seen by the game (0..1). mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
         self.bike = BikeHud() if bike else None
         self.skills = skills
         self.after_bike = False
         self.last_frame = None
+        self.blank_frame = False
         self.cam = camera; self.icons = {k: IconState() for k in ROIS}; self.forte = ForteState()
         self.events = collections.deque(maxlen=64)
         self.last_press = {'L': -9.0, 'R': -9.0}; self.prev_in = {'L': 0.0, 'R': 0.0}
+        self.trigger_presses = trigger_presses
+        self.seen_presses = list(trigger_presses()) if trigger_presses else [None, None]
         self.pre_press = {}; self.last_cast = {k: -9.0 for k in ROIS}
         self.stop_ev = threading.Event(); self.thread = None; self.frames = 0; self.error = None
         self.scan_wake = threading.Event()
@@ -416,6 +419,16 @@ class WWVision:
     def step(self, frame, now):
         """Process one captured region (BGRA). Public for tests."""
         l2, r2 = self.inputs()
+        presses = {}
+        if self.trigger_presses is not None:
+            stamps = self.trigger_presses()
+            for i, side in enumerate(('L', 'R')):
+                stamp = stamps[i]
+                if stamp is None or stamp == self.seen_presses[i] or stamp > now:
+                    continue
+                self.seen_presses[i] = stamp
+                if now - stamp <= CAST_WINDOW:
+                    presses[side] = stamp
         self.last_frame = now
         if self.bike is not None:
             previous_mode, _ = self.bike.state
@@ -453,8 +466,33 @@ class WWVision:
         if not self.skills:
             self.frames += 1
             return
+        # A fully black capture also erases the gamepad badges. Treat it as
+        # unavailable before consulting a cached layout or updating icon history.
+        if not frame[::8, ::8, :3].any():
+            if not self.blank_frame:
+                self.events.clear()
+                for skill in ROIS:
+                    self._reset_skill(skill)
+                self.forte = ForteState()
+                self.pre_press.clear()
+                self.last_press.update(L=-9.0, R=-9.0)
+                self.pad = None
+                self.lib_badges_until = 0.0
+                self.provisional_until = self.liberation_provisional_until = -9.0
+            self.blank_frame = True
+            self.prev_in.update(L=l2, R=r2)
+            self.scanned_switch = self.switch_request
+            self.scanned_liberation = self.liberation_rescan
+            self.frames += 1
+            return
+        if self.blank_frame:
+            self.refresh_badges_after = now
+            self.blank_frame = False
         if self.after_bike:
-            if self.ocr and self.frames % 3 == 0:
+            if not self.ocr:
+                # With no badge reader, resume the usual brightness-only path.
+                self.after_bike = False
+            elif self.frames % 3 == 0:
                 self._pad_update(frame, now)
                 self.after_bike = self.pad is None
             if self.after_bike:
@@ -485,7 +523,7 @@ class WWVision:
             self.prev_in.update(L=l2, R=r2)
             self.frames += 1
             return
-        self._read_skills(frame, now, l2, r2)
+        self._read_skills(frame, now, l2, r2, presses)
 
     def _on_switch(self, hat, now, pressed_at):
         self.switches += 1
@@ -512,11 +550,13 @@ class WWVision:
         self.ready_since.pop(skill, None)
         self.lit_on.pop(skill, None)
 
-    def _read_skills(self, frame, now, l2, r2):
+    def _read_skills(self, frame, now, l2, r2, presses):
         self._holds(now)
         for side, val in (('L', l2), ('R', r2)):
-            if val > 0.5 and self.prev_in[side] <= 0.5:          # press edge: remember the icon before it
-                self.last_press[side] = now
+            if self.trigger_presses is None and self.prev_in[side] <= 0.5 < val:
+                presses[side] = now
+            if side in presses:
+                self.last_press[side] = presses[side]
                 k = 'liberation' if side == 'R' else 'echo'
                 self.pre_press[k] = self.icons[k].value
             self.prev_in[side] = val
@@ -541,6 +581,10 @@ class WWVision:
                 self.cd[k] = self.ocr.cooldown(crop)
                 if self.cd[k] is not None: self.cd_seen[k] = True
         hud_hidden = max(bright.values()) < 15                 # menus / cutscenes: skill bar not drawn
+        if hud_hidden and not pad_on:
+            # A disappearing skill bar darkens every icon, even during a real press.
+            self.pre_press.clear()
+            self.last_press.update(L=-9.0, R=-9.0)
         flips = {}
         for k in ROIS:
             if k == 'liberation' and settling_liberation:
@@ -585,8 +629,8 @@ class WWVision:
                 self.events.append(('ww', 'forte', forte_ev))
         # validation snapshots: the full-resolution skill row at a press and 0.5 s later
         if self.shots_dir and self.shots < 300:
-            for side in 'LR':
-                if self.last_press[side] == now:
+            for side in presses:
+                if self.last_press[side] == presses[side]:
                     self.shot_due += [(now, side, 'press'), (now + 0.5, side, 'after')]
             for k, ready in flips.items():                     # also each ready / not-ready change: the HUD at that moment
                 if k in ('liberation', 'echo') and len(self.shot_due) < 6:
@@ -638,6 +682,8 @@ class WWVision:
                 self.scan_wake.clear()
                 t0 = time.monotonic()
                 fr = self.cam.grab(region=self.region, new_frame_only=self.bike is not None)
+                if self.stop_ev.is_set():
+                    break
                 if fr is not None:
                     self.step(fr, t0)
                 pending = self._switch_pending() or self.liberation_rescan is not self.scanned_liberation
@@ -646,6 +692,8 @@ class WWVision:
                     self.scan_wake.wait(max(0.0, period - (time.monotonic() - t0)))
         except Exception as exc:
             self.error = exc
+        finally:
+            self._close_outputs()
 
     def _holds(self, now):
         """Any face button or R1 / L1 held past HOLD_S: scan fast now and again right after it is let go."""
@@ -732,6 +780,10 @@ class WWVision:
         self.scan_wake.set()
         if self.thread:
             self.thread.join(1.0)
+        else:
+            self._close_outputs()
+
+    def _close_outputs(self):
         if self.recorder is not None:
             try: self.recorder.flush()
             except Exception: pass
@@ -742,9 +794,11 @@ class WWVision:
 
     def poll(self):
         out = []
-        while self.events:
-            out.append(self.events.popleft())
-        return out
+        while True:
+            try:
+                out.append(self.events.popleft())
+            except IndexError:
+                return out
 
     def bike_state(self):
         if self.bike is None:
@@ -754,8 +808,10 @@ class WWVision:
     def states(self, now=None):
         """Trigger output. A provisional switch never changes the vision events."""
         now = time.monotonic() if now is None else now
-        if self.after_bike or (self.bike is not None and (
-                self.last_frame is None or now - self.last_frame >= HUD_TTL)):
+        if (self.blank_frame or self.after_bike or self.stop_ev.is_set()
+                or (self.thread is not None and not self.thread.is_alive())
+                or ((self.thread is not None or self.bike is not None)
+                    and (self.last_frame is None or now - self.last_frame >= HUD_TTL))):
             return dict.fromkeys(self.final)
         # Read the acknowledgement first so a press arriving during this read is
         # still treated as pending, even while the capture thread resets its debouncers.

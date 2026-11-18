@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import numpy as np
 
 from usbip_vhci import VHCI_DESCRIPTION, VHCI_ERROR, Vhci
@@ -123,6 +124,7 @@ class VirtualDualSense:
         self.gate = {'L': None, 'R': None}; self._gate_down = {'L': False, 'R': False}
         self._gate_pull = {}
         self.trigger_input = (0.0, 0.0)
+        self.trigger_press_times = (None, None)
         self.bike_input = BikeInput()
         self.bike_context = None
         self.ready = threading.Event(); self.error = None
@@ -244,8 +246,7 @@ class VirtualDualSense:
     def forward(self, report):
         # the pad reports ~1000x/s, mostly because gyro / timestamps move. Forward at once when sticks,
         # triggers or buttons change (bytes 1..10), otherwise at most every 4 ms (game sees 250 Hz motion)
-        import time as _t
-        now = _t.perf_counter()
+        now = time.perf_counter()
         context = self.bike_context
         bike = context() if context is not None else 'other'
         report = self.bike_input.apply(report, bike in ('boost', 'air'))
@@ -257,14 +258,21 @@ class VirtualDualSense:
         key = bytes(report[1:11])
         if key == getattr(self, '_last_key', None) and now - getattr(self, '_last_fw', 0.0) < 0.004:
             return
-        self._last_key = key; self._last_fw = now
         state = asb_input(report)
         try:
             with self.send_lock:
                 self.sock.sendall(b'I' + struct.pack('<H', len(state)) + state)
         except Exception:
             return
-        self.trigger_input = (report[5] / 255, report[6] / 255)
+        self._last_key = key; self._last_fw = now
+        levels = (report[5] / 255, report[6] / 255)
+        left = self.trigger_input[0] <= 0.5 < levels[0]
+        right = self.trigger_input[1] <= 0.5 < levels[1]
+        if left or right:
+            stamp = time.monotonic()
+            prev_l, prev_r = self.trigger_press_times
+            self.trigger_press_times = (stamp if left else prev_l, stamp if right else prev_r)
+        self.trigger_input = levels
         self.frames['in'] += 1
 
     def triggers(self):

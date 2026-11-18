@@ -219,7 +219,7 @@ def test_lit_icon():
             def cooldown(self, crop): return None
             def read_gray(self, crop): return ''
         v.ocr = OCR(); v._pad_update = lambda f, n: None; v.pad = {'echo': 1740, 'liberation': 1950}
-        fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+        fr = np.full((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), 20, np.uint8)
         W.ring_fill = lambda *a: 0.3                                       # energy ring never full
         level = {'v': 0.0}; W.disc_stats = lambda *a: (level['v'], 0.4)
         t = 0.0
@@ -253,7 +253,7 @@ def test_short_conditional_liberation():
     v.pad = {'echo': 1740, 'liberation': 1950}
     v.lib_badges_until = 2.0
     v._pad_update = lambda *_: None
-    fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+    fr = np.full((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), 20, np.uint8)
     with patch.object(W, 'ring_fill', return_value=0.04), patch.object(W, 'disc_stats', return_value=(0.31, 0.42)):
         for t in (1.0, 1.1):
             v.pad_time = t
@@ -289,7 +289,7 @@ def test_switch_burst():
         v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), dpad=(lambda: hat['v']) if use_dpad else None); v._setup()
         v.ocr = OCR(); v._pad_update = lambda f, n: None
         v.pad = {'echo': 1740, 'liberation': 1950}
-        fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+        fr = np.full((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), 20, np.uint8)
         state = {'cd': {'echo': 6.0, 'liberation': 9.0}, 'ring': 0.2}
         W.ring_fill = lambda *a: state['ring']
         W.disc_stats = lambda *a: ((0.3 if state['ring'] > 0.9 else 0.0), 0.4)   # charged icon drawn lit
@@ -318,7 +318,7 @@ def test_switch_burst():
         """Slot up: echo on cooldown 3 s, ultimate full. Switch right, then back after 4 s: both ready at once."""
         v = WWVision(lambda: (0.0, 0.0), camera=FakeCam(), dpad=lambda: hat['v']); v._setup()
         v.ocr = OCR(); v._pad_update = lambda f, n: None; v.pad = {'echo': 1740, 'liberation': 1950}
-        fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+        fr = np.full((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), 20, np.uint8)
         screen = {'echo': 3.0, 'liberation': None}; ring = {'v': 1.0}
         W.ring_fill = lambda *a: ring['v']
         W.disc_stats = lambda *a: ((0.3 if ring['v'] > 0.9 else 0.0), 0.4)
@@ -367,7 +367,7 @@ def test_short_switch_tap_wakes_capture():
     v.notify_hat(8)
     assert v.scan_wake.is_set()
     assert v._switch_pending()
-    fr = np.zeros((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), np.uint8)
+    fr = np.full((v.region[3] - v.region[1], v.region[2] - v.region[0], 4), 20, np.uint8)
     v.step(fr, 1.0)
     assert v.slot == 2 and v.switches == 1
     assert not v._switch_pending()
@@ -458,7 +458,7 @@ def test_visual_forte_ignores_idle_and_hidden_hud():
     v = WWVision(lambda: (0, 0), camera=FakeCam(), ocr=False, buttons=lambda: 0)
     v._setup()
     shown = make_frame(v, {'resonance': True, 'echo': False, 'liberation': False})
-    hidden = np.zeros_like(shown)
+    hidden = np.full_like(shown, 6)  # dim menu with no skill bar
     with patch.object(v.forte, 'update', return_value='release'):
         v.step(shown, 20.0)
         assert v.poll() == []
@@ -474,8 +474,142 @@ def test_visual_forte_ignores_idle_and_hidden_hud():
         assert v.poll() == []
 
 
+def test_black_capture_releases_cached_gamepad_state():
+    from unittest.mock import Mock
+    v = WWVision(lambda: (0., 1.), camera=FakeCam(), ocr=Mock())
+    v._setup()
+    v.final['echo'].state = v.final['liberation'].state = True
+    v.pad = {'echo': 1740, 'liberation': 1950}
+    v.pad_time = 10.
+    v.provisional_until = 12.
+    v.events.append(('ww', 'echo', 'ready'))
+    frame = make_frame(v, dict.fromkeys(ROIS, True))
+    hidden = np.zeros_like(frame)
+    hidden[..., 3] = 255
+    v.step(hidden, 10.1)
+    assert set(v.states(10.1).values()) == {None}
+    assert not v.poll()
+    assert v.icons['echo'].n == 0 and v.pad is None
+    v.ocr.read_gray.side_effect = ['R1', 'L2', 'R2', '']
+    v.ocr.cooldown.return_value = None
+    v.step(frame, 10.2)
+    assert v.pad == {'echo': 1530, 'liberation': 1740}
+    assert not v.poll()
+
+
+def test_capture_stop_during_grab():
+    import threading
+    import time
+    from unittest.mock import Mock
+
+    entered, resume = threading.Event(), threading.Event()
+    class SlowCam(FakeCam):
+        def grab(self, **kwargs):
+            entered.set()
+            resume.wait(4)
+            return object()
+
+    v = WWVision(lambda: (0., 0.), camera=SlowCam(), ocr=False)
+    log = v.trace = Mock()
+    v.step = Mock()
+    v.start()
+    try:
+        assert entered.wait(2)
+        v.final['echo'].state = True
+        v.last_frame = time.monotonic() - 1.
+        assert v.states()['echo'] is None
+        v.stop()
+        assert v.thread.is_alive() and not log.close.called
+        assert v.states()['echo'] is None
+    finally:
+        resume.set()
+        v.thread.join(2)
+    log.close.assert_called_once()
+    v.step.assert_not_called()
+
+
+def test_native_short_tap_between_frames():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    from xds import VirtualDualSense
+
+    pad = VirtualDualSense()
+    send = Mock()
+    pad.sock = SimpleNamespace(sendall=send)
+    pad.gate['R'] = 170
+    v = WWVision(lambda: pad.trigger_input, camera=FakeCam(), ocr=False,
+                 trigger_presses=lambda: pad.trigger_press_times)
+    v._setup()
+    shown = make_frame(v, dict.fromkeys(ROIS, True))
+    dim = make_frame(v, {'resonance': True, 'echo': True, 'liberation': False})
+    for i in range(40):
+        v.step(dim if i < 20 else shown, 10 + i * 0.05)
+    v.poll()
+    report = bytearray(64)
+    report[0], report[8] = 1, 8
+    with patch('xds.time.monotonic', return_value=12.02), patch('xds.time.perf_counter', return_value=12.02):
+        report[6] = 150
+        pad.forward(report)
+        assert pad.trigger_press_times == (None, None)
+        report[6] = 200
+        send.side_effect = OSError()
+        pad.forward(report)
+        assert pad.trigger_press_times == (None, None)
+        send.side_effect = None
+        pad.forward(report)
+        report[6] = 0
+        pad.forward(report)
+    assert pad.trigger_input == (0., 0.)
+    v.step(shown, 12.01)  # a grab already in flight precedes the press
+    assert v.last_press['R'] < 0
+    for t in (12.1, 12.2, 12.3, 12.4):
+        v.step(dim, t)
+    assert v.last_press['R'] == 12.02
+    assert v.poll().count(('ww', 'liberation', 'cast')) == 1
+    # Opening a new vision session must not replay the previous session's tap.
+    fresh = WWVision(lambda: pad.trigger_input, camera=FakeCam(), ocr=False,
+                     trigger_presses=lambda: pad.trigger_press_times)
+    fresh._setup()
+    fresh.step(shown, 12.5)
+    assert fresh.last_press['R'] < 0
+
+
+def test_hiding_hud_during_press_cannot_cast():
+    press = [0., 0.]
+    v = WWVision(lambda: press, camera=FakeCam(), ocr=False)
+    v._setup()
+    shown = make_frame(v, dict.fromkeys(ROIS, True))
+    dim = make_frame(v, dict.fromkeys(ROIS, False))
+    for i in range(40):
+        v.step(dim if i < 20 else shown, 10 + i * 0.05)
+    v.poll()
+    press[:] = [1., 1.]
+    v.step(shown, 12.)
+    v.step(np.zeros_like(shown), 12.05)
+    assert not v.poll()
+    # Returning to a visible cooldown must not consume the pre-menu press either.
+    for i in range(4):
+        v.step(dim, 12.1 + 0.05 * i)
+    assert not any(event[2] == 'cast' for event in v.poll())
+
+
+def test_dismount_recovers_without_ocr():
+    from unittest.mock import patch
+    v = WWVision(lambda: (0., 0.), camera=FakeCam(), ocr=False, bike=True)
+    v._setup()
+    shown = make_frame(v, dict.fromkeys(ROIS, True))
+    with patch.object(v.bike, 'update'):
+        v.bike.state = ('bike', 10.3)
+        v.step(shown, 10.)
+        assert v.after_bike
+        v.bike.state = ('other', 10.4)
+        v.step(shown, 10.1)
+        assert not v.after_bike
+        assert v.icons['echo'].n == 1
+
+
 if __name__ == '__main__':
-    for f in (test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
+    for f in (test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
         f(); print('ok', f.__name__)
     test_hold_arms_only_liberation_and_rescans_on_release_or_attack()
     print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')
