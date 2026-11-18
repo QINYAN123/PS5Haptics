@@ -20,8 +20,8 @@ STATE_TRIGGERS = {
 }
 
 RULES = [
-    {"name": "大招释放", "kind": "ww", "fn_has": ["liberation"], "detail_has": ["cast"], "cooldown": 800,
-     "group": "ww_skill", "priority": 90,
+    {"name": "大招释放", "kind": "ww", "fn_has": ["liberation"], "detail_has": ["cast"], "cooldown": 0,
+     "group": "ww_liberation", "priority": 90,
      "grip": [{"freq": 200, "amp": 0.9, "dur": 30, "attack": 1, "decay": 12, "pan": [1, 1]},
               {"freq": 70, "freq_to": 40, "amp": 1.0, "dur": 520, "attack": 8, "decay": 260, "pan": [1, 1]}],
      "native_gain": 0.6, "native_ms": 600,
@@ -35,8 +35,8 @@ RULES = [
     {"name": "大招就绪", "kind": "ww", "fn_has": ["liberation"], "detail_has": ["ready"], "cooldown": 1500,
      "grip": [{"freq": 230, "amp": 0.45, "dur": 18, "attack": 1, "decay": 7, "pan": R_HAND},
               {"freq": 230, "amp": 0.45, "dur": 18, "attack": 1, "decay": 7, "delay": 70, "pan": R_HAND}]},
-    {"name": "声骸释放", "kind": "ww", "fn_has": ["echo"], "detail_has": ["cast"], "cooldown": 500,
-     "group": "ww_skill", "priority": 70,
+    {"name": "声骸释放", "kind": "ww", "fn_has": ["echo"], "detail_has": ["cast"], "cooldown": 0,
+     "group": "ww_echo", "priority": 70,
      "grip": [{"freq": 160, "amp": 0.7, "dur": 25, "attack": 1, "decay": 10, "pan": L_HAND},
               {"freq": 60, "amp": 0.7, "dur": 180, "attack": 4, "decay": 80, "pan": L_HAND}],
      "trigger": {"side": "L", "effect": "vibration", "amp": 7, "freq": 45, "ms": 160}},

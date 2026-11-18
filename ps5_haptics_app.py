@@ -37,7 +37,7 @@ DEFAULTS = {'grip_profile': '均衡', 'trigger_profile': '均衡冲击', 'grip_g
             'mode': '原生透传', 'fusion': '叠加', 'trigger_mode': '自动', 'rumble_gain': 1.0, 'speaker_mode': '特殊事件', 'speaker_eq': '原味', 'speaker_volume': 0.8, 'haptic_style': '游戏', 'pbz_fx': True, 'ww_fx': True, 'ww_enabled': True,
             'cinema_rumble': 1.0, 'cinema_kick': 1.0, 'cinema_trigger': 1.0, 'music_kick': 1.0, 'music_tick': 1.0, 'music_trigger': 1.0, 'record_native': True, 'event_fx': True,
             **trigger_presets.scene_defaults(), 'user_games': [],
-            'ww_vision': True, 'ww_skill_shadow': False, 'ww_click_gate': True, 'ww_bike_swap': True, 'ww_bike_audio': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
+            'ww_vision': True, 'ww_skill_icons': False, 'ww_skill_shadow': False, 'ww_click_gate': True, 'ww_bike_swap': True, 'ww_bike_audio': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
 
 
 WW_EXE = 'client-win64-shipping.exe'
@@ -323,6 +323,7 @@ class Runner:
 
     def run(self):
         p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None; volume = None
+        music_gate = None
         voice_gate = None; pad_tap = None; g_env = 0.05; g_gain = 1.0; g_out_pk = 0.0; spk_clip = None; gsp_z = sosfilt_zi(GSP_LOWCUT) * 0.0
         try:                                         # a game with its own settings already running: start with them (routing is fixed per run)
             import proc_loopback as plb
@@ -359,8 +360,15 @@ class Runner:
                 vpad.open()
                 self.pad_filter = InputFilter(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
                 def forward_input(report):
-                    observe_ww_input(report)
+                    current = vision
+                    if current is not None:
+                        current.notify_input(report)
+                    before = vpad.trigger_press_times if native and current is not None else None
                     vpad.forward(self.pad_filter.apply(report))
+                    if before is not None and before is not vpad.trigger_press_times:
+                        for side, old, stamp in zip(('L', 'R'), before, vpad.trigger_press_times):
+                            if stamp != old:
+                                current.notify_trigger(side, stamp)
 
                 hid.start_reader(forward_input)
                 self.stats['takeover'] = True
@@ -672,7 +680,8 @@ class Runner:
                         self.stats['profile'] = prof['name'] if prof else ''
                     skills = bool(self.cfg.get('ww_vision', True) and fx is not None)
                     observe_ww = skills or (native and self.cfg.get('scene', '游戏') == '游戏')
-                    new_vision_key = (hwnd, skills) if prof and prof.get('vision') and observe_ww else None
+                    skill_icons = self.cfg.get('ww_skill_icons', False)
+                    new_vision_key = (hwnd, skills, skill_icons) if prof and prof.get('vision') and observe_ww else None
                     if new_vision_key != vision_key:
                         vision_key = new_vision_key
                         if native:
@@ -684,7 +693,7 @@ class Runner:
                             previous.stop()
                         if new_vision_key is not None:
                             tp = None
-                            shadow = self.cfg.get('ww_skill_shadow', False)
+                            shadow = skill_icons and self.cfg.get('ww_skill_shadow', False)
                             if self.cfg.get('record_native', True) or shadow:
                                 (ROOT / 'traces').mkdir(exist_ok=True)
                                 tp = ROOT / 'traces' / time.strftime('ww-%Y%m%d-%H%M%S.tsv')
@@ -694,7 +703,7 @@ class Runner:
                             vision = WWVision(trigger_input, dpad=lambda: hid.dpad,
                                               buttons=lambda: hid.held, trace_path=tp, mem=proc_mem_mb,
                                               crops_dir=cd, shots_dir=sd, fps=10, bike=True, skills=skills,
-                                              skill_shadow=shadow,
+                                              skill_shadow=shadow, skill_icons=skill_icons,
                                               trigger_presses=(lambda: vpad.trigger_press_times) if native else None)
                             bike_window = hwnd
                             if native:
@@ -728,6 +737,7 @@ class Runner:
                         else:
                             boost.reset()
 
+                control_triggers = None
                 if vision is not None and fx is not None:
                     for ev in vision.poll():
                         if bike_mode == 'other' and not vision.after_bike:
@@ -738,7 +748,10 @@ class Runner:
                         on = bool(st.get(skill))
                         fx.set_state_trigger(side, eff if on else None)
                         if native and vpad is not None:            # game sees the press only past the click
-                            vpad.gate[side] = self.cfg.get('ww_gate_' + side, gate) if on and self.cfg.get('ww_click_gate', True) else None
+                            vpad.gate[side] = self.cfg.get('ww_gate_' + side, gate) if on and self.cfg.get('ww_click_gate', True) and self.cfg.get('trigger_mode') != '纯用游戏' else None
+                    if vision.skills and not vision.skill_icons and bike_mode in ('other', 'unknown'):
+                        control_triggers = tuple(STATE_TRIGGERS[side][1] if st.get(STATE_TRIGGERS[side][0])
+                                                 else effect_off() for side in ('L', 'R'))
                     self.stats['ww'] = (st, vision.frames, str(vision.error) if vision.error else '')
                 if fx is not None:
                     for name in fx.poll():
@@ -756,21 +769,32 @@ class Runner:
                     if ep_gain != 1.0 and source_endpoint:           # haptics only: the speaker keeps following the system volume
                         bl = np.clip(bl * ep_gain, -1, 1); br = np.clip(br * ep_gain, -1, 1)
                     wl, wr, trig = eng.process(bl, br, press)
-                    tl_snd_l, tl_snd_r = wl, wr
-                    if self.cfg.get('voice_gate') and voice_gate is not False:   # pure dialogue must not shake the grips
+                    vg = 1.0
+                    if self.cfg.get('voice_gate'):
                         if voice_gate is None:
                             try:
                                 from voice_gate import VoiceGate
                                 voice_gate = VoiceGate()
                             except Exception as exc:
-                                voice_gate = False; self.log('人声识别不可用（不影响其他功能）：' + str(exc))
+                                voice_gate = False
+                                self.log('人声识别不可用：' + str(exc))
                         if voice_gate:
                             vg = voice_gate.gain(bl, br)
-                            self.stats['voice_closed'] = voice_gate.closed
-                            if vg < 0.999:
-                                wl = wl * vg; wr = wr * vg; trig = (trig[0] * vg, trig[1] * vg)
+                        if self.cfg.get('scene', '游戏') == '游戏':
+                            if music_gate is None:
+                                from voice_gate import GameSoundGate
+                                music_gate = GameSoundGate()
+                            attack = (vision is not None and bike_mode == 'other'
+                                      and 0 <= now - vision.last_attack_input < 0.22)
+                            vg = min(vg, music_gate.gain(bl, br, attack))
+                        else:
+                            music_gate = None
                     else:
-                        self.stats['voice_closed'] = False
+                        music_gate = voice_gate = None
+                    self.stats['voice_closed'] = vg < 0.15
+                    if vg < 0.999:
+                        wl = wl * vg; wr = wr * vg; trig = (trig[0] * vg, trig[1] * vg)
+                    tl_snd_l, tl_snd_r = wl, wr
                     if native:
                         (rleft, rright), _, color = vpad.feedback()
                         if guard_game is not None:
@@ -899,6 +923,9 @@ class Runner:
                     if trig_mode == '纯用游戏':                       # ours is off: exactly what the game sends
                         hid.set_triggers(game_l or effect_off(), game_r or effect_off())
                         last_trig = (-1, -1); amp = None
+                    elif control_triggers is not None:
+                        hid.set_triggers(*control_triggers)
+                        last_trig = (-1, -1); amp = None
                     elif bike_mode != 'other':
                         left = game_l or effect_off()
                         right = game_r or effect_off()
@@ -928,6 +955,10 @@ class Runner:
                     if not trig_released:
                         hid.set_triggers(effect_off(), effect_off(), force=True); trig_released = True; last_trig = (-1, -1)
                     amp = None
+                elif control_triggers is not None:
+                    hid.set_triggers(*control_triggers)
+                    trig_released = False
+                    last_trig = (-1, -1); amp = None
                 else:
                     trig_released = False
                 if amp is not None and fx is not None:

@@ -733,8 +733,64 @@ def test_dismount_recovers_without_ocr():
         assert v.icons['echo'].n == 1
 
 
+def test_control_hud_and_fast_inputs():
+    import io
+    from unittest.mock import Mock, patch
+    from ww_vision import PAD_BADGE_X, PAD_SLOTS
+    reader = Mock()
+    v = WWVision(lambda: (0, 0), camera=FakeCam(), ocr=reader, skill_icons=False)
+    v._setup()
+    v.trace = io.StringIO()
+    fr = make_frame(v, dict.fromkeys(ROIS, False))
+    # Encode badge labels at the OCR crop centres; cooldowns stay grey.
+    for i, top in enumerate(PAD_SLOTS):
+        x, y = v._pad_xy(PAD_BADGE_X, top)
+        fr[y, x, :3] = i + 1
+    reader.read_gray.side_effect = lambda crop: {2: 'L2', 3: 'R2'}.get(int(crop[crop.shape[0]//2, crop.shape[1]//2]), '')
+    v.step(fr, 1.0)
+    assert all(v.states(1.0)[s] for s in ('liberation', 'echo'))
+    v.notify_trigger('R', 1.01)
+    v.notify_trigger('L', 1.03)
+    with patch('ww_vision.time.monotonic', return_value=1.05):
+        v.notify_hat(2)
+    v.notify_trigger('R', 1.07)
+    v.step(fr, 1.10)
+    assert [line.split('\t')[2] for line in v.trace.getvalue().splitlines()] == ['R','L','hat=2','R']
+    assert v.poll() == [] and all(v.states(1.10)[s] for s in ('liberation', 'echo'))
+    reader.cooldown.assert_not_called()
+    menu = np.full_like(fr, 45)
+    v.step(menu, 1.20)
+    v.step(menu, 1.50)
+    assert not any(v.states(1.50).values())
+    v.step(fr, 1.71)
+    assert v.states(1.71)['echo']
+    v.step(np.zeros_like(fr), 1.72)
+    assert not any(v.states(1.72).values())
+
+
+def test_rapid_casts_and_switch_settle():
+    taps = [None, None]
+    v = WWVision(lambda: (0, 0), camera=FakeCam(), ocr=False, trigger_presses=lambda: taps)
+    v._setup()
+    frame = make_frame(v, dict.fromkeys(ROIS, True))
+    v.last_press.update(R=1.0, L=1.02)
+    v._cast('liberation', 1.01)
+    v._cast('echo', 1.03)
+    v._cast('echo', 1.04)
+    v.switch_request = (2, 1.05)
+    taps[:] = [1.02, 1.06]
+    v.step(frame, 1.07)
+    v.step(frame, 1.21)
+    assert v.last_press == {'L': -9., 'R': 1.06}
+    v._cast('liberation', 1.22)
+    v._cast('liberation', 1.23)
+    fx = EventFX(dict(DEFAULT_CONFIG))
+    assert [fx.feed(*ev) for ev in v.poll()] == ['大招释放', '声骸释放', '大招释放']
+    assert all(fx.triggers())
+
+
 if __name__ == '__main__':
-    for f in (test_gamepad_echo_reads_centered_countdown_at_two_resolutions, test_diagnostic_snapshots_own_pixels_and_bound_pending_writes, test_ocr_cache_requires_identical_network_input, test_gamepad_model_respects_cooldown_badges_and_model_fallback, test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
+    for f in (test_control_hud_and_fast_inputs, test_rapid_casts_and_switch_settle, test_gamepad_echo_reads_centered_countdown_at_two_resolutions, test_diagnostic_snapshots_own_pixels_and_bound_pending_writes, test_ocr_cache_requires_identical_network_input, test_gamepad_model_respects_cooldown_badges_and_model_fallback, test_black_capture_releases_cached_gamepad_state, test_capture_stop_during_grab, test_native_short_tap_between_frames, test_hiding_hud_during_press_cannot_cast, test_dismount_recovers_without_ocr, test_sdr, test_hdr_like, test_rules_and_state_triggers, test_forte_release_and_speaker, test_click_gate, test_ocr_states, test_lit_icon, test_short_conditional_liberation, test_switch_burst, test_short_switch_tap_wakes_capture, test_switch_arms_both_until_new_icons_confirm):
         f(); print('ok', f.__name__)
     test_hold_arms_only_liberation_and_rescans_on_release_or_attack()
     print('ok test_hold_arms_only_liberation_and_rescans_on_release_or_attack')

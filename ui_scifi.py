@@ -541,13 +541,13 @@ class SkillHex(tk.Canvas):
             self.hx[k] = (glow, hexa, t, st)
         self.note = self.create_text(px(165), px(118), text='切到鸣潮后自动识别技能栏', fill=FAINT, font=(ZH, 8))
 
-    def update_vals(self, states, note):
+    def update_vals(self, states, note, context=False):
         pulse = 0.5 + 0.5 * math.sin(time.time() * 6)
         for k, (glow, hexa, t, st) in self.hx.items():
             v = states.get(k) if states else None
             if v:
                 self.itemconfigure(hexa, fill=mix(PANEL2, CYAN, 0.28), outline=CYAN); self.itemconfigure(t, fill=TEXT)
-                self.itemconfigure(glow, outline=mix(PANEL, CYAN, 0.3 + 0.5 * pulse)); self.itemconfigure(st, text='就绪', fill=CYAN)
+                self.itemconfigure(glow, outline=mix(PANEL, CYAN, 0.3 + 0.5 * pulse)); self.itemconfigure(st, text='有阻力' if context else '就绪', fill=CYAN)
             else:
                 self.itemconfigure(hexa, fill=PANEL2, outline=LINE2 if v is False else FAINT); self.itemconfigure(t, fill=DIM)
                 self.itemconfigure(glow, outline=PANEL); self.itemconfigure(st, text='冷却' if v is False else '—', fill=FAINT)
@@ -705,6 +705,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         'rumble_gain': tk.DoubleVar(value=cfg['rumble_gain'] * 100), 'speaker_mode': tk.StringVar(value={'仅大招/特殊技': '仅关键事件', '智能增强': '全部游戏声音'}.get(cfg['speaker_mode'], cfg['speaker_mode'])),
         'speaker_volume': tk.DoubleVar(value=cfg['speaker_volume'] * 100), 'record_native': tk.BooleanVar(value=cfg.get('record_native', True)),
         'event_fx': tk.BooleanVar(value=cfg.get('event_fx', True)), 'ww_vision': tk.BooleanVar(value=cfg.get('ww_vision', True)),
+        'ww_skill_icons': tk.BooleanVar(value=cfg.get('ww_skill_icons', False)),
         'ww_skill_shadow': tk.BooleanVar(value=cfg.get('ww_skill_shadow', False)),
         'ww_bike_swap': tk.BooleanVar(value=cfg.get('ww_bike_swap', True)),
         'ww_bike_audio': tk.BooleanVar(value=cfg.get('ww_bike_audio', True)),
@@ -799,7 +800,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     # settings that the running engine picks up live (within 0.5 s) vs the ones that need a restart
     RESTART_KEYS = {'mode': '连接方式', 'capture': '声音来源', 'pbz_fx': '影之刃零事件特调', 'ww_fx': '鸣潮事件特调',
-                    'ww_vision': '鸣潮技能识别', 'ww_skill_shadow': '鸣潮识别对照记录', 'record_native': '录制调校数据', 'foreground_exe': '指定前台游戏',
+                    'ww_vision': '鸣潮扳机', 'ww_skill_icons': '按技能图标就绪', 'ww_skill_shadow': '鸣潮识别对照记录', 'record_native': '录制调校数据', 'foreground_exe': '指定前台游戏',
                     'pbz_log_dir': '事件日志目录'}
     live = {'job': None}
 
@@ -1206,12 +1207,13 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     p = module('鸣潮', 'WUTHERING WAVES', GREEN, '鸣潮（Client-Win64-Shipping.exe）在前台时自动生效。读屏幕识别技能状态，不注入、不修改游戏。')
     Toggle(p.body, '鸣潮专属调校', V['game_profiles'], '在前台时自动切换：原生震动降到 60%、握把风格改为细节丰富', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
-    Toggle(p.body, '技能识别（读屏 + OCR）', V['ww_vision'], '识别手柄界面 L2 / R2 技能按钮的冷却数字：大招就绪时 R2 变成「咔哒」武器扳机，声骸就绪时 L2 有阻力', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
-    Toggle(p.body, '鸣潮识别对照记录', V['ww_skill_shadow'], '在日志记录新模型和现有技能判定的分歧。启用技能识别后可用，重启触感引擎生效。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
+    Toggle(p.body, '鸣潮自适应扳机', V['ww_vision'], '默认在画面显示角色的 L2 / R2 操作提示时，两侧持续有阻力。菜单或过场隐藏提示后解除。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
+    Toggle(p.body, '按技能图标就绪（AI，可选）', V['ww_skill_icons'], '开启后分别读取声骸和大招的图标及冷却，决定各侧阻力。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
+    Toggle(p.body, '鸣潮识别对照记录', V['ww_skill_shadow'], '在日志记录新模型和现有技能判定的分歧。配合「按技能图标就绪」使用，重启触感引擎生效。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '科考摩托 R1／R2 互换', V['ww_bike_swap'], '原生透传识别到科考摩托的 R1 加速提示时，实体 R2 加速，实体 R1 执行原 R2 动作。离开摩托界面恢复。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '摩托氮气随声音增加阻力', V['ww_bike_audio'], '使用鸣潮进程声音的 45–140 Hz 低频调节 R2 阻力。没有进程声音时使用基础阻力。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
     Toggle(p.body, '扳机按到咔哒点才释放', V['ww_click_gate'], '技能就绪时，扳机要按过咔哒点游戏才收到按键，不会误放技能（仅原生透传）', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
-    Toggle(p.body, '鸣潮事件特调', V['ww_fx'], '大招、声骸释放和共鸣回路特殊技时：握把专属震动（扬声器不做事件适配，按全部游戏声播放）', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
+    Toggle(p.body, '鸣潮事件特调', V['ww_fx'], '配合「按技能图标就绪」使用。识别到释放大招、声骸或共鸣回路特殊技时，追加专属握把震动。', color=GREEN, wrap=820).pack(fill='x', pady=px(4))
 
     p = module('影之刃零', 'PHANTOM BLADE ZERO', MAG, '需要另装事件记录 mod（PS5EventLog，发布包「影之刃零事件mod」文件夹）。mod 只记录事件，不改变游戏行为。')
     Toggle(p.body, '影之刃零事件特调', V['pbz_fx'], '格挡 / 精准格挡 / 完美格挡 / 完美闪避 / 受击 / 破防 / 处决分别给不同的握把、扳机和扬声器反馈', color=MAG, wrap=820).pack(fill='x', pady=px(4))
@@ -1504,7 +1506,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         tk.Label(pnl.body, text='扳机风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['trigger_profile'], TRIGGER_PROFILES, cell=116, color=MAG, rec='均衡冲击').pack(anchor='w', pady=(px(4), px(10)))
         Toggle(pnl.body, '忽略中置声道', sv['skip_center'], '5.1/7.1 时对白（中置）不触发震动', wrap=300).pack(fill='x', pady=px(4))
-        Toggle(pnl.body, '纯人声时不震', sv['voice_gate'], '只有台词、旁白时压掉声音触感；同时有打击、爆炸就不压。不影响游戏原生震动', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
+        Toggle(pnl.body, '抑制人声和背景音乐' if sc == '游戏' else '纯人声时不震', sv['voice_gate'],
+               '压低台词和持续配乐产生的震动，遇到突出的技能或打击音时短暂放行。' if sc == '游戏' else '压低由台词、旁白产生的声音触感。', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
         trigger_panel(f, sv)
         pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
@@ -2109,7 +2112,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             lvl_lb.configure(text=f"OUT {s.get('level', 0.0):4.2f}   NATIVE {max(rum):4.2f}" if run else 'STANDBY')
             m = r.start_cfg.get('mode', '') if run else SC('mode')
             info['工作方式'].set(m + ('（运行中）' if run else '（未启动）'), GREEN if run else DIM)
-            info['声源'].set(('⚠ 截不到游戏声音（关闭空间音效/独占模式）  ' if s.get('silent') else '') + (s.get('source') or '—') + ('  ·  人声中，声音触感已压低' if s.get('voice_closed') else ''),
+            info['声源'].set(('⚠ 截不到游戏声音（关闭空间音效/独占模式）  ' if s.get('silent') else '') + (s.get('source') or '—') + ('  ·  声音触感已抑制' if s.get('voice_closed') else ''),
                            MAG if s.get('silent') else TEXT)
             vp = s.get('vpad')
             info['虚拟手柄'].set(f'输入转发 {vp[0]}  ·  反馈包 {vp[1]}' if vp else '—', CYAN if vp else DIM)
@@ -2130,7 +2133,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                 p_ww.pack_forget()
             if s.get('profile') and ww:
                 note = f'截图 {ww[1]} 帧' + (f'  错误 {ww[2]}' if ww[2] else '')
-                hexes.update_vals(ww[0], note)
+                hexes.update_vals(ww[0], note, context=not cfg.get('ww_skill_icons', False))
             else:
                 hexes.update_vals(None, '切到鸣潮后自动识别技能栏' if run else '未启动')
             fxl = s.get('fx_last')

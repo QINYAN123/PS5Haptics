@@ -775,7 +775,27 @@ def test_live():
     raise AssertionError('virtual pad still there 10 s after close')
 
 
+def test_game_music_gate():
+    from voice_gate import GameSoundGate
+    gate = GameSoundGate()
+    rng = np.random.default_rng(403)
+    drum = rng.normal(0, .045, 480) * np.exp(-np.arange(480) / 120)
+    skill = rng.normal(0, .13, 480)
+    outputs = []
+    for hop in range(430):
+        t = (np.arange(480) + hop * 480) / 48000
+        chord = sum(.06 * np.sin(2*np.pi*f*t) for f in (110, 330, 550))
+        music = chord + (drum if hop % 40 == 0 else 0)
+        impact = skill if hop in (284, 309, 339) else 0.
+        # The skill is panned out of phase; a mono detector would lose it.
+        outputs.append(gate.gain(music + impact, music - impact, attack=280 <= hop < 350))
+    assert max(outputs[80:280]) == 0, 'repeating music leaked'
+    assert outputs[284] == outputs[309] == outputs[339] == 1., 'missed an impact over music'
+    assert max(outputs[365:]) == 0, 'gate failed to close'
+
+
 if __name__ == '__main__':
+    test_game_music_gate()
     test_silent_source_releases_audio_triggers()
     test_audio_reset_and_failed_start_cleanup()
     test_equal_peak_wave_changes()

@@ -92,3 +92,43 @@ class VoiceGate:
         want = self.FLOOR if self.closed else 1.0
         self.g += (self.OPEN if want > self.g else self.CLOSE) * (want - self.g)
         return self.g
+
+
+class GameSoundGate:
+    """Pass short, broadband effects against the recent game mix (48 kHz, 10 ms hops)."""
+
+    def __init__(self):
+        self.window = np.hanning(480) / 240
+        self.background = np.zeros(120)
+        self.previous = np.zeros(120)
+        self.age = 0
+        self.hold = 0
+        self.level = 0.0
+
+    def gain(self, left, right, attack=False):
+        # Keep stereo energy: wide effects can cancel if mixed to mono first.
+        spectrum = np.abs(np.fft.rfft(np.asarray((left, right)) * self.window, axis=1))
+        bins = spectrum[:, 1:121].max(axis=0)
+        # A slow peak envelope remembers repeated percussion. A separate onset
+        # check prevents a sustained effect from repeatedly opening the gate.
+        reference = self.background * (1.35 if attack else 1.9)
+        novel = bins > np.maximum(np.maximum(reference, self.previous * 1.35), 0.0008)
+        hits = np.count_nonzero(novel)
+        if (self.age >= 6 and hits >= (9 if attack else 14)
+                and np.count_nonzero(novel[:22]) >= 2
+                and np.count_nonzero(novel[22:]) >= 4):
+            self.hold = 12
+        # Do not learn a button-correlated hit as music: an identical second
+        # cast should get through even if it follows the first one immediately.
+        if not (attack and self.hold):
+            self.background = np.maximum(self.background * 0.996, bins)
+        self.previous = bins
+        self.age += 1
+        if self.hold:
+            self.hold -= 1
+            self.level = 1.0
+        else:
+            self.level *= 0.72
+            if self.level < 0.01:
+                self.level = 0.0
+        return self.level

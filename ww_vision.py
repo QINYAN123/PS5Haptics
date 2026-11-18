@@ -42,6 +42,7 @@ PAD_BADGE_X = 3672                     # badge centre x
 PAD_HALF = 80                          # icon box half size
 PAD_RING = (74, 96)                    # liberation energy ring radius range
 PAD_REGION = (PAD_X - 100, PAD_SLOTS[0] - 100, PAD_BADGE_X + 50, PAD_SLOTS[-1] + 100)
+CONTROL_HUD_GRACE = 0.45       # tolerate two missed badge scans during a character swap
 CAST_WINDOW = 0.6
 # character switch (D-pad up / right / left on the gamepad HUD): the other character's skills show up at once,
 # so scan fast for a moment and forget the previous character's countdowns instead of waiting them out
@@ -281,10 +282,17 @@ def body_brightness(bgra):
 
 
 class WWVision:
-    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True, skill_shadow=False, trigger_presses=None):
+    def __init__(self, inputs, fps=20, camera=None, trace_path=None, mem=None, crops_dir=None, shots_dir=None, ocr=None, dpad=None, buttons=None, bike=False, skills=True, skill_shadow=False, trigger_presses=None, skill_icons=True):
         """inputs(): returns the L2/R2 values seen by the game (0..1). mem(): MB, for diagnostics."""
         self.inputs = inputs; self.period = 1.0 / fps; self.mem = mem
         self.bike = BikeHud() if bike else None
+        self.skill_icons = skill_icons
+        self.context_seen = -9.0
+        self.context_scan = -9.0
+        self.input_log = collections.deque(maxlen=64)
+        self.physical_presses = [None, None]
+        self.switch_time = -9.0
+        self.settle_presses = {}
         self.skills = skills
         self.after_bike = False
         self.last_frame = None
@@ -317,7 +325,7 @@ class WWVision:
         self.shot_writer = None
         self.pending_shots = collections.deque()
         self.shadow = None
-        if skill_shadow and skills and self.trace is not None:
+        if skill_shadow and skills and skill_icons and self.trace is not None:
             try:
                 from ww_skill_visual import SkillShadow
                 self.shadow = SkillShadow(
@@ -398,6 +406,10 @@ class WWVision:
         normalized = [value.upper().replace(' ', '') for value in labels]
         confirmed = lay is not None and normalized[lay['echo']] == 'L2' and normalized[lay['liberation']] == 'R2'
         self.lib_badges_until = now + 0.65 if confirmed else 0.0
+        # A clipped L on the Echo badge is common. Require an explicit R2 anchor.
+        if lay and normalized[lay['liberation']] == 'R2' and normalized[lay['echo']] in ('L2', '2'):
+            self.context_seen = now
+        self.context_scan = now
 
     def _badge_white_scale(self, frame):
         # The two confirmed button labels provide a white reference independent
@@ -479,16 +491,17 @@ class WWVision:
         return wants
 
     def _cast(self, k, now):
-        if now - self.last_cast[k] > 1.0:
-            self.last_cast[k] = now
+        press = self.last_press[SIDE_OF[k]]
+        if press > self.last_cast[k] and 0 <= now - press <= CAST_WINDOW:
+            self.last_cast[k] = press
             self.events.append(('ww', k, 'cast'))
 
     def step(self, frame, now):
         """Process one captured region (BGRA). Public for tests."""
         l2, r2 = self.inputs()
         presses = {}
-        if self.trigger_presses is not None:
-            stamps = self.trigger_presses()
+        if self.trigger_presses is not None or any(self.physical_presses):
+            stamps = self.trigger_presses() if self.trigger_presses is not None else self.physical_presses
             for i, side in enumerate(('L', 'R')):
                 stamp = stamps[i]
                 if stamp is None or stamp == self.seen_presses[i] or stamp > now:
@@ -505,6 +518,9 @@ class WWVision:
                 self.trace.write(f'{int(time.time() * 1000)}\tbike\t{mode}\n')
                 self.trace.flush()
             if mode != 'other':
+                self.context_seen = self.context_scan = -9.0
+                self.settle_presses.clear()
+                self.input_log.clear()
                 self.scanned_switch = self.switch_request
                 self.scanned_liberation = self.liberation_rescan
                 self.liberation_provisional_until = -9.0
@@ -536,6 +552,9 @@ class WWVision:
         # A fully black capture also erases the gamepad badges. Treat it as
         # unavailable before consulting a cached layout or updating icon history.
         if not frame[::8, ::8, :3].any():
+            self.context_seen = self.context_scan = -9.0
+            self.settle_presses.clear()
+            self.input_log.clear()
             if not self.blank_frame:
                 self.events.clear()
                 for skill in ROIS:
@@ -568,6 +587,24 @@ class WWVision:
                 self.prev_in.update(L=l2, R=r2)
                 self.frames += 1
                 return
+        if not self.skill_icons:
+            if self.ocr and now - self.context_scan >= 0.18:
+                self._pad_update(frame, now)
+            # Input arrives at HID rate. Keep each edge in order, even when
+            # two R2 presses straddle a switch between captured frames.
+            if self.trace is not None:
+                wrote = False
+                while self.input_log and self.input_log[0][0] <= now:
+                    stamp, control = self.input_log.popleft()
+                    if now - self.context_seen <= CONTROL_HUD_GRACE and now - stamp <= CAST_WINDOW:
+                        self.trace.write(f'{int((time.time() - (now - stamp)) * 1000)}\tinput\t{control}\t{stamp:.6f}\n')
+                        wrote = True
+                if wrote:
+                    self.trace.flush()
+            self.scanned_switch = self.switch_request
+            self.scanned_liberation = self.liberation_rescan
+            self.frames += 1
+            return
         hat = self.dpad() if self.dpad is not None else None
         request = self.switch_request
         if request is not None and request is not self.scanned_switch:
@@ -585,14 +622,25 @@ class WWVision:
             self.liberation_provisional_until = rescan + BURST_S
             self.burst_until = max(self.burst_until, now + BURST_S)
             self.scanned_liberation = rescan
+        if self.trigger_presses is None:
+            for side, value in (('L', l2), ('R', r2)):
+                if side not in presses and self.prev_in[side] <= 0.5 < value:
+                    presses[side] = now
+        presses = {side: stamp for side, stamp in presses.items() if stamp >= self.switch_time}
         if now < self.settle_until:
+            self.settle_presses.update(presses)
             # Never cache cooldowns from the outgoing character during the animation.
             self.prev_in.update(L=l2, R=r2)
             self.frames += 1
             return
+        if self.settle_presses:
+            presses = {**{s: t for s, t in self.settle_presses.items() if now - t <= CAST_WINDOW}, **presses}
+            self.settle_presses.clear()
         self._read_skills(frame, now, l2, r2, presses)
 
     def _on_switch(self, hat, now, pressed_at):
+        self.switch_time = pressed_at
+        self.settle_presses.clear()
         self.switches += 1
         self.burst_until = now + BURST_S; self.settle_until = now + SETTLE_S
         self.refresh_badges_after = self.settle_until
@@ -620,8 +668,6 @@ class WWVision:
     def _read_skills(self, frame, now, l2, r2, presses):
         self._holds(now)
         for side, val in (('L', l2), ('R', r2)):
-            if self.trigger_presses is None and self.prev_in[side] <= 0.5 < val:
-                presses[side] = now
             if side in presses:
                 self.last_press[side] = presses[side]
                 k = 'liberation' if side == 'R' else 'echo'
@@ -630,7 +676,7 @@ class WWVision:
         if self.recorder is not None:
             self.recorder.add(frame, self.boxes, self.forte_box, l2, r2)
         refresh = self.refresh_badges_after is not None and now >= self.refresh_badges_after
-        if self.ocr and (refresh or self.frames % 5 == 0):
+        if self.ocr and self.skill_icons and (refresh or self.frames % 5 == 0):
             self._pad_update(frame, now)
             if refresh:
                 self.refresh_badges_after = None
@@ -694,6 +740,12 @@ class WWVision:
                     0.0 <= now - self.last_attack_input <= CAST_WINDOW
                     and (now < self.lib_badges_until if pad_on else not hud_hidden))):
                 self.events.append(('ww', 'forte', forte_ev))
+        # Two distinct fast presses can land in one capture. Require both
+        # forwarded edges and a confirmed gamepad HUD before accepting both falls.
+        if (all(flips.get(k) is False for k in SWITCH_SKILLS) and now < self.lib_badges_until
+                and all(0 <= now - self.last_press[SIDE_OF[k]] <= CAST_WINDOW for k in SWITCH_SKILLS)):
+            for skill in SWITCH_SKILLS:
+                self._cast(skill, now)
         # validation snapshots: the full-resolution skill row at a press and 0.5 s later
         if self.shots_dir and self.shots < 300:
             for side in presses:
@@ -803,9 +855,16 @@ class WWVision:
     def notify_hat(self, hat):
         """Receive a D-pad report on the input-reader thread, without capturing here."""
         if self.skills and hat in SWITCH_HATS and self.input_hat != hat:
-            self.switch_request = (hat, time.monotonic())
+            stamp = time.monotonic()
+            self.switch_request = (hat, stamp)
+            if self.skills and self.trace is not None and not self.skill_icons:
+                self.input_log.append((stamp, f'hat={hat}'))
             self.scan_wake.set()
         self.input_hat = hat
+
+    def notify_trigger(self, side, stamp):
+        if self.skills and self.trace is not None and not self.skill_icons:
+            self.input_log.append((stamp, side))
 
     def notify_input(self, report):
         """Observe physical input before any report filtering or gamepad remapping."""
@@ -819,6 +878,12 @@ class WWVision:
         if report[6] >= TRIGGER_ATTACK_LEVEL:
             buttons |= LIBERATION_ATTACK
         pressed = buttons & ~self.attack_buttons
+        if self.trigger_presses is None and pressed & (ECHO_ATTACK | LIBERATION_ATTACK):
+            stamp = time.monotonic()
+            for index, (bit, side) in enumerate(((ECHO_ATTACK, 'L'), (LIBERATION_ATTACK, 'R'))):
+                if pressed & bit:
+                    self.physical_presses[index] = stamp
+                    self.notify_trigger(side, stamp)
         normal_released = self.attack_buttons & NORMAL_ATTACK and not buttons & NORMAL_ATTACK
         self.attack_buttons = buttons
         if self.after_bike or self.switch_request is not previous_switch:
@@ -896,6 +961,11 @@ class WWVision:
                 or ((self.thread is not None or self.bike is not None)
                     and (self.last_frame is None or now - self.last_frame >= HUD_TTL))):
             return dict.fromkeys(self.final)
+        if not self.skill_icons:
+            states = dict.fromkeys(self.final)
+            if self.skills and 0 <= now - self.context_seen <= CONTROL_HUD_GRACE:
+                states.update(echo=True, liberation=True)
+            return states
         # Read the acknowledgement first so a press arriving during this read is
         # still treated as pending, even while the capture thread resets its debouncers.
         scanned = self.scanned_switch
