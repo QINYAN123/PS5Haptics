@@ -693,7 +693,6 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     from pad_input import BUTTON_LABELS, ButtonMap
     from voice_gate import suppression_enabled
     V = {
-        'suppress_background': tk.BooleanVar(value=suppression_enabled(cfg)),
         'grip_profile': tk.StringVar(value=cfg['grip_profile']), 'trigger_profile': tk.StringVar(value=cfg['trigger_profile']),
         'haptic_style': tk.StringVar(value={'标准': '游戏', '电影': '影院', '音乐': '律动'}.get(cfg.get('haptic_style', '游戏'), cfg.get('haptic_style', '游戏'))),
         'pbz_fx': tk.BooleanVar(value=cfg.get('pbz_fx', cfg.get('event_fx', True))),
@@ -733,8 +732,9 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                    rumble_gain=1.0, speaker_mode='全部游戏声', speaker_eq='低音饱满', speaker_volume=0.6, capture='自动', skip_center=False, button_haptics=False, trigger_haptics=False, stick_haptics=False, touch_haptics=False, button_gain=1.0, speaker_output='扬声器', grip_left_gain=1.0, grip_right_gain=1.0, trigger_left_gain=1.0, trigger_right_gain=1.0),
     }
     import trigger_presets as TP
-    for _d in SCENE_DEF.values():
-        _d.update(TP.scene_defaults())
+    for sc, defaults in SCENE_DEF.items():
+        defaults.update(TP.scene_defaults())
+        defaults['suppress_background'] = suppression_enabled({}, sc)
     saved = dict(cfg.get('scenes') or {})
     if '游戏' not in saved:                                   # first run of the scene system: keep the user's old setup
         saved['游戏'] = {k: cfg.get(k, v) for k, v in SCENE_DEF['游戏'].items()}
@@ -743,6 +743,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     for sc in SCENES:
         vals = dict(SCENE_DEF[sc]); vals.update(saved.get(sc, {}))
         vals.pop('voice_gate', None)
+        vals['suppress_background'] = suppression_enabled(cfg, sc)
         vals['speaker_mode'] = SPEAKER_MODE_ALIAS.get(vals['speaker_mode'], vals['speaker_mode'])
         if vals.get('fusion') == '仅游戏震动' and 'trigger_mode' not in saved.get(sc, {}):
             vals['trigger_mode'] = '纯用游戏'                 # that old choice also left the triggers to the game
@@ -1550,8 +1551,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         tk.Label(pnl.body, text='扳机风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['trigger_profile'], TRIGGER_PROFILES, cell=116, color=MAG, rec='均衡冲击').pack(anchor='w', pady=(px(4), px(10)))
         Toggle(pnl.body, '忽略中置声道', sv['skip_center'], '5.1/7.1 时对白（中置）不触发震动', wrap=300).pack(fill='x', pady=px(4))
-        Toggle(pnl.body, '抑制人声和背景音乐', V['suppress_background'],
-               '所有场景共用。压低台词和配乐产生的震动，突出打击和爆炸。想让手柄跟随音乐律动时可关闭。', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
+        Toggle(pnl.body, '抑制人声和背景音乐', SV[sc]['suppress_background'],
+               '按场景记忆。游戏默认开启，影院和音乐默认关闭。开启后压低台词和配乐产生的震动。', wrap=300, color=GREEN).pack(fill='x', pady=px(4))
         trigger_panel(f, sv)
         pnl = Panel(f, '手柄扬声器', 'SPEAKER', accent=BLUE); pnl.pack(fill='x', pady=(0, px(10)))
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')

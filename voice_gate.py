@@ -15,13 +15,19 @@ WINDOW = 512              # 32 ms at 16 kHz, what the model takes
 CONTEXT = 64
 
 
-def suppression_enabled(config):
-    """Use the active scene's old preference until the shared switch is saved."""
-    if 'suppress_background' in config:
-        return bool(config['suppress_background'])
-    scene = config.get('scene', '游戏')
-    previous = (config.get('scenes') or {}).get(scene, {})
-    return bool(previous.get('voice_gate', config.get('voice_gate', scene == '游戏')))
+def suppression_enabled(config, scene=None):
+    """Use the scene's saved choice, including preferences from older versions."""
+    scene = scene or config.get('scene', '游戏')
+    scenes = config.get('scenes') or {}
+    settings = scenes.get(scene, {})
+    if 'suppress_background' in settings:
+        return bool(settings['suppress_background'])
+    if 'voice_gate' in settings:
+        return bool(settings['voice_gate'])
+    # Before scene settings existed, the saved voice gate applied to games.
+    if not scenes and scene == '游戏':
+        return bool(config.get('voice_gate', True))
+    return scene == '游戏'
 
 
 class VoiceDetector:

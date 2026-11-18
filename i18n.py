@@ -34,7 +34,7 @@ T = [
     ('原始键位', 'Original layout', '元の配置', '기본 배치'),
     ('交换键位', 'Swap buttons', 'ボタンを交換', '버튼 교환'),
     ('恢复原始键位', 'Reset layout', '元の配置に戻す', '기본 배치 복원'),
-    ('所有场景共用。压低台词和配乐产生的震动，突出打击和爆炸。想让手柄跟随音乐律动时可关闭。', 'Shared across scenes. Reduce haptics from dialogue and music, emphasizing impacts. Turn off for music-driven haptics.', '全シーン共通。台詞や音楽による振動を抑えて衝撃音を強調します。音楽に合わせて振動させるにはオフにしてください。', '모든 장면에 적용됩니다. 대사와 음악의 진동을 줄이고 충격음을 강조합니다. 음악을 따라 진동하려면 끄세요.'),
+    ('按场景记忆。游戏默认开启，影院和音乐默认关闭。开启后压低台词和配乐产生的震动。', 'Saved per scene. On by default in Game, off in Cinema and Music. Reduces haptics from dialogue and music.', 'シーンごとに保存します。既定ではゲームでオン、シネマと音楽でオフです。台詞や音楽の振動を抑えます。', '장면별로 저장합니다. 기본값은 게임에서 켜짐, 영화와 음악에서 꺼짐입니다. 대사와 음악의 진동을 줄입니다.'),
     ('选择两个实体键，交换它们发给游戏的输入。原生透传、接管和虚拟 Xbox 支持改键；普通模式由游戏直接读取实体手柄。', 'Select two physical buttons to swap their game inputs. Available with virtual PS5, PS4 and Xbox pads. Overlay uses the physical controller directly.', '2つのボタンの入力を交換します。仮想 PS5、PS4、Xbox に対応します。通常モードでは実機の入力を直接使用します。', '실제 버튼 두 개의 게임 입력을 교환합니다. 가상 PS5, PS4, Xbox에서 지원하며 일반 모드는 실제 패드를 직접 읽습니다.'),
     ('映射在下次启动触感引擎时生效。自定义 R1 或 R2 后，鸣潮摩托优先使用你的键位。', 'Restart haptics to apply. Custom R1 or R2 bindings take priority on the WuWa bike.', '触感エンジンの再起動で適用されます。鳴潮のバイクでは R1/R2 の手動設定が優先されます。', '햅틱 엔진을 다시 시작하면 적용됩니다. 명조 바이크는 사용자 지정 R1/R2 배치를 우선합니다.'),
     ('抑制人声和背景音乐', 'Suppress voice and background music', '音声と BGM の振動を抑える', '음성 및 배경 음악 진동 억제'),

@@ -640,7 +640,7 @@ def test_silent_source_releases_audio_triggers(scene="游戏", suppress=False):
 
     logs = []
     cfg = dict(app.DEFAULTS, mode='普通', capture='系统', speaker_mode='关闭', source_hint='loop',
-               pbz_fx=False, ww_fx=False, ww_vision=False, scene=scene, suppress_background=suppress)
+               pbz_fx=False, ww_fx=False, ww_vision=False, scene=scene, scenes={scene: {"suppress_background": suppress}})
     runner = app.Runner(cfg, logs.append)
     clock = [100.]
     first = True
@@ -798,12 +798,15 @@ def test_game_music_gate():
     assert max(outputs[365:]) == 0, 'gate failed to close'
 
 
-def test_shared_suppression():
+def test_scene_suppression():
     from voice_gate import suppression_enabled
+    assert not suppression_enabled({'voice_gate': False})
     for scene in ('游戏', '影院', '音乐'):
-        old = dict(scene=scene, scenes={scene: {'voice_gate': False}}, voice_gate=True)
-        assert not suppression_enabled(old)
-        assert suppression_enabled(dict(old, suppress_background=True))
+        defaults = dict(scene=scene, suppress_background=True)
+        assert suppression_enabled(defaults) == (scene == '游戏')
+        legacy = dict(scene=scene, scenes={scene: {'voice_gate': False}}, suppress_background=True)
+        assert not suppression_enabled(legacy)
+        assert suppression_enabled(dict(legacy, scenes={scene: {'suppress_background': True}}))
         test_silent_source_releases_audio_triggers(scene, suppress=True)
 
 
@@ -862,7 +865,7 @@ def test_button_map():
 
 
 if __name__ == '__main__':
-    test_shared_suppression()
+    test_scene_suppression()
     test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()
