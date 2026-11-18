@@ -59,7 +59,7 @@ class StuckGuard:
     def reset_wave(self):
         self.wave_since = None
         self.wave_reference = None
-        self.wave_peaks = (0.0, 0.0)
+        self.wave_blocks = []
         self.wave_samples = 0
         self.wave_muted = False
 
@@ -92,25 +92,37 @@ class StuckGuard:
 
     def wave(self, left, right, last_event, now):
         """Watch the raw native coil signal, before it is mixed with other vibration."""
-        peaks = (float(np.max(np.abs(left))), float(np.max(np.abs(right))))
         if last_event and now - last_event <= QUIET_EVENTS_S:
             self.reset_wave()
             return False
-        self.wave_peaks = tuple(max(a, b) for a, b in zip(self.wave_peaks, peaks))
+        self.wave_blocks.append((left.copy(), right.copy()))
         self.wave_samples += len(left)
         if self.wave_samples < WAVE_WINDOW_SAMPLES:
             return self.wave_muted
-        peaks = self.wave_peaks
-        self.wave_peaks = (0.0, 0.0)
+        signature = []
+        for blocks in zip(*self.wave_blocks):
+            signal = np.concatenate(blocks)
+            magnitude = np.abs(signal)
+            peak = float(magnitude.max())
+            level = float(magnitude.mean())
+            # For a sine, total travel per second is 4 * amplitude * frequency.
+            # Also track mean magnitude to distinguish pulses with different duty cycles.
+            rate = (float(np.abs(np.diff(signal)).sum()) * RATE / (4 * peak * len(signal))
+                    if peak >= 0.05 else 0.0)
+            signature.append((peak, level, rate))
+        self.wave_blocks.clear()
         self.wave_samples = 0
-        if max(peaks) < 0.15:
+        if max(channel[0] for channel in signature) < 0.15:
             self.reset_wave()
             return False
-        # Compare to the first window of the plateau, so gradual changes rearm it too.
+        # Compare with the first window so a slow sweep can rearm the guard.
         if self.wave_reference is None or any(
-            abs(a - b) > max(0.025, 0.08 * b) for a, b in zip(peaks, self.wave_reference)
+            abs(current - original) > max(floor, relative * original)
+            for channel, reference in zip(signature, self.wave_reference)
+            for current, original, floor, relative in zip(channel, reference,
+                                                          (0.025, 0.025, 12.0), (0.08, 0.12, 0.15))
         ):
-            self.wave_reference = peaks
+            self.wave_reference = signature
             self.wave_since = now
             self.wave_muted = False
         elif now - self.wave_since >= STUCK_WAVE_S:

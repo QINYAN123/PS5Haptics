@@ -600,6 +600,38 @@ def test_stuck_guard():
     assert g.trigger('R', vib, 62.0) == vib
 
 
+def test_equal_peak_wave_changes():
+    import numpy as np
+    import ps5_haptics_app as app
+
+    guard = app.StuckGuard(lambda _: None)
+    samples = np.arange(app.HOP) / app.RATE
+    block = 0
+
+    def render(seconds, right_tone):
+        nonlocal block
+        states = []
+        for _ in range(round(seconds * app.RATE / app.HOP)):
+            now = block * app.HOP / app.RATE
+            t = now + samples
+            left = 0.6 * np.sin(2 * np.pi * 100 * t)
+            right = 0.3 * right_tone(t)
+            states.append(guard.wave(left, right, 0.0, now))
+            block += 1
+        return states
+
+    # Equal peaks on both grips, only the quieter grip changes frequency.
+    alternating = lambda t: np.sin(2 * np.pi * np.where(t.astype(int) % 2, 180, 80) * t)
+    assert not any(render(10, alternating))
+    steady = lambda t: np.sin(2 * np.pi * 100 * t)
+    assert render(7, steady)[-1]
+    assert not render(0.3, lambda t: np.sin(2 * np.pi * 180 * t))[-1]
+    # Same frequency and peak, but changing pulse width.
+    guard.reset()
+    pulses = lambda t: ((t * 100) % 1 < np.where(t.astype(int) % 2, 0.2, 0.8)).astype(float)
+    assert not any(render(10, pulses))
+
+
 def test_volume():
     assert gain_for(0.0, 0) == 1.0
     assert abs(gain_for(-6.0206, 0) - 2.0) < 0.01
@@ -659,6 +691,7 @@ def test_live():
 
 
 if __name__ == '__main__':
+    test_equal_peak_wave_changes()
     test_native_motor_mode_switch()
     test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks(); test_stuck_guard()
     print('offline tests ok')
