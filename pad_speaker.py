@@ -252,7 +252,10 @@ class PadSpeakerTap(threading.Thread):
             try:
                 x = lb.read()
             except Exception:                              # virtual pad went away
-                lb.close(); lb = None; self.source = ''; continue
+                lb.close(); lb = None; self.source = ''; self.last_sound = 0.0
+                with self.lock:
+                    self.buf.clear(); self.n = 0; self.primed = False
+                continue
             if len(x):
                 mono = (x[:, 0] + x[:, 1]) * 0.5
                 pk = float(np.max(np.abs(mono)))
@@ -265,3 +268,4 @@ class PadSpeakerTap(threading.Thread):
                 self.stop_ev.wait(0.005)
         if lb is not None:
             lb.close()
+

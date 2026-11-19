@@ -24,7 +24,7 @@ from button_haptics import ButtonClicks
 from game_caps import GameCaps, NOT_GAMES
 from pad_input import InputFilter, ButtonMap
 from voice_gate import suppression_enabled
-from takeover import VirtualDS4, VirtualX360, Isolation, RumbleCoil, fuse, FUSION_ALIAS
+from takeover import VirtualDS4, VirtualX360, Isolation, IsolationUnavailable, RumbleCoil, fuse, FUSION_ALIAS
 from xds import VirtualDualSense
 from event_fx import EventFX, load_config as load_event_fx
 from ww_vision import WWVision
@@ -49,6 +49,7 @@ PBZ_EXE = 'pbz.exe'
 # vibration the game may have forgotten to stop. Without event data, require a
 # sustained plateau in both channels before suppressing the native waveform.
 STUCK_TRIGGER_S, STUCK_MOTOR_S, STUCK_WAVE_S, QUIET_EVENTS_S = 3.0, 5.0, 6.0, 4.0
+PBZ_STUCK_MOTOR_S = 2.5
 WAVE_WINDOW_SAMPLES = RATE // 10
 
 
@@ -85,9 +86,9 @@ class StuckGuard:
             self._say('扳机震动'); return None
         return eff
 
-    def motors(self, l, r, now):
+    def motors(self, l, r, now, timeout=STUCK_MOTOR_S):
         t = self.held('motor', (l, r), now)
-        if (l or r) and t > STUCK_MOTOR_S:
+        if (l or r) and t >= timeout:
             self._say('马达震动'); return 0, 0
         return l, r
 
@@ -144,21 +145,26 @@ def foreground_window():
     return get_window()
 
 
-def foreground_exe(hwnd=None):
+def foreground_process(hwnd=None):
     u = C.windll.user32; k = C.windll.kernel32
     hwnd = hwnd or foreground_window()
-    pid = W.DWORD(); u.GetWindowThreadProcessId(hwnd, C.byref(pid))
+    pid = W.DWORD(); u.GetWindowThreadProcessId(W.HWND(hwnd), C.byref(pid))
     k.OpenProcess.restype = W.HANDLE
     h = k.OpenProcess(0x1000, False, pid.value)
     if not h:
         # protected processes (anti-cheat) may refuse even limited queries: fall back to the title
-        title = C.create_unicode_buffer(256); u.GetWindowTextW(hwnd, title, 256)
-        return WW_EXE if ('鸣潮' in title.value or 'Wuthering' in title.value) else ''
+        title = C.create_unicode_buffer(256); u.GetWindowTextW(W.HWND(hwnd), title, 256)
+        return pid.value, WW_EXE if ('鸣潮' in title.value or 'Wuthering' in title.value) else ''
     try:
         buf = C.create_unicode_buffer(1024); n = W.DWORD(1024)
-        return pathlib.Path(buf.value).name.lower() if k.QueryFullProcessImageNameW(h, 0, buf, C.byref(n)) else ''
+        name = pathlib.Path(buf.value).name.lower() if k.QueryFullProcessImageNameW(W.HANDLE(h), 0, buf, C.byref(n)) else ''
+        return pid.value, name
     finally:
-        k.CloseHandle(h)
+        k.CloseHandle(W.HANDLE(h))
+
+
+def foreground_exe(hwnd=None):
+    return foreground_process(hwnd)[1]
 
 
 class _PMC(C.Structure):
@@ -229,6 +235,27 @@ GSP_LOWCUT = butter(2, 150, 'highpass', fs=RATE, output='sos')
 CONTROL_HAPTICS = {'button': 'button_haptics', 'trigger': 'trigger_haptics', 'stick': 'stick_haptics', 'touch': 'touch_haptics'}
 
 
+def speaker_route(mode, pure, adapted, native_speaking, direct_speaking):
+    if mode != '特殊事件':
+        return mode
+    if native_speaking:
+        return '游戏原生'
+    if direct_speaking:
+        return '游戏接管'
+    if adapted:
+        return mode
+    return '静默' if pure else '全部游戏声'
+
+
+def capture_request(cfg, game_exes=()):
+    setting = cfg.get('capture', '自动')
+    if setting == '锁定进程':
+        return 'pinned', pathlib.PureWindowsPath(cfg.get('capture_exe', '').strip().strip('"')).name.casefold()
+    if setting == '仅游戏进程' or (setting == '自动' and cfg.get('scene', '游戏') == '游戏'):
+        return 'game', tuple(game_exes)
+    return ('auto' if setting == '自动' else 'mix'), None
+
+
 class Runner:
     def __init__(self, cfg, log):
         self.base = cfg; self.profile = None   # base: the UI's settings; cfg: base + the foreground game's own settings
@@ -239,6 +266,7 @@ class Runner:
         self.pad_filter = None              # stick deadzones / gyro bias for the virtual pad
         self.live_ver = 0                   # bumped by the UI when settings change: applied within 0.5 s
         self.proc = None
+        self.capture = capture_request(cfg)
         self.stats = {'level': 0.0, 'trigger': (0.0, 0.0), 'active': False, 'source': '', 'late': 0, 'rumble': (0.0, 0.0), 'vpad': None, 'takeover': False, 'native_trig': (False, False)}
 
     def profile_for(self, exe):
@@ -260,8 +288,30 @@ class Runner:
     def user_exes(self):
         return [pathlib.Path(g.get('exe', '')).name.lower() for g in self.base.get('user_games') or [] if g.get('exe')]
 
+    @property
+    def capture_locked(self):
+        return self.capture[0] in ('game', 'pinned')
+
+    def _capture_request(self):
+        games = (*GAME_PROFILES, PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower(), *self.user_exes())
+        return capture_request(self.cfg, games)
+
+    def _foreground_game(self, known):
+        hwnd = foreground_window()
+        if not hwnd:
+            return None
+        pid, exe = foreground_process(hwnd)
+        if pid and exe not in NOT_GAMES and pid != os.getpid():
+            from ui_scifi import other_fullscreen
+            if exe in known or other_fullscreen(hwnd=hwnd):
+                return pid, exe
+        return None
+
+    def _allow_system_mix(self):
+        return not self.capture_locked and not (self.capture[0] == 'auto' and self.proc and self.proc.sounding())
+
     def _audio_cb(self, data, frames, info, status):
-        if self.proc is not None and self.proc.sounding():  # game captured per process: ignore the mix
+        if not self._allow_system_mix():
             return (None, pa.paContinue)
         try:
             self.q.put_nowait(np.frombuffer(data, np.float32).copy())
@@ -290,37 +340,57 @@ class Runner:
         return stream
 
     def _open_loopback(self, hint_override=None):
-        """Find the default output's loopback and open it. Right after a device change (pad re-plugged,
-        audio device disabled) WASAPI can fail for a few seconds: re-enumerate and retry."""
-        last = None
-        for attempt in range(8):
+        p = pa_new()
+        try:
+            hint = hint_override or self.cfg.get('source_hint')
+            use_default = not hint
+            if use_default:
+                wasapi = p.get_host_api_info_by_type(pa.paWASAPI)
+                hint = p.get_device_info_by_index(wasapi['defaultOutputDevice'])['name']
+                if 'dualsense' in hint.lower():
+                    raise PermissionError('默认声音输出设备是 PS5 手柄本身。请在 Windows 声音设置里把默认输出改回音箱/电视，再点开始。')
+            candidates = [d for d in p.get_loopback_device_info_generator()
+                          if 'dualsense' not in d['name'].lower()]
+            src = next((d for d in candidates
+                        if d['name'].removesuffix(' [Loopback]').casefold() == hint.casefold()), None)
+            if src is None and not use_default:
+                matches = [d for d in candidates if hint.casefold() in d['name'].casefold()]
+                if len(matches) == 1:
+                    src = matches[0]
+            if src is None:
+                raise LookupError('找不到唯一的声音输出设备环回（loopback）：' + hint)
+            return p, src, self._open_stream(p, src)
+        except Exception:
+            pa_end(p)
+            raise
+
+    def _open_audio(self, hint_override=None, output_name=None):
+        for attempt in range(4):
             if self.stop_ev.is_set():
                 raise RuntimeError('已取消')
-            p = None
+            p = stream = out = None
+            stage = '系统音频环回'
             try:
-                p = pa_new()
-                w = p.get_host_api_info_by_type(pa.paWASAPI)
-                default_name = p.get_device_info_by_index(w['defaultOutputDevice'])['name']
-                if not (hint_override or self.cfg.get('source_hint')) and 'DualSense' in default_name:
-                    raise PermissionError('默认声音输出设备是 PS5 手柄本身。请在 Windows 声音设置里把默认输出改回音箱/电视，再点开始。')
-                hint = hint_override or self.cfg.get('source_hint') or default_name
-                src = next((d for d in p.get_loopback_device_info_generator() if hint in d['name'] and 'DualSense' not in d['name']), None)
-                if src is None:
-                    raise LookupError('找不到声音输出设备的环回（loopback）：' + hint)
-                return p, src, self._open_stream(p, src)
-            except PermissionError as exc:
-                if p is not None:
+                rescan()
+                if self.capture_locked:
+                    p = pa_new()
+                    src = {'name': '按进程截音', 'maxInputChannels': 2, 'defaultSampleRate': RATE}
+                else:
+                    p, src, stream = self._open_loopback(hint_override)
+                stage = '手柄音频输出'
+                out = HapticOut(p, output_name)
+                return p, src, stream, out
+            except PermissionError:
+                raise
+            except (LookupError, OSError) as exc:
+                if attempt == 3:
+                    raise RuntimeError(f'打开{stage}失败：{exc}') from exc
+                self.log(f'{stage}暂不可用，正在重新枚举设备（{attempt + 1}/3）：{exc}')
+            finally:
+                if p is not None and out is None:
+                    close_stream(stream)
                     pa_end(p)
-                raise RuntimeError(str(exc)) from exc
-            except Exception as exc:
-                last = exc
-                if p is not None:
-                    try: pa_end(p)
-                    except Exception: pass
-                if attempt < 7:
-                    self.log(f'声音设备还没准备好，正在重试（{attempt + 1}/8）…')
-                    self.stop_ev.wait(1.5)
-        raise RuntimeError('打开声音设备失败：' + str(last))
+            self.stop_ev.wait(0.75)
 
     def run(self):
         p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None; volume = None
@@ -335,6 +405,7 @@ class Runner:
                 self.log(f'使用「{self.profile}」的专属设置')
         except Exception:
             pass
+        self.capture = self._capture_request()
         mode = self.cfg.get('mode')
         native = mode == '原生透传'                 # virtual DualSense: game's own triggers + haptics
         xbox = mode == 'Xbox'                       # virtual Xbox pad: games that only accept Xbox controllers
@@ -342,11 +413,10 @@ class Runner:
         button_map = ButtonMap(self.start_cfg.get('button_map') if takeover else None)
         logical_report = bytes([1, 128, 128, 128, 128, 0, 0, 0, 8, 0])
         try:
-            rescan()                                  # see a pad / audio device plugged in since the app opened
-            p, src, stream = self._open_loopback()
+            p, src, stream, out = self._open_audio()
             ch = src['maxInputChannels']; rate = int(src['defaultSampleRate'])
             self.stats['source'] = f"{src['name']}  {ch}声道 {rate}Hz"
-            out = HapticOut(p); hid = DualSenseHID()   # open the REAL pad before any virtual one exists
+            hid = DualSenseHID()                        # open the REAL pad before any virtual one exists
             real_out = out.dev['name']
             fw = hid.firmware_info()
             if fw:
@@ -358,7 +428,17 @@ class Runner:
                     current.notify_input(report)
 
             if takeover:
-                iso = Isolation(self.log); iso.open(hid.path)
+                iso = Isolation(self.log)
+                try:
+                    iso.open(hid.path)
+                except IsolationUnavailable as exc:
+                    if not native:
+                        raise
+                    self.log(str(exc) + ' 已切到普通模式，声音震动可用，游戏直接连接真手柄。')
+                    native = takeover = False
+                    mode = '普通'
+                    button_map = ButtonMap()
+            if takeover:
                 vpad = VirtualDualSense(self.log) if native else VirtualX360() if xbox else VirtualDS4()
                 vpad.open()
                 self.pad_filter = InputFilter(self.cfg.get('stick_dz_l', 0.0), self.cfg.get('stick_dz_r', 0.0), self.cfg.get('gyro_bias') or (0, 0, 0))
@@ -375,7 +455,7 @@ class Runner:
                             if stamp != old:
                                 current.notify_trigger(side, stamp)
 
-                hid.start_reader(forward_input)
+                hid.start_reader(forward_input, self.log)
                 self.stats['takeover'] = True
                 if native:                         # the game's own pad-speaker sound lands on the virtual pad
                     from pad_speaker import PadSpeakerTap, SpeakerClip
@@ -389,7 +469,7 @@ class Runner:
             except Exception: pass
             eng = HapticEngine(self.cfg['grip_profile'], self.cfg['trigger_profile'], self.cfg['grip_gain'], self.cfg['trigger_gain'],
                                self.cfg.get('haptic_style', '游戏'), groove_gains(self.cfg))
-            ep_gain = 1.0; source_endpoint = False; pad_session_check = 0.0; fg_since = time.monotonic(); last_game_trig = (None, None); trig_released = False
+            ep_gain = 1.0; source_endpoint = False; pad_session_check = 0.0; game_speaker_active = False; fg_since = time.monotonic(); last_game_trig = (None, None); trig_released = False
             rum = RumbleCoil(); clicks = ButtonClicks(); vol = self.cfg.get('speaker_volume', 0.6)
             spk_mode = SPEAKER_MODE_ALIAS.get(self.cfg.get('speaker_mode', '全部游戏声'), self.cfg.get('speaker_mode', '全部游戏声'))
             spk_eq = self.cfg.get('speaker_eq', '原味')
@@ -465,21 +545,17 @@ class Runner:
                 if static[i] is not None:
                     return static[i]
                 return effect_vibration(amp[i], 30 + 25 * trig[i]) if amp[i] else effect_off()
-            if self.cfg.get('capture', '自动') == '自动':
-                # known games are captured per process: works with Dolby Atmos / spatial sound, where the
-                # endpoint loopback is silent, and leaves music / voice chat out of the haptics
-                try:
-                    from proc_loopback import ProcSource
-                    scene_name = self.cfg.get('scene', '游戏')
-                    if scene_name == '游戏':                    # adapted games first, then the program in front
-                        exes = [e for e in list(GAME_PROFILES) + [PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower()] + self.user_exes() if e]
-                        players = 'foreground'
-                    else:                                 # films / music: whatever is playing (player, browser, music app)
-                        exes, players = [], 'loudest'
-                    self.proc = ProcSource(self.q, exes, self.log, self.stop_ev, players); self.proc.start()
-                except Exception as exc:
-                    self.log('按进程截音不可用，使用系统混音：' + str(exc))
+            try:
+                from proc_loopback import ProcSource
+                self.proc = ProcSource(self.q, self.log, self.stop_ev, self._foreground_game)
+                self.proc.request = self.capture
+                self.proc.start()
+            except Exception as exc:
+                self.proc = None
+                self.log('按进程截音不可用：' + str(exc))
             ep_source = self.stats['source']
+            was_locked = self.capture_locked
+            input_route = None
             default_id = None
             if not self.cfg.get('source_hint'):
                 try:
@@ -488,38 +564,44 @@ class Runner:
                 except Exception as exc:
                     self.log('无法监视默认声音输出（不影响使用）：' + str(exc))
             while not self.stop_ev.is_set():
-                if time.monotonic() - alive_check > 1.0:          # audio device reset mid-session -> reopen
+                capture_changed = was_locked != self.capture_locked
+                default_changed = False
+                if time.monotonic() - alive_check > 1.0:
                     alive_check = time.monotonic()
                     now_id = watcher.current() if watcher else None
-                    if now_id and now_id != default_id:
-                        # default output switched (e.g. laptop speakers -> TV): PortAudio only sees the new
-                        # default after a full re-initialisation, so close everything audio and reopen
-                        default_id = now_id; prev = src['name'].replace(' [Loopback]', '')
-                        close_stream(stream); stream = None
-                        try: out.close()
-                        except Exception: pass
-                        pa_end(p); p = None; rescan()
-                        try:
-                            p, src, stream = self._open_loopback()
-                        except RuntimeError as exc:
-                            self.log(str(exc) + ' 继续使用原来的设备。')
-                            p, src, stream = self._open_loopback(hint_override=prev)
-                        ch = src['maxInputChannels']; rate = int(src['defaultSampleRate'])
-                        out = HapticOut(p, real_out)               # the REAL pad, not the virtual one
-                        self.stats['source'] = ep_source = f"{src['name']}  {ch}声道 {rate}Hz"
-                        while not self.q.empty():
-                            try: self.q.get_nowait()
-                            except queue.Empty: break
-                        pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
-                        clock0 = time.monotonic(); produced = 0
-                        self.log('默认声音输出已切换，触感声源跟随到：' + self.stats['source'])
-                        continue
-                    stream = self._refresh_stream(stream, p, src)
+                    default_changed = bool(now_id and now_id != default_id)
+                    if default_changed:
+                        default_id = now_id
+                    elif not self.capture_locked and not capture_changed:
+                        stream = self._refresh_stream(stream, p, src)
+                if capture_changed or default_changed or (not self.capture_locked and stream is None) or out.failure is not None:
+                    was_locked = self.capture_locked
+                    previous = src['name'].removesuffix(' [Loopback]')
+                    close_stream(stream); stream = None
+                    out.close(); out = None
+                    pa_end(p); p = None
+                    try:
+                        p, src, stream, out = self._open_audio(output_name=real_out)
+                    except (RuntimeError, PermissionError) as exc:
+                        if not default_changed or capture_changed or self.capture_locked or self.stop_ev.is_set():
+                            raise
+                        self.log(str(exc) + ' 尝试恢复原来的声音设备。')
+                        p, src, stream, out = self._open_audio(previous, real_out)
+                    ch = src['maxInputChannels']; rate = int(src['defaultSampleRate'])
+                    self.stats['source'] = ep_source = f"{src['name']}  {ch}声道 {rate}Hz"
+                    while not self.q.empty():
+                        try: self.q.get_nowait()
+                        except queue.Empty: break
+                    pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
+                    clock0 = time.monotonic(); produced = 0; rs = Resampler()
+                    spk_assert = 0.0
+                    self.log('音频设备已重新连接：' + self.stats['source'])
+                    continue
                 if hid.read_error is not None:
-                    raise RuntimeError('PS5 手柄断开了（' + str(hid.read_error) + '）')
+                    raise RuntimeError('PS5 手柄输入中断：' + str(hid.read_error))
                 # WASAPI loopback may stop delivering packets altogether during silence.
                 # Keep processing until the last audio-driven trigger has actually been released.
-                needs_idle_audio = (takeover or vision is not None or max(last_trig) > 0
+                needs_idle_audio = (self.capture_locked or takeover or spk is not None or vision is not None or max(last_trig) > 0
                                     or any(self.cfg.get(k) for k in CONTROL_HAPTICS.values())
                                     or (fx is not None and (fx.voices or any(fx.triggers()))))
                 try:
@@ -550,16 +632,24 @@ class Runner:
                 except queue.Empty:
                     blk = None
                 audio_exe = ''
+                proc_key = self.proc.key if self.proc else None
+                route = self.capture, None if self._allow_system_mix() else proc_key
+                if route != input_route:
+                    input_route = route
+                    pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
+                    rs = Resampler()
+                    if spk is not None:
+                        spk = RawSpeaker()
                 if blk is not None:
                     from_endpoint = not isinstance(blk, tuple)
                     if isinstance(blk, tuple):                      # per-process capture: stereo 48 kHz
-                        audio_exe, blk = blk; bch, brate = 2, RATE
-                        if not (self.proc and self.proc.sounding()):
-                            blk = None                             # silent game process: the mix is used
+                        tag, audio_exe, blk = blk; bch, brate = 2, RATE
+                        if not (tag and tag == proc_key and tag[0] == self.capture):
+                            blk = None
                     else:
                         bch, brate = ch, rate
-                        if self.proc is not None and self.proc.sounding():
-                            blk = None                             # game process has sound: it wins
+                        if not self._allow_system_mix():
+                            blk = None
                 if blk is not None:
                     source_endpoint = from_endpoint
                     if np.any(blk):
@@ -596,15 +686,17 @@ class Runner:
                     if new_fg != fg:
                         fg_since = now
                         stuck.reset_wave()
+                        game_speaker_active = False
+                        pad_session_check = 0.0
                     fg = new_fg
                     g_now = self.profile_for(fg)
                     g_name = g_now.get('name') if g_now else None
                     if g_name != self.profile:                  # the person's own settings for the game in front
                         self.profile = g_name; self.cfg = self.effective(fg); live_seen = -1
                         self.log(f'使用「{g_name}」的专属设置' if g_name else '前台不是有专属设置的游戏，使用通用设置')
-                        if g_now and (self.cfg.get('mode') != mode or self.cfg.get('capture') != self.start_cfg.get('capture')) and g_name not in mode_warned:
+                        if g_now and self.cfg.get('mode') != mode and g_name not in mode_warned:
                             mode_warned.add(g_name)
-                            self.log(f'「{g_name}」的连接方式或声音来源和当前不同：先打开游戏，再停止并重新启动本软件后生效。')
+                            self.log(f'「{g_name}」的连接方式和当前不同：先打开游戏，再停止并重新启动本软件后生效。')
                     elif self.live_ver != live_seen:
                         self.cfg = self.effective(fg)
                     if self.cfg.get('volume_comp'):             # lowering the system volume should not weaken the haptics
@@ -634,41 +726,44 @@ class Runner:
                         rgain = base_rgain * (prof['rumble_scale'] if tune else 1.0)
                         eng = HapticEngine(prof['grip_profile'] if tune and self.cfg['grip_profile'] != '细腻' else self.cfg['grip_profile'], self.cfg['trigger_profile'],
                                            self.cfg['grip_gain'], self.cfg['trigger_gain'], self.cfg.get('haptic_style', '游戏'), groove_gains(self.cfg))
-                        if self.proc is not None:              # scene changed: which program to listen to
-                            game_scene = self.cfg.get('scene', '游戏') == '游戏'
-                            self.proc.players = 'foreground' if game_scene else 'loudest'
-                            self.proc.exes = [e for e in list(GAME_PROFILES) + [PBZ_EXE, self.cfg.get('foreground_exe', '').strip().lower()] + self.user_exes() if e] if game_scene else []
+                        request = self._capture_request()
+                        if request != self.capture:
+                            self.capture = request
+                            if self.proc is not None:
+                                self.proc.request = request
+                            pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
+                            rs = Resampler()
+                            if spk is not None:
+                                spk = RawSpeaker()
+                            continue
                     # 全部游戏声: the whole mix, even over a game's own pad-speaker sound.
                     # 特殊事件: a game that drives the pad speaker itself keeps it; 影之刃零 keeps its event tuning;
                     # games that don't use the pad speaker play the whole mix.
                     # grips on 纯用游戏 + 特殊事件 = nothing of ours at all: no event tuning, no whole mix as a fallback
                     pure = FUSION_ALIAS.get(fusion, fusion) == '纯用游戏' and spk_mode == '特殊事件'
                     adapted = fg == PBZ_EXE and self.cfg.get('pbz_fx', True) and not pure     # 特殊事件: only 影之刃零 is adapted
-                    spk_eff = ('静默' if pure else '全部游戏声') if (spk_mode == '特殊事件' and not adapted) else spk_mode
-                    if spk_mode == '特殊事件' and pad_tap is not None and (pad_tap.sounding(2.0) or (adapted and pad_tap.last_sound)):
-                        spk_eff = '游戏原生'          # the game drives the pad speaker itself (like on PS5): use exactly that
-                    if spk_mode == '特殊事件' and spk is not None and 'DualSense' not in src['name']:
-                        # the game in front uses the controller speaker itself: step aside, now and on later launches.
-                        # Its own audio session decides, so a game left in the background is not blamed on the browser in front.
-                        may_use_pad = (pad_tap is not None and pad_tap.sounding(0.6)) or (pad_tap is None and not takeover)
-                        if may_use_pad and fg not in NOT_GAMES and not self.caps.has(fg, 'speaker') and now - pad_session_check > 1.0:
-                            pad_session_check = now
-                            try:
-                                from pad_speaker import game_on_pad
-                                if game_on_pad(fg) and self.caps.note(fg, 'speaker'):
-                                    self.log(f'检测到 {fg} 自己在用手柄扬声器，之后这款游戏的扬声器交给游戏')
-                            except Exception:
-                                pass                               # can't tell: keep playing as chosen
-                        if self.caps.has(fg, 'speaker') and not adapted:
-                            spk_eff = '游戏原生' if pad_tap is not None else '游戏接管'
+                    if (spk_mode == '特殊事件' and not takeover and fg not in NOT_GAMES
+                            and now - pad_session_check >= 1.0):
+                        pad_session_check = now
+                        try:
+                            from pad_speaker import game_on_pad
+                            game_speaker_active = game_on_pad(fg)
+                        except Exception:
+                            game_speaker_active = False
+                    if spk_mode != '特殊事件':
+                        game_speaker_active = False
+                    spk_eff = speaker_route(spk_mode, pure, adapted, pad_tap is not None and pad_tap.sounding(1.0),
+                                            not takeover and fg not in NOT_GAMES and game_speaker_active)
                     self.stats['spk_eff'] = spk_eff
-                    if self.proc is not None and self.proc.sounding():
+                    if self.proc is not None and self.proc.key and self.proc.key[0] == self.capture:
                         self.stats['source'] = f'{self.proc.name}（按进程截音）  2声道 48000Hz'
+                    elif self.capture_locked:
+                        self.stats['source'] = '等待锁定进程' if self.capture[0] == 'pinned' else '等待游戏进程'
                     else:
                         self.stats['source'] = ep_source
                     # a game in front but pure digital silence on the loopback for 15 s: its audio bypasses
                     # the shared mix (Windows spatial sound / Dolby Atmos, or exclusive mode)
-                    silent = bool(fg) and fg in GAME_PROFILES and now - heard > 15
+                    silent = not self.capture_locked and fg in GAME_PROFILES and now - heard > 15
                     if silent and not self.stats.get('silent'):
                         self.log('截不到游戏声音：' + src['name'].replace(' [Loopback]', '') + ' 上 15 秒全是静音数据。'
                                  '请在 Windows 声音设置里关闭这个输出设备的「空间音效」(Dolby Atmos / Windows Sonic)，'
@@ -776,7 +871,7 @@ class Runner:
                     spk_assert = time.monotonic()
                     try: hid.enable_speaker(volume=0x64, headset=self.cfg.get('speaker_output') == '耳机孔')
                     except Exception: pass
-                while len(pend_l) >= HOP:
+                while len(pend_l) >= HOP and out.failure is None:
                     bl, br = pend_l[:HOP], pend_r[:HOP]; pend_l, pend_r = pend_l[HOP:], pend_r[HOP:]
                     produced += HOP
                     if not active:
@@ -809,7 +904,8 @@ class Runner:
                     if native:
                         (rleft, rright), _, color = vpad.feedback()
                         if guard_game is not None:
-                            rleft, rright = stuck.motors(rleft, rright, time.monotonic())
+                            timeout = PBZ_STUCK_MOTOR_S if guard_game == PBZ_EXE else STUCK_MOTOR_S
+                            rleft, rright = stuck.motors(rleft, rright, now, timeout)
                         large, small = rleft / 255, rright / 255
                         nl, nr = vpad.wave.pull(HOP)                  # game's own voice-coil waveform
                         if guard_game is not None and stuck.wave(
@@ -842,6 +938,8 @@ class Runner:
                             except Exception: pass
                     elif takeover:
                         large, small, color = vpad.rumble()
+                        if guard_game == PBZ_EXE:
+                            large, small = stuck.motors(large, small, now, PBZ_STUCK_MOTOR_S)
                         tl_acc['mot'] = max(tl_acc['mot'], large, small)
                         rl, rr = rum.step(large, small, rgain)
                         wl, wr = fuse(wl, wr, rl, rr, max(large, small), fusion, duck)
@@ -1013,7 +1111,7 @@ class Runner:
                 if out: out.close()
             except Exception: pass
             if p: pa_end(p)
-            tail = '扳机和握把已释放。' + ('真手柄已对游戏恢复可见。' if takeover else '')
+            tail = '已释放扳机和握把。' if hid is not None and hid.read_error is None else '已停止触感输出。'
             self.log(('已停止。原因：' + error + '\n' + tail) if error else ('已停止，' + tail))
 
 
@@ -1119,3 +1217,4 @@ if __name__ == '__main__':
         selftest()
     else:
         main()
+

@@ -15,6 +15,7 @@ from button_haptics import ControlTracker
 
 VID = 0x054C
 PIDS = (0x0CE6, 0x0DF2)   # DualSense, DualSense Edge
+NEUTRAL_INPUT = bytes([1, 128, 128, 128, 128, 0, 0, 0, 8] + [0] * 24 + [0x80, 0, 0, 0, 0x80] + [0] * 26)
 
 
 def battery_status(r):
@@ -154,6 +155,7 @@ class DualSenseHID:
         self.l2 = 0; self.r2 = 0
         self.last = (None, None); self.last_write = 0.0
         self.lock = threading.Lock()
+        self.recovering = threading.Event()
         self.reader = None; self.reader_stop = threading.Event(); self.reports = 0; self.read_error = None
         self.light = None; self.battery = None; self.buttons = ControlTracker()
         self.dpad = None                                 # D-pad hat 0..7 (0 = up, clockwise), None = released
@@ -191,7 +193,7 @@ class DualSenseHID:
         with self.lock:
             self.dev.write(bytes(rep))
 
-    def start_reader(self, on_report):
+    def start_reader(self, on_report, log=lambda _: None):
         """Own all input reads in a thread; on_report(bytes) gets every 0x01 input report.
         poll_input() then just returns the cached trigger values."""
         self.dev.set_nonblocking(False)
@@ -200,16 +202,57 @@ class DualSenseHID:
             while not self.reader_stop.is_set():
                 try:
                     r = self.dev.read(64, 20)
-                except Exception as exc:          # unplugged
-                    self.read_error = exc; break
+                except (OSError, ValueError) as exc:
+                    if self.reader_stop.is_set():
+                        return
+                    self.recovering.set()
+                    try:
+                        self.l2 = self.r2 = self.held = 0
+                        self.dpad = None
+                        self.buttons.update(NEUTRAL_INPUT)
+                        on_report(NEUTRAL_INPUT)
+                        log('手柄读取中断，正在重新连接同一手柄…')
+                        if self._reopen_reader():
+                            log('手柄输入已重新连接。')
+                            continue
+                    except Exception as recovery_error:
+                        self.read_error = recovery_error
+                        return
+                    finally:
+                        self.recovering.clear()
+                    if not self.reader_stop.is_set():
+                        self.read_error = exc
+                    return
                 if r and r[0] == 0x01 and len(r) >= 41:
                     self.l2, self.r2 = r[5], r[6]; self.reports += 1; self.battery = battery_status(r); self.buttons.update(r)
                     hat = r[8] & 0x0F; self.dpad = hat if hat < 8 else None; self.held = (r[8] >> 4) | ((r[9] & 0x03) << 4)
                     try:
                         on_report(bytes(r))
                     except Exception as exc:
-                        self.read_error = exc; break
+                        self.read_error = RuntimeError(f'转发手柄输入失败：{exc}'); break
         self.reader = threading.Thread(target=loop, daemon=True); self.reader.start()
+
+    def _reopen_reader(self):
+        with self.lock:
+            self.dev.close()
+        for _ in range(12):
+            if self.reader_stop.wait(0.2):
+                return False
+            candidate = hid.device()
+            try:
+                candidate.open_path(self.path)
+                candidate.set_nonblocking(False)
+                candidate.read(64, 20)
+                with self.lock:
+                    if self.reader_stop.is_set():
+                        candidate.close()
+                        return False
+                    self.dev = candidate
+                    self.last_write = 0.0
+                return True
+            except (OSError, ValueError):
+                candidate.close()
+        return False
 
     def poll_input(self, on_report=None):
         """Drain reports, optionally forwarding each full input sample."""
@@ -234,7 +277,14 @@ class DualSenseHID:
         if not force and now - self.last_write < min_interval:
             return False
         with self.lock:
-            self.dev.write(output_report(right=right_effect, left=left_effect))
+            if self.recovering.is_set():
+                return False
+            try:
+                self.dev.write(output_report(right=right_effect, left=left_effect))
+            except (OSError, ValueError):
+                if self.reader is None or force:
+                    raise
+                return False
         self.last = (left_effect, right_effect); self.last_write = now
         return True
 
@@ -253,3 +303,4 @@ class DualSenseHID:
             self.dev.close()
         except Exception:
             pass
+
