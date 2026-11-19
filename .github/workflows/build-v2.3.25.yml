@@ -1,0 +1,105 @@
+name: Build PS5Haptics v2.3.25
+
+on:
+  push:
+    branches: [release/v2.3.25]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ps5haptics-v2.3.25
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 24
+    env:
+      PYTHONUTF8: '1'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: python -m pip install numpy scipy pillow pyaudiowpatch hidapi comtypes dxcam onnxruntime onnxocr-ppocrv5 pyinstaller
+      - name: Check Windows compatibility and update handling
+        run: |
+          foreach ($test in @('test_compat.py', 'test_speaker_safety.py', 'test_event_fx.py', 'test_updater.py', 'test_usbip_vhci.py', 'test_ww_bike.py')) {
+            python $test
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Recover static distribution files from v2.3.24
+        run: |
+          gh release download v2.3.24 --pattern 'PS5Haptics-v2.3.24.zip' --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Join-Path $env:RUNNER_TEMP 'PS5Haptics-v2.3.24.zip'
+          $expected = '7cd1abccfb66d8b3f15294c71a922a7e98dc0fef4b2c53dabaa795418796409d'
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Previous release checksum mismatch' }
+          $unpacked = Join-Path $env:RUNNER_TEMP 'ps5haptics-v2.3.24'
+          python -m zipfile -e $zip $unpacked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem -LiteralPath $unpacked -Recurse -File -Filter PS5Haptics.exe | Where-Object { $_.Directory.Name -eq 'PS5声音触感' } | Select-Object -First 1
+          if (-not $exe) { throw 'Previous release program directory not found' }
+          $app = $exe.Directory.FullName
+          $root = $exe.Directory.Parent.FullName
+          $parent = (Get-Item -LiteralPath .).Parent.FullName
+          New-Item -ItemType Directory -Path 'dist_deps' -Force | Out-Null
+          $installer = Join-Path $root '依赖.exe'
+          if (-not (Test-Path -LiteralPath $installer)) { $installer = Join-Path $app '依赖.exe' }
+          Copy-Item -LiteralPath $installer -Destination 'dist_deps'
+          foreach ($name in @('一键恢复手柄可见性.ps1','一键恢复手柄可见性.cmd')) {
+            Copy-Item -LiteralPath (Join-Path $root $name) -Destination $parent
+          }
+          $mods = Join-Path $parent '影之刃零事件记录mod'
+          New-Item -ItemType Directory -Path $mods -Force | Out-Null
+          $previousMod = Join-Path $root '影之刃零事件mod\PS5EventLog'
+          if (-not (Test-Path -LiteralPath $previousMod)) { $previousMod = Join-Path $app 'mods\PS5EventLog' }
+          Copy-Item -LiteralPath $previousMod -Destination $mods -Recurse
+          $published = Join-Path $parent '发布'
+          New-Item -ItemType Directory -Path $published -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $root '依赖安装包') -Destination (Join-Path $published '依赖安装包-原始') -Recurse
+      - name: Build program and both release archives
+        run: |
+          python -m PyInstaller --noconfirm PS5Haptics.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python release/build_release.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path 'release-assets' -Force | Out-Null
+          Copy-Item -Path '../发布/GitHub上传/*.zip' -Destination 'release-assets'
+          @'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          packages = sorted(Path('release-assets').glob('*.zip'))
+          assert len(packages) == 2, packages
+          for package in packages:
+              with ZipFile(package) as archive:
+                  assert archive.testzip() is None, package
+                  assert any(name.endswith('/PS5Haptics.exe') for name in archive.namelist()), package
+              print(package.name)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage draft release
+        run: |
+          @'
+          ## 游戏音源
+
+          - 游戏场景默认「仅游戏进程」。手柄扬声器与声音转震动使用同一个游戏音源。切到桌面或浏览器时继续锁定该游戏，静音时不会切回系统混音。
+          - 可通过「设置 → 声音来源 → 锁定进程」选择窗口化游戏的 exe，也可选「系统混音」。游戏原生的手柄反馈可照常透传。
+
+          ## 稳定性
+
+          - #1 手柄读取中断时先释放输入，再尝试重连原实体手柄。
+          - #2 《影之刃零》长时间固定马达震动自动停止，新的效果可正常恢复。
+          - #3 原生手柄扬声器静默后回到当前混音策略。
+          - #4 减少 HidHide 的设备扫描。读取驱动超时时可回退到普通模式。
+          - #5 音频设备暂不可用时重新枚举并重试，运行中支持重连。
+
+          已有用户可用程序内更新或下载升级包。首次使用请下载完整包。
+          '@ | Set-Content -LiteralPath release-notes.md -Encoding utf8
+          $assets = Get-ChildItem -LiteralPath 'release-assets' -Filter '*.zip' | ForEach-Object FullName
+          gh release create v2.3.25 @assets --draft --target $env:GITHUB_SHA --title 'PS5 手柄 · 声音触感 v2.3.25' --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
