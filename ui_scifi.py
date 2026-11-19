@@ -632,7 +632,7 @@ def install_translation():
     tk.Wm.wm_title = tk.Wm.title = lambda self, string=None: wt(self, tr(string) if string else string)
 
 
-def other_fullscreen(own_hwnd=0):
+def other_fullscreen(own_hwnd=0, *, hwnd=None):
     """True while ANOTHER program is fullscreen: exclusive fullscreen (D3D), or a window whose content
     area (client rect, no title bar) covers its whole monitor - a borderless fullscreen game. A normal
     maximized window always keeps its title bar, so it never counts. The dashboard then stops drawing."""
@@ -642,7 +642,7 @@ def other_fullscreen(own_hwnd=0):
         if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(st)) == 0 and st.value == 3:
             return True                                   # QUNS_RUNNING_D3D_FULL_SCREEN (exclusive fullscreen)
         u.GetForegroundWindow.restype = ctypes.c_void_p
-        h = u.GetForegroundWindow()
+        h = hwnd if hwnd is not None else u.GetForegroundWindow()
         if not h:
             return False
         pid = ctypes.c_ulong(0); u.GetWindowThreadProcessId(ctypes.c_void_p(h), ctypes.byref(pid))
@@ -735,6 +735,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     for sc, defaults in SCENE_DEF.items():
         defaults.update(TP.scene_defaults())
         defaults['suppress_background'] = suppression_enabled({}, sc)
+        defaults['capture_exe'] = ''
+    SCENE_DEF['游戏']['capture'] = '仅游戏进程'
     saved = dict(cfg.get('scenes') or {})
     if '游戏' not in saved:                                   # first run of the scene system: keep the user's old setup
         saved['游戏'] = {k: cfg.get(k, v) for k, v in SCENE_DEF['游戏'].items()}
@@ -743,6 +745,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     for sc in SCENES:
         vals = dict(SCENE_DEF[sc]); vals.update(saved.get(sc, {}))
         vals.pop('voice_gate', None)
+        if sc == '游戏' and vals['capture'] == '自动':
+            vals['capture'] = '仅游戏进程'
         vals['suppress_background'] = suppression_enabled(cfg, sc)
         vals['speaker_mode'] = SPEAKER_MODE_ALIAS.get(vals['speaker_mode'], vals['speaker_mode'])
         if vals.get('fusion') == '仅游戏震动' and 'trigger_mode' not in saved.get(sc, {}):
@@ -804,7 +808,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         stop() if running() else start()
 
     # settings that the running engine picks up live (within 0.5 s) vs the ones that need a restart
-    RESTART_KEYS = {'button_map': '按键映射', 'mode': '连接方式', 'capture': '声音来源', 'pbz_fx': '影之刃零事件特调', 'ww_fx': '鸣潮事件特调',
+    RESTART_KEYS = {'button_map': '按键映射', 'mode': '连接方式', 'pbz_fx': '影之刃零事件特调', 'ww_fx': '鸣潮事件特调',
                     'ww_vision': '鸣潮扳机', 'ww_skill_icons': '按技能图标就绪', 'ww_skill_shadow': '鸣潮识别对照记录', 'record_native': '录制调校数据', 'foreground_exe': '指定前台游戏',
                     'pbz_log_dir': '事件日志目录'}
     live = {'job': None}
@@ -1513,7 +1517,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         ModeCards(pnl.body, sv['mode'], [(v, t, '推荐' if v == rec else '', d) for v, t, _g, d in ROUTING]).pack(fill='x', pady=(px(4), px(8)))
         steam_note(pnl.body, sv)
         if game is not None:
-            tk.Label(pnl.body, text='连接方式和声音来源在点「启动」时决定：先打开这个游戏，再点「启动」，就会用这里的设置；其他设置在游戏切到前台时自动换上。',
+            tk.Label(pnl.body, text='连接方式在点「启动」时决定；声音来源和触感设置随前台游戏切换。',
                      bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(0, px(8)))
         if sc == '游戏':
             for label, key, values, rec_v, col in (('握把', 'fusion', ('叠加', '替换', '纯用游戏'), '叠加', CYAN),
@@ -1588,10 +1592,32 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                  bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(4), 0))
         pnl = Panel(f, '声音来源', 'SOURCE', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
         fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x')
-        Segmented(fr, sv['capture'], ('自动', '系统混音'), cell=124, rec='自动').pack(side='left')
-        tk.Label(fr, text=('自动：先截已适配的游戏，其次截前台正在出声的程序' if sc == '游戏' else '自动：截当前正在出声的播放器 / 浏览器 / 音乐软件') +
-                 '（按进程截音，开着杜比全景声也能用）；系统混音：截整个系统的声音。',
-                 bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(620)).pack(side='left', padx=px(14))
+        default_capture = '仅游戏进程' if sc == '游戏' else '自动'
+        Segmented(fr, sv['capture'], (default_capture, '锁定进程', '系统混音'), cell=134, rec=default_capture).pack(side='left')
+        lock = tk.Frame(pnl.body, bg=PANEL)
+        tk.Label(lock, text='进程文件名', bg=PANEL, fg=TEXT, font=(ZH, 10)).pack(side='left')
+        tk.Entry(lock, textvariable=sv['capture_exe'], width=28, bg=PANEL2, fg=CYAN, insertbackground=CYAN,
+                 relief='flat', font=(MONO, 10)).pack(side='left', padx=px(10), ipady=px(4))
+
+        def choose_capture_exe():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(title=tr('选择游戏的 exe'), filetypes=[(tr('程序'), '*.exe')])
+            if path:
+                sv['capture_exe'].set(pathlib.Path(path).name)
+
+        NeonButton(lock, '浏览…', choose_capture_exe, w=80, h=30, size=9).pack(side='left')
+        tk.Label(pnl.body, text=('仅游戏进程：扬声器和声音震动共用游戏音源。自动识别已适配、已添加和全屏游戏；窗口化游戏也可手动锁定。'
+                                 if sc == '游戏' else '自动：优先截取正在播放的播放器、浏览器或音乐软件。'),
+                 bg=PANEL, fg=DIM, font=(ZH, 9), justify='left', anchor='w', wraplength=px(820)).pack(fill='x', pady=(px(6), 0))
+
+        def show_capture_exe(*_a):
+            if sv['capture'].get() == '锁定进程':
+                lock.pack(fill='x', pady=(px(6), 0), after=fr)
+            else:
+                lock.pack_forget()
+
+        sv['capture'].trace_add('write', show_capture_exe)
+        show_capture_exe()
         if game is None:
             mapping_panel(f)
             if sc == '游戏':
@@ -1822,6 +1848,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
         body = tk.Frame(f, bg=BG)
         vals = {k: (v.get() / 100 if k in PCT else v.get()) for k, v in SV['游戏'].items()}
         vals.update(g.get('settings') or {})
+        if vals['capture'] == '自动':
+            vals['capture'] = '仅游戏进程'
         gsv = make_vars(vals); lib['vars'][gid] = gsv
 
         def store(*_a):
@@ -2226,3 +2254,4 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     add_log('就绪。PS5 手柄请用 USB 线或 DS5Dongle 接收器（测试版）连接，然后点右上角「启动」。')
     root.after(800, lambda: check_system(auto=True))
     return root
+

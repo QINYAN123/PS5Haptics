@@ -203,6 +203,17 @@ T = [
     ('播放', 'Playback', '再生', '재생'),
     ('音色', 'Tone', '音色', '음색'),
     ('系统混音', 'System mix', 'システムミックス', '시스템 믹스'),
+    ('仅游戏进程', 'Game only', 'ゲームのみ', '게임만'),
+    ('锁定进程', 'Lock process', 'プロセス指定', '프로세스 지정'),
+    ('进程文件名', 'Process filename', 'プロセス名', '프로세스 이름'),
+    ('等待游戏进程', 'Waiting for a game', 'ゲームを待機中', '게임 대기 중'),
+    ('等待锁定进程', 'Waiting for the selected process', '指定プロセスを待機中', '지정 프로세스 대기 중'),
+    ('仅游戏进程：扬声器和声音震动共用游戏音源。自动识别已适配、已添加和全屏游戏；窗口化游戏也可手动锁定。',
+     'Game only: the speaker and audio haptics share the game audio. Supported, added and fullscreen games are detected automatically. You can lock a windowed game manually.',
+     'ゲームのみ：スピーカーと音声振動はゲーム音声を共有します。対応・登録済み・全画面のゲームを自動検出します。ウィンドウ表示のゲームは手動で指定できます。',
+     '게임만: 스피커와 오디오 진동은 게임 소리를 공유합니다. 지원·등록된 게임과 전체 화면 게임을 자동으로 감지합니다. 창 모드 게임은 직접 지정할 수 있습니다.'),
+    ('自动：优先截取正在播放的播放器、浏览器或音乐软件。', 'Auto: prefers the media app or browser currently playing audio.', '自動：再生中のプレーヤーやブラウザーの音声を優先します。', '자동: 재생 중인 플레이어, 브라우저 또는 음악 앱의 소리를 우선합니다.'),
+    ('连接方式在点「启动」时决定；声音来源和触感设置随前台游戏切换。', 'The connection mode is set at startup. The audio source and haptics follow the foreground game.', '接続方式は開始時に決まります。音源と触覚設定は前面のゲームに合わせて切り替わります。', '연결 방식은 시작할 때 결정됩니다. 오디오 소스와 햅틱은 전면 게임을 따릅니다.'),
     ('运行中', 'Running', '実行中', '실행 중'),
     ('缺少依赖：', 'Missing drivers: ', '不足しているドライバ：', '필요한 드라이버: '),
     ('出错', 'Error', 'エラー', '오류'),
@@ -768,3 +779,4 @@ def system_lang():
 def ui_font():
     """Font that has the glyphs of the current language."""
     return {'ko': 'Malgun Gothic', 'ja': 'Yu Gothic UI', 'en': 'Segoe UI'}.get(LANG, 'Microsoft YaHei UI')
+

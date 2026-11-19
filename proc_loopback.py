@@ -228,93 +228,113 @@ def find_pid(*exe_names):
 
 
 class ProcSource(threading.Thread):
-    """Feeds (process_name, samples) into a queue from the first running game in `exes` (re-checked every
-    2 s, follows restarts). .active tells the runner to ignore the endpoint loopback meanwhile."""
+    """Read one process tree and tag packets so a route change cannot play stale audio."""
 
-    def __init__(self, q, exes, log, stop_ev, players='off'):
-        """players: 'off' = only `exes`; 'foreground' = then the foreground program if it plays sound,
-        else the loudest one (games); 'loudest' = the loudest playing program (films / music)."""
+    def __init__(self, q, log, stop_ev, foreground_game):
         super().__init__(daemon=True)
-        self.q, self.exes, self.log, self.stop_ev, self.players = q, list(exes), log, stop_ev, players
-        self.active = False; self.name = ''; self.failed = set(); self.reattach = 0; self.max_gap = 0.0
+        self.q, self.log, self.stop_ev = q, log, stop_ev
+        self.foreground_game = foreground_game
+        self.request = ('mix', None)
+        self.key = None
+        self.name = ''
+        self.reattach = 0
+        self.max_gap = 0.0
         self.last_sound = 0.0
 
     def sounding(self):
-        """Per-process capture is live AND carried real sound within the last second. When it is
-        silent (e.g. a mini-game whose audio is played outside the game process), the runner
-        falls back to the system mix."""
-        return self.active and time.monotonic() - self.last_sound < 1.0
+        return self.key is not None and self.key[0] == self.request and time.monotonic() - self.last_sound < 1.0
 
-    def _pick_player(self, cur_pid, live):
-        """A playing program to capture. Sticky: keep the current one while it played recently."""
-        if cur_pid and live and time.monotonic() - self.last_sound < 5.0:
-            return cur_pid, self.name
+    def select(self, request, current, attached):
+        mode, target = request
+        if mode == 'game':
+            foreground = self.foreground_game(target)
+            return foreground or (find_pid(current[1]) if current else None)
+        if mode == 'pinned':
+            return find_pid(target) if target else None
+        if mode != 'auto':
+            return None
+        if current and attached and time.monotonic() - self.last_sound < 5.0:
+            return current
         try:
             import audio_sessions
-            lst = [x for x in audio_sessions.playing() if x[0] > 0.003]
+            return next(((pid, exe) for peak, pid, exe in audio_sessions.playing() if peak > 0.003), None)
         except Exception:
             return None
-        if not lst:
-            return None
-        if self.players == 'foreground':
-            try:
-                u = ctypes.windll.user32; u.GetForegroundWindow.restype = W.HWND
-                fpid = W.DWORD(); u.GetWindowThreadProcessId(u.GetForegroundWindow(), byref(fpid))
-                for peak, pid, exe in lst:
-                    if pid == fpid.value:
-                        return pid, exe
-            except Exception:
-                pass
-        return lst[0][1], lst[0][2]
 
     def run(self):
-        import queue as _q
-        try: comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
-        except OSError: pass
-        pl = None; pid = None; check = 0.0; last_pkt = time.monotonic()
-        while not self.stop_ev.is_set():
-            if time.monotonic() - check > 2.0:
-                check = time.monotonic()
-                found = find_pid(*self.exes) if self.exes else None
-                if not found and self.players != 'off':
-                    found = self._pick_player(pid, pl is not None)
-                new = found[0] if found else None
-                if new != pid or (pl is None and new):
-                    if pl is not None:
-                        pl.close(); pl = None
-                    pid = new; self.active = False
-                    if pid:
+        import queue
+        initialized = False
+        stream = current = request = None
+        retry_at = check_at = last_packet = 0.0
+        failed = None
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            initialized = True
+            while not self.stop_ev.is_set():
+                now = time.monotonic()
+                wanted = self.request
+                if wanted != request or now >= check_at:
+                    found = self.select(wanted, current if wanted == request else None, stream is not None)
+                    check_at = now + (0.35 if wanted[0] == 'game' else 1.0)
+                    if found != current or wanted != request:
+                        self.key = None
+                        self.last_sound = 0.0
+                        self.name = ''
+                        if stream is not None:
+                            stream.close()
+                            stream = None
+                        current, request = found, wanted
+                        retry_at = 0.0
+                    if stream is None and current and now >= retry_at:
+                        pid, exe = current
+                        retry_at = now + 1.5
                         try:
-                            pl = ProcessLoopback(pid); self.active = True; self.name = found[1]
-                            if pid != getattr(self, 'logged', None):     # re-attaches after alt-tab stay quiet
-                                self.logged = pid
-                                self.log(f'按进程截音：{found[1]}（杜比全景声 / 空间音效开着也能截到）')
-                            self.failed.discard(pid)
-                        except Exception as exc:           # retried every 2 s; logged once per pid
-                            if pid not in self.failed:
-                                self.log('按进程截音失败，暂用系统混音，会自动重试：' + str(exc))
-                            self.failed.add(pid)
-            if pl is None:
-                self.stop_ev.wait(0.2); continue
-            try:
-                x = pl.read(20)
-            except Exception as exc:                       # game exited / session gone
-                self.log('游戏进程音频中断：' + str(exc)); pl.close(); pl = None; pid = None; self.active = False
-                continue
-            if len(x):
-                t = time.monotonic(); self.max_gap = max(self.max_gap, t - last_pkt); last_pkt = t
-                if np.abs(x).max() > 1e-4:
-                    self.last_sound = t
-                try: self.q.put_nowait((self.name.lower(), x))
-                except _q.Full: pass
-            elif time.monotonic() - last_pkt > 1.5:
-                # alt-tab: the game recreates its audio stream and the capture silently stops delivering.
-                # Re-attach (the mix path takes over meanwhile, so nothing is lost while it reconnects)
-                pl.close(); pl = None; self.active = False; check = 0.0; last_pkt = time.monotonic()
-                self.reattach += 1
-        if pl is not None:
-            pl.close()
-        self.active = False
+                            stream = ProcessLoopback(pid)
+                            last_packet = time.monotonic()
+                            self.name = exe
+                            self.key = request, pid
+                            if self.key != getattr(self, 'logged', None):
+                                self.logged = self.key
+                                self.log(f'按进程截音：{exe}（杜比全景声 / 空间音效开着也能截到）')
+                            failed = None
+                        except Exception as exc:
+                            if current != failed:
+                                detail = '按进程截音失败，将保持静音并重试：' if request[0] in ('game', 'pinned') else '按进程截音失败，暂用系统混音，会自动重试：'
+                                self.log(detail + str(exc))
+                                failed = current
+                if stream is None:
+                    self.stop_ev.wait(0.15)
+                    continue
+                try:
+                    samples = stream.read(20)
+                except Exception as exc:
+                    self.log('游戏进程音频中断：' + str(exc))
+                    samples = ()
+                    last_packet = 0.0
+                now = time.monotonic()
+                if len(samples):
+                    self.max_gap = max(self.max_gap, now - last_packet)
+                    last_packet = now
+                    if np.abs(samples).max() > 1e-4:
+                        self.last_sound = now
+                    if self.request == request and (request[0] != 'auto' or self.sounding()):
+                        try:
+                            self.q.put_nowait((self.key, self.name.lower(), samples))
+                        except queue.Full:
+                            pass
+                elif now - last_packet > 1.5:
+                    self.key = None
+                    self.last_sound = 0.0
+                    stream.close()
+                    stream = None
+                    self.reattach += 1
+                    check_at = 0.0
+        finally:
+            self.key = None
+            if stream is not None:
+                stream.close()
+            if initialized:
+                comtypes.CoUninitialize()
 
 
 if __name__ == '__main__':
@@ -325,3 +345,4 @@ if __name__ == '__main__':
         xs.append(pl.read())
     x = np.concatenate(xs); pl.close()
     print('pid', pid, 'samples', len(x), 'peak %.4f' % (float(np.abs(x).max()) if len(x) else 0))
+

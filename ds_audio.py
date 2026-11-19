@@ -105,8 +105,8 @@ class HapticOut:
         try:
             self.dev = find_dualsense_output(self.p, name)
             if self.dev is None:
-                raise RuntimeError('没有找到 DualSense 音频设备（需要 USB 线或 DS5Dongle 接收器，普通蓝牙不行）')
-            self.lock = threading.Lock(); self.xruns = 0
+                raise LookupError('没有找到 DualSense 音频设备（需要 USB 线或 DS5Dongle 接收器，普通蓝牙不行）')
+            self.lock = threading.Lock(); self.xruns = 0; self.failure = None
             self.speaker_safety = SpeakerSafety()
             self.stream = pa_open(self.p, format=pa.paFloat32, channels=4, rate=RATE, output=True,
                                   output_device_index=self.dev['index'], frames_per_buffer=960)
@@ -127,13 +127,17 @@ class HapticOut:
         buf[:, 3] = np.clip(right, -1, 1)
         try:
             self.stream.write(buf.tobytes(), exception_on_underflow=True)
-        except IOError:
-            self.xruns += 1                     # output ran dry before this block: an audible gap
+        except OSError as exc:
+            if exc.errno == pa.paOutputUnderflowed:
+                self.xruns += 1
+            else:
+                self.failure = exc
 
     def close(self):
         if self.stream is not None:
             try:
-                self.feed(np.zeros(2400, np.float32), np.zeros(2400, np.float32))
+                if self.failure is None:
+                    self.feed(np.zeros(2400, np.float32), np.zeros(2400, np.float32))
             except Exception:
                 pass
             close_stream(self.stream)
@@ -170,3 +174,4 @@ def test_burst():
 
 if __name__ == '__main__':
     print('played on', test_burst())
+

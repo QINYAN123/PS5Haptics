@@ -565,7 +565,10 @@ def test_stuck_guard():
     assert g.trigger('R', bow, 3.6) == bow and g.trigger('R', bow, 60.0) == bow   # resistance may stay forever
     assert g.trigger('R', vib, 61.0) == vib                             # a new vibration works again
     assert g.motors(80, 40, 0.0) == (80, 40) and g.motors(80, 40, 6.0) == (0, 0)
-    assert g.motors(90, 40, 6.1) == (90, 40)                            # values change: the game is driving it
+    assert g.motors(90, 40, 6.1, A.PBZ_STUCK_MOTOR_S) == (90, 40)
+    assert g.motors(90, 40, 8.7, A.PBZ_STUCK_MOTOR_S) == (0, 0)
+    assert g.motors(0, 0, 9.0, A.PBZ_STUCK_MOTOR_S) == (0, 0)
+    assert g.motors(90, 40, 9.1, A.PBZ_STUCK_MOTOR_S) == (90, 40)                            # values change: the game is driving it
     step = A.HOP / A.RATE
     t = 100.0
     phase = 2 * np.pi * 97 * np.arange(A.HOP) / A.RATE
@@ -664,6 +667,7 @@ def test_silent_source_releases_audio_triggers(scene="游戏", suppress=False):
     hid.buttons.drain.return_value = ()
     engine.process.side_effect = lambda l, r, _: (l, r, (float(l.max()), float(r.max())))
     output.dev = {'name': 'test pad'}
+    output.failure = None
     src = {'name': 'loop', 'defaultSampleRate': app.RATE, 'maxInputChannels': 2}
     with TemporaryDirectory() as tmp, ExitStack() as ctx:
         for name, value in [('rescan', Mock()), ('foreground_window', lambda: 1), ('foreground_exe', lambda *_: ''),
@@ -702,7 +706,7 @@ def test_audio_reset_and_failed_start_cleanup():
                 raise AssertionError('simulated device loss must fail the open')
         end.assert_called_once_with(backend)
 
-    runner = app.Runner(dict(app.DEFAULTS), lambda _: None)
+    runner = app.Runner(dict(app.DEFAULTS, capture='系统混音'), lambda _: None)
     stream, reopened, src = Mock(), Mock(), {'name': 'loop', 'defaultSampleRate': 48000, 'maxInputChannels': 2}
     stream.is_active.side_effect = stream.stop_stream.side_effect = OSError('disconnected')
     with patch.object(runner, '_open_stream', side_effect=[OSError('still unavailable'), reopened]):
@@ -710,6 +714,18 @@ def test_audio_reset_and_failed_start_cleanup():
         assert runner._refresh_stream(None, backend, src) is reopened
         assert runner._refresh_stream(reopened, backend, src) is reopened
     stream.close.assert_called_once()
+
+    tracked = [Mock(), Mock()]
+    recovered_out = Mock()
+    with patch.object(runner, '_open_loopback', side_effect=[(backend, src, t) for t in tracked]), \
+            patch.object(app, 'HapticOut', side_effect=[OSError(-9996, 'Invalid device'), recovered_out]), \
+            patch.object(app, 'rescan') as rescan, patch.object(app, 'pa_end') as end, \
+            patch.object(runner.stop_ev, 'wait'):
+        assert runner._open_audio() == (backend, src, tracked[1], recovered_out)
+        assert rescan.call_count == 2
+        tracked[0].close.assert_called_once()
+        tracked[1].close.assert_not_called()
+        end.assert_called_once_with(backend)
 
     with TemporaryDirectory() as tmp, patch.object(app, 'ROOT', Path(tmp)), \
             patch.object(app, 'foreground_exe', return_value=''), patch.object(app, 'rescan'), \
@@ -719,6 +735,115 @@ def test_audio_reset_and_failed_start_cleanup():
         assert runner.stop_ev.is_set()
         reopened.close.assert_called_once()
         end.assert_called_once_with(backend)
+
+
+def test_speaker_route_recovers_after_native_audio_goes_quiet():
+    from ps5_haptics_app import speaker_route
+
+    assert speaker_route('特殊事件', False, False, True, False) == '游戏原生'
+    assert speaker_route('特殊事件', False, False, False, False) == '全部游戏声'
+    assert speaker_route('特殊事件', False, False, False, True) == '游戏接管'
+    assert speaker_route('特殊事件', True, False, False, False) == '静默'
+    assert speaker_route('特殊事件', False, True, False, False) == '特殊事件'
+    assert speaker_route('游戏原生', False, False, False, False) == '游戏原生'
+
+
+def test_game_capture_never_falls_back_to_system_mix():
+    from unittest.mock import Mock, patch
+    import ps5_haptics_app as app
+
+    runner = app.Runner({'scene': '游戏', 'capture': '自动'}, lambda _: None)
+    assert runner.capture_locked and not runner._allow_system_mix()
+    assert app.capture_request({'scene': '音乐', 'capture': '自动'}) == ('auto', None)
+    assert app.capture_request(dict(capture='锁定进程', capture_exe='C:/Games/GAME.EXE')) == ('pinned', 'game.exe')
+    with patch.object(app, 'rescan'), patch.object(app, 'pa_new', return_value='backend'), \
+            patch.object(app, 'HapticOut', return_value='haptics'), patch.object(runner, '_open_loopback') as loopback:
+        backend, source, stream, output = runner._open_audio()
+        assert (backend, source['maxInputChannels'], stream, output) == ('backend', 2, None, 'haptics')
+        loopback.assert_not_called()
+
+    runner.capture = ('pinned', 'game.exe')
+    runner.proc = Mock()
+    runner.proc.sounding.return_value = False
+    assert not runner._allow_system_mix()
+    runner.capture = ('mix', None)
+    assert runner._allow_system_mix()
+
+
+def test_game_process_sticks_across_alt_tab_and_tracks_new_game():
+    from unittest.mock import Mock, patch
+    import queue, threading
+    import proc_loopback as plb
+
+    first = (100, 'game.exe')
+    next_game = (200, 'next.exe')
+    foreground = Mock(side_effect=[first, None, next_game, None])
+    proc = plb.ProcSource(queue.Queue(), lambda _: None, threading.Event(), foreground)
+    request = ('game', ('game.exe', 'next.exe'))
+    with patch.object(plb, 'find_pid', side_effect=[first, None, next_game]) as find:
+        assert proc.select(request, None, False) == first
+        assert proc.select(request, first, True) == first
+        assert proc.select(request, first, True) == next_game
+        assert proc.select(request, next_game, True) is None
+        assert proc.select(('pinned', 'next.exe'), None, False) == next_game
+        assert proc.select(('pinned', ''), None, False) is None
+        assert [args[0][0] for args in find.call_args_list] == ['game.exe', 'next.exe', 'next.exe']
+
+
+def test_hid_reader_reconnects_same_path_and_releases_input():
+    from unittest.mock import Mock, patch
+    import ds_hid
+
+    original = Mock()
+    original.read.side_effect = OSError('read error')
+    replacement = Mock()
+    report = bytearray(ds_hid.NEUTRAL_INPUT)
+    report[5] = 120
+    replacement.read.side_effect = [[], report]
+    received = []
+
+    def forward(data):
+        received.append(data)
+        if data[5]:
+            controller.reader_stop.set()
+
+    with patch.object(ds_hid, 'find_path', return_value=(b'physical', 0x0DF2)), \
+            patch.object(ds_hid.hid, 'device', side_effect=[original, replacement]):
+        controller = ds_hid.DualSenseHID()
+        controller.start_reader(forward)
+        controller.reader.join(3)
+        assert not controller.reader.is_alive()
+        assert received == [ds_hid.NEUTRAL_INPUT, bytes(report)]
+        assert controller.read_error is None and controller.l2 == 120
+        replacement.open_path.assert_called_once_with(b'physical')
+        original.close.assert_called_once()
+        controller.close()
+
+
+def test_hidhide_uses_opened_pad_before_broad_discovery():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from unittest.mock import Mock, patch
+    import ds_hid
+    from takeover import Isolation, collection_paths
+
+    prefix = r'\\?\hid#vid_054c&pid_0df2&mi_03&col'
+    pad = prefix + r'01#8&aaaa&0&0000#{guid}'
+    sibling = prefix + r'02#8&aaaa&0&0001#{guid}'
+    other = prefix + r'01#8&bbbb&0&0000#{guid}'
+    rows = [{'path': path.encode()} for path in (pad, sibling, other)]
+    assert len(collection_paths(pad, rows)) == 2
+    iso = Isolation.__new__(Isolation)
+    iso.cli = Path(__file__)
+    iso.log = Mock()
+    iso.receipt = None
+    iso.hh = Mock(side_effect=['--cloak-off', ''])
+    with TemporaryDirectory() as tmp, patch.object(ds_hid.hid, 'enumerate', return_value=rows):
+        iso.path = Path(tmp) / 'receipt.json'
+        iso.open(pad)
+        assert len(iso.receipt['devices']) == 2
+        assert all('aaaa' in item for item in iso.receipt['devices'])
+        assert all('--dev-gaming' not in call.args for call in iso.hh.call_args_list)
 
 
 def test_volume():
@@ -870,6 +995,11 @@ if __name__ == '__main__':
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()
     test_audio_reset_and_failed_start_cleanup()
+    test_speaker_route_recovers_after_native_audio_goes_quiet()
+    test_game_capture_never_falls_back_to_system_mix()
+    test_game_process_sticks_across_alt_tab_and_tracks_new_game()
+    test_hid_reader_reconnects_same_path_and_releases_input()
+    test_hidhide_uses_opened_pad_before_broad_discovery()
     test_equal_peak_wave_changes()
     test_native_motor_mode_switch()
     test_hidhide_output(); test_instance_path(); test_mapping(); test_battery(); test_controls(); test_input_filter(); test_pad_commands(); test_volume(); test_game_caps(); test_edge_is_found(); test_tap_buffer(); test_fuse_modes(); test_presets(); test_next_step(); test_voice_gate(); test_fine_profile(); test_hidhide_inverse(); test_receiver_paths(); test_trigger_presets(); test_selfcheck_report(); test_game_profiles(); test_steam_app_for(); test_notes_url(); test_deps_checks(); test_stuck_guard()
@@ -877,3 +1007,4 @@ if __name__ == '__main__':
     if '--live' in sys.argv:
         test_live()
         print('live test ok')
+

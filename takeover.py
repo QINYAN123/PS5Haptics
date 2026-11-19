@@ -234,9 +234,19 @@ def collection_paths(pad_path, rows):
     own = instance_path(pad_path)
     if not own:
         return []
-    base = lambda p: re.sub(r'&COL[0-9A-F]+', '', p.split('\\')[1], flags=re.I).upper()
-    found = [p for p in (instance_path(r.get('path')) for r in rows) if p and base(p) == base(own)]
-    return found if own in found else found + [own]
+    def collection_key(path):
+        _, interface, instance = path.lower().split('\\')
+        base = re.sub(r'&col[0-9a-f]+$', '', interface)
+        parent = instance.rsplit('&', 1)[0] if base != interface else instance
+        return base, parent
+
+    found = [p for p in (instance_path(r.get('path')) for r in rows)
+             if p and collection_key(p) == collection_key(own)]
+    return list(dict.fromkeys([*found, own]))
+
+
+class IsolationUnavailable(RuntimeError):
+    """The driver could not be queried before making any changes."""
 
 
 class Isolation:
@@ -257,7 +267,7 @@ class Isolation:
                 break
             except subprocess.TimeoutExpired:
                 if attempt == 3:
-                    raise RuntimeError('HidHide 没有响应（重试 4 次）')
+                    raise TimeoutError('HidHide 命令没有响应：' + ', '.join(arg for arg in args if arg.startswith('--')))
         out = _decode_cli(r.stdout); err = _decode_cli(r.stderr)
         if r.returncode:
             raise RuntimeError('HidHide 命令失败：' + (err or out).strip()[:200])
@@ -274,14 +284,16 @@ class Isolation:
                 self.path.unlink(missing_ok=True)
         if not self.cli.exists():
             raise RuntimeError('没有安装 HidHide，无法接管')
-        before = self.hh('--inv-state', '--cloak-state', '--dev-list', '--app-list')
-        inverse = '--inv-on' in before                               # listed apps are blocked, everything else sees the pad
-        devs = gaming_pad_paths(self.hh('--dev-gaming'))             # HidHide's own device list: fast
+        try:
+            before = self.hh('--inv-state', '--cloak-state', '--dev-list', '--app-list')
+        except TimeoutError as exc:
+            raise IsolationUnavailable(str(exc)) from exc
+        inverse = '--inv-on' in before
         import hid
         from ds_hid import VID, is_bluetooth
-        for own_path in collection_paths(pad_path, hid.enumerate(VID, 0)):
-            if own_path.lower() not in (d.lower() for d in devs):
-                devs.append(own_path)
+        devs = collection_paths(pad_path, hid.enumerate(VID, 0)) if pad_path else []
+        if not devs and not pad_path:
+            devs = gaming_pad_paths(self.hh('--dev-gaming'))
         if not any(d.upper().startswith('HID\\') for d in devs):
             self.log('HID path: ' + repr(pad_path))              # for bug reports: the receiver's real path
             if pad_path and is_bluetooth(pad_path):
@@ -392,3 +404,4 @@ def fuse(audio_l, audio_r, rum_l, rum_r, level, mode, duck_depth=0.5):
         duck = 1.0 - duck_depth * min(1.0, level * 2)
         l, r = audio_l * duck + rum_l, audio_r * duck + rum_r
     return np.tanh(l).astype(np.float32), np.tanh(r).astype(np.float32)
+
