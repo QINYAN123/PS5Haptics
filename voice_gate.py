@@ -3,11 +3,13 @@
 Only a clean voice closes the gate: the detector's confidence collapses as soon as other sounds cover the
 voice, and any big sudden sound reopens it at once, so fights with talking in them stay as they are.
 """
+import math
 import pathlib
 import sys
 
 import numpy as np
-from scipy.signal import butter, sosfilt, sosfilt_zi
+from scipy.signal import butter
+from haptic_dsp import FastSOS, HOP
 
 ROOT = pathlib.Path(getattr(sys, '_MEIPASS', pathlib.Path(__file__).resolve().parent))   # the packaged app carries the model inside
 RATE = 48000
@@ -37,15 +39,30 @@ class VoiceDetector:
         import onnxruntime as ort
         so = ort.SessionOptions(); so.intra_op_num_threads = 1; so.inter_op_num_threads = 1
         self.sess = ort.InferenceSession(str(model or ROOT / 'models' / 'silero_vad.onnx'), so, providers=['CPUExecutionProvider'])
-        self.sos = butter(6, 7000, 'lowpass', fs=RATE, output='sos'); self.z = sosfilt_zi(self.sos) * 0.0
+        self.flt = FastSOS(butter(6, 7000, 'lowpass', fs=RATE, output='sos'))
         self.phase = 0; self.buf = np.zeros(0, np.float32); self.ctx = np.zeros(CONTEXT, np.float32)
         self.state = np.zeros((2, 1, 128), np.float32); self.sr = np.array(16000, np.int64)
         self.prob = 0.0
+        self._silent_hops = 0
 
-    def feed(self, mono):
-        y, self.z = sosfilt(self.sos, mono, zi=self.z)
+    def feed(self, mono, block_peak=None):
+        n = len(mono)
+        if block_peak is None:
+            block_peak = float(np.max(np.abs(mono))) if n else 0.0
+        if block_peak < 1e-8 and not self.flt.active:
+            self._silent_hops += 1
+            if self._silent_hops >= 6:
+                # Sustained digital silence: drain complete, keep phase aligned and reset VAD once cleanly.
+                if self._silent_hops == 6:
+                    self.ctx.fill(0.0); self.buf = np.zeros(0, np.float32)
+                    self.state.fill(0.0); self.prob = 0.0
+                self.phase = (self.phase - n) % 3
+                return self.prob
+        else:
+            self._silent_hops = 0
+        y = self.flt.step(mono, block_peak)
         y = y[self.phase::3].astype(np.float32)             # 48 -> 16 kHz
-        self.phase = (self.phase - len(mono)) % 3
+        self.phase = (self.phase - n) % 3
         self.buf = np.concatenate([self.buf, y])
         while len(self.buf) >= WINDOW:
             w = self.buf[:WINDOW]; self.buf = self.buf[WINDOW:]
@@ -77,15 +94,27 @@ class VoiceGate:
         self.det = detector or VoiceDetector()
         self.count = 0; self.hold = 0; self.closed = False; self.g = 1.0; self.block = 0
         self.age = 0; self.peak = 0.0; self.low_peak = 0.0; self.high_peak = 0.0
-        self.sos_low = butter(2, 120, 'lowpass', fs=RATE, output='sos'); self.z_low = sosfilt_zi(self.sos_low) * 0.0
-        self.sos_high = butter(2, 5000, 'highpass', fs=RATE, output='sos'); self.z_high = sosfilt_zi(self.sos_high) * 0.0
+        self.flt_low = FastSOS(butter(2, 120, 'lowpass', fs=RATE, output='sos'))
+        self.flt_high = FastSOS(butter(2, 5000, 'highpass', fs=RATE, output='sos'))
+        self._zero_mono = np.zeros(HOP, dtype=np.float64)
+        self._zero_mono.setflags(write=False)
+        self._has_peak_det = hasattr(self.det, '_silent_hops')
 
     def gain(self, left, right, impact=0.0):
-        mono = (np.asarray(left, np.float64) + np.asarray(right, np.float64)) * 0.5
-        p = self.det.feed(mono)
-        lo, self.z_low = sosfilt(self.sos_low, mono, zi=self.z_low)
-        hi, self.z_high = sosfilt(self.sos_high, mono, zi=self.z_high)
-        level = float(np.sqrt(np.mean(mono * mono))); low = float(np.sqrt(np.mean(lo * lo))); high = float(np.sqrt(np.mean(hi * hi)))
+        n = len(left)
+        pk = max(float(np.max(np.abs(left))), float(np.max(np.abs(right)))) if n else 0.0
+        if pk < 1e-8 and not self.flt_low.active and not self.flt_high.active:
+            mono = self._zero_mono if n == HOP else np.zeros(n, dtype=np.float64)
+            p = self.det.feed(mono, pk) if self._has_peak_det else self.det.feed(mono)
+            level = low = high = 0.0
+        else:
+            mono = (np.asarray(left, np.float64) + np.asarray(right, np.float64)) * 0.5
+            p = self.det.feed(mono, pk) if self._has_peak_det else self.det.feed(mono)
+            lo = self.flt_low.step(mono, pk)
+            hi = self.flt_high.step(mono, pk)
+            level = math.sqrt(float(np.dot(mono, mono)) / n) if n else 0.0
+            low = math.sqrt(float(np.dot(lo, lo)) / n) if n else 0.0
+            high = math.sqrt(float(np.dot(hi, hi)) / n) if n else 0.0
         if self.closed and self.age >= self.LEARN and (level > self.peak * self.OVER or low > max(self.low_peak, 0.003) * self.LOW_OVER
                                                        or high > max(self.high_peak, 0.003) * self.HIGH_OVER):
             self.closed = False; self.hold = 0; self.count = 0; self.block = self.REOPEN
@@ -121,6 +150,25 @@ class GameSoundGate:
         self.level = 0.0
 
     def gain(self, left, right, attack=False):
+        pk = max(float(np.max(np.abs(left))), float(np.max(np.abs(right)))) if len(left) else 0.0
+        if pk < 1e-8:
+            # Below -160 dBFS, every FFT bin is far below 0.0008, so novel hits are guaranteed 0.
+            if not (attack and self.hold) and self.level > 0.0 or self.age < 6 or float(np.max(self.background)) >= 1e-7:
+                if not (attack and self.hold):
+                    self.background *= 0.996
+                self.previous.fill(0.0)
+            else:
+                self.background.fill(0.0)
+                self.previous.fill(0.0)
+            self.age += 1
+            if self.hold:
+                self.hold -= 1
+                self.level = 1.0
+            else:
+                self.level *= 0.72
+                if self.level < 0.01:
+                    self.level = 0.0
+            return self.level
         # Keep stereo energy: wide effects can cancel if mixed to mono first.
         spectrum = np.abs(np.fft.rfft(np.asarray((left, right)) * self.window, axis=1))
         bins = spectrum[:, 1:121].max(axis=0)

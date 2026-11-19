@@ -1,6 +1,7 @@
 import time, unittest
 import numpy as np
-from haptic_dsp import HapticEngine, HOP, RATE
+from scipy.signal import butter, sosfilt, sosfilt_zi
+from haptic_dsp import FastSOS, HapticEngine, RawSpeaker, HOP, RATE
 
 rng = np.random.default_rng(1)
 
@@ -58,6 +59,39 @@ class DSPTests(unittest.TestCase):
     def test_silence_is_silent(self):
         o, t, _ = run(HapticEngine(), np.zeros(5 * RATE, np.float32))
         self.assertEqual(float(o.max()), 0.0); self.assertEqual(float(t.max()), 0.0)
+
+    def test_fast_sos_matches_scipy_and_settles(self):
+        sos = butter(2, (70, 320), 'bandpass', fs=RATE, output='sos')
+        flt = FastSOS(sos, block_len=HOP)
+        zi = sosfilt_zi(sos) * 0.0
+        sig = np.concatenate([
+            impacts(0.5),
+            np.zeros(4 * RATE, np.float32),
+            impacts(0.2)[:137],
+        ])
+        pos = 0
+        sizes = [HOP] * ((len(sig) - 137) // HOP) + [137]
+        for sz in sizes:
+            blk = sig[pos:pos + sz]; pos += sz
+            ref, zi = sosfilt(sos, blk.astype(np.float64), zi=zi)
+            got = flt.step(blk)
+            np.testing.assert_allclose(got, ref, atol=1e-11, rtol=1e-11)
+        self.assertTrue(flt.active)
+
+    def test_fine_engine_idle_and_wakeup(self):
+        eng = HapticEngine('细腻', '均衡冲击', style='标准')
+        spk = RawSpeaker()
+        z = np.zeros(HOP, np.float32)
+        for _ in range(30):
+            wl, wr, tg = eng.process(z, z)
+            spk.analyse(z, z)
+        self.assertTrue(eng._idle)
+        self.assertEqual(float(np.abs(wl).max()), 0.0)
+        self.assertEqual(float(np.abs(spk.render('原味', 0.8)).max()), 0.0)
+        hit = (0.8 * rng.standard_normal(HOP)).astype(np.float32)
+        wl, wr, tg = eng.process(hit, hit)
+        self.assertFalse(eng._idle)
+        self.assertGreater(float(np.abs(wl).max()), 0.05)
 
 
 if __name__ == '__main__':

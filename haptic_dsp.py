@@ -19,10 +19,54 @@ import numpy as np
 from scipy.ndimage import median_filter
 from scipy.signal import lfilter, butter, sosfilt, sosfilt_zi
 
+try:
+    from scipy.signal._sosfilt import _sosfilt as _c_sosfilt
+except ImportError:
+    _c_sosfilt = None
+
 RATE = 48000
 HOP = 480            # 10 ms (was 5 ms: half the per-block work, latency +5 ms)
 NFFT = 1024
 BIN_HZ = RATE / NFFT
+
+
+class FastSOS:
+    """Stateful second-order-section IIR filter bypassing Python wrapper overhead and denormal stalls."""
+
+    def __init__(self, sos, block_len=HOP):
+        self.sos = np.ascontiguousarray(sos, dtype=np.float64)
+        self.z3 = np.zeros((1, self.sos.shape[0], 2), dtype=np.float64)
+        self._buf = np.empty((1, block_len), dtype=np.float64)
+        self._zeros = np.zeros(block_len, dtype=np.float64)
+        self._zeros.setflags(write=False)
+        self.active = False
+
+    def reset(self):
+        self.z3.fill(0.0)
+        self.active = False
+
+    def step(self, x, block_peak=None):
+        n = len(x)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        if block_peak is None:
+            block_peak = float(np.max(np.abs(x)))
+        if block_peak < 1e-8 and not self.active:
+            return self._zeros if n == len(self._zeros) else np.zeros(n, dtype=np.float64)
+        if _c_sosfilt is None:
+            y, zi = sosfilt(self.sos, np.asarray(x, dtype=np.float64), zi=self.z3[0])
+            self.z3[0] = zi
+        else:
+            buf = self._buf if n == self._buf.shape[1] else np.empty((1, n), dtype=np.float64)
+            np.copyto(buf[0], x, casting='unsafe')
+            _c_sosfilt(self.sos, buf, self.z3)
+            y = buf[0].copy()
+        if block_peak >= 1e-8:
+            self.active = True
+        elif float(np.abs(self.z3).max()) < 1e-12:
+            self.z3.fill(0.0)
+            self.active = False
+        return y
 
 # bands: (low Hz, high Hz, threshold dB, gain dB, release ms, carrier Hz)
 # floor_pct / floor_ms: how fast the sustain floor tracks; span_hz: broadband median width;
@@ -65,23 +109,42 @@ class AutoGain:
     """Slow level steering: 8 s history, 97.5th percentile -> target; cuts 15x faster than it boosts."""
 
     def __init__(self, target_db=-14.0, max_boost=18.0, max_cut=12.0, rise_db_s=0.6):
-        self.hist = collections.deque(maxlen=int(8 * RATE / HOP))
+        maxlen = int(8 * RATE / HOP)
+        self.hist = collections.deque(maxlen=maxlen)
         self.gain_db = 0.0
         self.target = target_db; self.max_boost = max_boost; self.max_cut = max_cut; self.rise = rise_db_s
+        self._buf = np.empty(maxlen, dtype=np.float64)
+        self._maxlen = maxlen
+        self._idx = 0
+        self._count = 0
+        self._dirty = 0
+        self._peak = -90.0
+        self._gain = 1.0
 
     def update(self, level_db):
         if level_db > -90:
             self.hist.append(level_db)
-        if len(self.hist) < 40:
-            return 10 ** (self.gain_db / 20)
-        peak = float(np.percentile(np.fromiter(self.hist, float), 97.5))
-        want = max(-self.max_cut, min(self.max_boost, self.target - peak))
+            self._buf[self._idx] = level_db
+            self._idx = (self._idx + 1) % self._maxlen
+            if self._count < self._maxlen:
+                self._count += 1
+            self._dirty += 1
+        if self._count < 40:
+            return self._gain
+        if self._dirty >= 8 or self._peak <= -90.0:
+            view = self._buf[:self._count] if self._count < self._maxlen else self._buf
+            self._peak = float(np.percentile(view, 97.5))
+            self._dirty = 0
+        want = max(-self.max_cut, min(self.max_boost, self.target - self._peak))
+        if abs(want - self.gain_db) < 1e-9:
+            return self._gain
         step = self.rise * HOP / RATE
         if want < self.gain_db:
             self.gain_db = max(want, self.gain_db - 15 * step)
         else:
             self.gain_db = min(want, self.gain_db + step)
-        return 10 ** (self.gain_db / 20)
+        self._gain = 10 ** (self.gain_db / 20)
+        return self._gain
 
 
 class STFT:
@@ -90,10 +153,32 @@ class STFT:
     def __init__(self):
         self.win = np.hanning(NFFT).astype(np.float32)
         self.buf = np.zeros(NFFT, np.float32)
+        self._wbuf = np.empty(NFFT, np.float32)
+        self._scale = np.float32(1.0 / (NFFT / 4))
+        self._zero_mag = np.zeros(NFFT // 2 + 1, np.float32)
+        self._zero_mag.setflags(write=False)
+        self._tail_hops = 0
 
-    def step(self, block):
-        self.buf = np.concatenate([self.buf[len(block):], block])
-        return np.abs(np.fft.rfft(self.buf * self.win)) / (NFFT / 4)
+    def step(self, block, block_peak=None):
+        n = len(block)
+        if block_peak is None:
+            block_peak = float(np.max(np.abs(block))) if n else 0.0
+        if block_peak >= 1e-8:
+            self._tail_hops = (NFFT + HOP - 1) // HOP + 1
+        elif self._tail_hops > 0:
+            self._tail_hops -= 1
+            if self._tail_hops == 0:
+                self.buf.fill(0.0)
+                return self._zero_mag
+        else:
+            return self._zero_mag
+        if n < NFFT:
+            self.buf[:-n] = self.buf[n:]
+            self.buf[-n:] = block
+        else:
+            self.buf[:] = block[-NFFT:]
+        np.multiply(self.buf, self.win, out=self._wbuf)
+        return np.abs(np.fft.rfft(self._wbuf)) * self._scale
 
 
 class SideAnalyzer:
@@ -113,29 +198,54 @@ class SideAnalyzer:
         self.lock = 0
         self.span = max(1, int(round(prof['span_hz'] / BIN_HZ))) | 1
         self.flux_lo = int(1500 / BIN_HZ); self.flux_hi = int(11000 / BIN_HZ)
+        self._zero_spec = np.zeros(NFFT // 2 + 1, dtype=np.float64)
+        self._zero_spec.setflags(write=False)
+        self._enhance_decay = math.exp(-HOP / RATE / 0.025)
 
-    def step(self, mag, P=None):
+    def settled(self):
+        return (self.H is None or float(np.max(self.H)) < 1e-9) and self.enhance < 1e-7 and self.lock == 0
+
+    def step(self, mag, P=None, is_zero=False):
+        if is_zero and self.settled():
+            if self.H is None:
+                self.H = np.zeros_like(mag, dtype=np.float64)
+            else:
+                self.H.fill(0.0)
+            self.enhance = 0.0
+            if self.prev_log is not None:
+                self.prev_log.fill(0.0)
+            self.flux_hist.append(0.0)
+            return self._zero_spec
         if self.H is None:
             self.H = mag.copy()
         d = mag - self.H
         self.H += np.where(d > 0, self.rise, self.fall) * d
         H = self.H
-        if P is None:
-            P = median_filter(mag, size=self.span, mode='nearest')
-        mask = P ** 2 / (H ** 2 + P ** 2 + 1e-12)
-        mask = np.maximum(mask, self.p['mask_floor']) * (mag > H)  # keep only energy above the sustained floor
-        perc = mag * mask
-        # onset (spectral flux, 1.5-11 kHz) -> short accent
-        logm = np.log1p(mag[self.flux_lo:self.flux_hi] * 100)
-        flux = float(np.sum(np.maximum(0, logm - self.prev_log))) if self.prev_log is not None else 0.0
-        self.prev_log = logm
+        if is_zero:
+            perc = self._zero_spec
+            flux = 0.0
+            if self.prev_log is not None:
+                self.prev_log.fill(0.0)
+        else:
+            if P is None:
+                P = median_filter(mag, size=self.span, mode='nearest')
+            mask = P ** 2 / (H ** 2 + P ** 2 + 1e-12)
+            mask = np.maximum(mask, self.p['mask_floor']) * (mag > H)  # keep only energy above the sustained floor
+            perc = mag * mask
+            # onset (spectral flux, 1.5-11 kHz) -> short accent
+            logm = np.log1p(mag[self.flux_lo:self.flux_hi] * 100)
+            flux = float(np.sum(np.maximum(0, logm - self.prev_log))) if self.prev_log is not None else 0.0
+            self.prev_log = logm
         self.flux_hist.append(flux)
-        med = float(np.median(self.flux_hist)) + 1e-6
-        self.enhance *= math.exp(-HOP / RATE / 0.025)
+        self.enhance *= self._enhance_decay
         if self.lock > 0:
             self.lock -= 1
-        elif flux / med > self.p['onset'] and flux > 0.5:
-            self.enhance = 1.0; self.lock = int(0.035 * RATE / HOP)
+        elif flux > 0.5:
+            med = float(np.median(self.flux_hist)) + 1e-6
+            if flux / med > self.p['onset']:
+                self.enhance = 1.0; self.lock = int(0.035 * RATE / HOP)
+        if perc is self._zero_spec:
+            return perc
         boost = 10 ** (self.p['accent_db'] * self.enhance / 20)
         return perc * boost
 
@@ -148,11 +258,24 @@ class BandMapper:
         self.idx = [(int(lo / BIN_HZ), max(int(lo / BIN_HZ) + 1, int(hi / BIN_HZ))) for lo, hi, *_ in bands]
         self.env = np.zeros(len(bands))
         self.rel = np.array([math.exp(-HOP / RATE / (b[4] / 1000)) for b in bands])
+        self._zeros = np.zeros(len(bands), dtype=np.float64)
+        self._zeros.setflags(write=False)
 
-    def step(self, spec, gain):
-        out = np.zeros(len(self.bands))
+    def settled(self):
+        return float(np.max(self.env)) < 1e-7
+
+    def step(self, spec, gain, is_zero=False):
+        if is_zero:
+            if float(np.max(self.env)) < 1e-7:
+                self.env.fill(0.0)
+                return self._zeros
+            self.env *= self.rel
+            return self.env.copy()
+        out = np.empty(len(self.bands), dtype=np.float64)
         for i, ((a, b), (lo, hi, thr, gdb, rel_ms, car)) in enumerate(zip(self.idx, self.bands)):
-            level = _db(np.sqrt(np.mean(spec[a:b] ** 2)) * gain)
+            sl = spec[a:b]
+            rms = math.sqrt(float(np.dot(sl, sl)) / (b - a)) * gain
+            level = 20.0 * math.log10(rms if rms > 1e-9 else 1e-9)
             over = level - thr
             target = 0.0 if over <= 0 else min(1.0, 10 ** ((over + gdb - 30) / 20))
             self.env[i] = target if target > self.env[i] else max(target, self.env[i] * self.rel[i])
@@ -179,9 +302,8 @@ class Groove:
         style = STYLE_ALIAS.get(style, style); self.style = style
         g = gains or {}                                    # user gains from the mode card's settings (1.0 = default)
         self.g_kick = g.get('kick', 1.0); self.g_tick = g.get('tick', 1.0); self.g_rumble = g.get('rumble', 1.0); self.g_trig = g.get('trigger', 1.0)
-        self.sos_low = butter(2, (35, 150) if style == '音乐' else (25, 150), 'bandpass', fs=RATE, output='sos')
-        self.sos_hi = butter(2, (2500, 8000), 'bandpass', fs=RATE, output='sos')
-        self.zl = sosfilt_zi(self.sos_low) * 0.0; self.zh = sosfilt_zi(self.sos_hi) * 0.0
+        self.flt_low = FastSOS(butter(2, (35, 150) if style == '音乐' else (25, 150), 'bandpass', fs=RATE, output='sos'))
+        self.flt_hi = FastSOS(butter(2, (2500, 8000), 'bandpass', fs=RATE, output='sos'))
         self.fast = [0.0, 0.0]; self.slow = [1e-4, 1e-4]; self.peak = [1e-3, 1e-3]
         self.kick = 0.0; self.tick = 0.0; self.rumble = 0.0; self.hold = [0, 0]
         dec = 0.07 if style == '音乐' else 0.25
@@ -190,9 +312,20 @@ class Groove:
         self.p_rel = math.exp(-HOP / RATE / 6.0); self.r_k = math.exp(-HOP / RATE / 0.08)
         self.ph = np.zeros(3); self.car = np.array([55.0 if style == '音乐' else 45.0, 170.0, 45.0])
         self.prev = np.zeros(3)
+        self._k = np.arange(HOP, dtype=np.float64)
+        self._frac = (self._k / HOP)[None, :]
+        self._phases_base = (2 * np.pi / RATE) * self.car[:, None] * self._k[None, :]
+        self._dph = 2 * np.pi * self.car / RATE
+        self._z_hop = np.zeros(HOP, dtype=np.float32); self._z_hop.setflags(write=False)
+
+    def settled(self):
+        return (self.style not in ('电影', '音乐')
+                or (not self.flt_low.active and not self.flt_hi.active
+                    and self.kick < 1e-6 and self.tick < 1e-6 and self.rumble < 1e-6
+                    and float(np.max(np.abs(self.prev))) < 1e-6))
 
     def _band(self, i, y):
-        e = float(np.sqrt(np.mean(y * y))) if len(y) else 0.0
+        e = math.sqrt(float(np.dot(y, y)) / len(y)) if len(y) else 0.0
         self.fast[i] = e if e > self.fast[i] else self.fast[i] * self.f_rel
         self.slow[i] = self.slow[i] * self.s_k + e * (1 - self.s_k)
         self.peak[i] = e if e > self.peak[i] else max(1e-4, self.peak[i] * self.p_rel)
@@ -200,13 +333,20 @@ class Groove:
         onset = self.fast[i] / (self.slow[i] + 1e-6)
         return norm, onset
 
-    def step(self, left, right):
+    def step(self, left, right, block_peak=None):
         """-> (grip_l, grip_r, trig_l, trig_r); zeros in 标准."""
         n = len(left)
         if self.style not in ('电影', '音乐') or n == 0:
             return None
-        x = ((left + right) * 0.5).astype(np.float64)
-        yl, self.zl = sosfilt(self.sos_low, x, zi=self.zl); yh, self.zh = sosfilt(self.sos_hi, x, zi=self.zh)
+        if block_peak is None:
+            block_peak = max(float(np.max(np.abs(left))), float(np.max(np.abs(right))))
+        if block_peak < 1e-8 and self.settled():
+            self.kick = self.tick = self.rumble = 0.0
+            self.prev.fill(0.0)
+            z = self._z_hop if n == HOP else np.zeros(n, dtype=np.float32)
+            return z, z, 0.0, 0.0
+        x = (left + right) * 0.5
+        yl = self.flt_low.step(x, block_peak); yh = self.flt_hi.step(x, block_peak)
         nl, ol = self._band(0, yl); nh, oh = self._band(1, yh)
         self.hold = [max(0, h - 1) for h in self.hold]
         if ol > 1.7 and nl > 0.35 and not self.hold[0]:           # kick / explosion onset (refractory 60 ms)
@@ -223,11 +363,17 @@ class Groove:
             k, rb = self.kick * self.g_kick, self.rumble ** 1.5 * self.g_rumble
             amps = np.array([0.9 * k, 0.0, 0.55 * rb])
             tl = tr = max(0.9 * k, 0.45 * rb) * self.g_trig
-        k = np.arange(n)
-        ramp = self.prev[:, None] + (amps - self.prev)[:, None] * (k / n)[None, :]
-        ph = self.ph[:, None] + 2 * np.pi * self.car[:, None] * k[None, :] / RATE
+        if n == HOP:
+            frac = self._frac
+            pbase = self._phases_base
+        else:
+            k_arr = np.arange(n, dtype=np.float64)
+            frac = (k_arr / n)[None, :]
+            pbase = (2 * np.pi / RATE) * self.car[:, None] * k_arr[None, :]
+        ramp = self.prev[:, None] + (amps - self.prev)[:, None] * frac
+        ph = self.ph[:, None] + pbase
         w = ramp * np.sin(ph)
-        self.ph = (self.ph + 2 * np.pi * self.car * n / RATE) % (2 * np.pi); self.prev = amps
+        self.ph = (self.ph + self._dph * n) % (2 * np.pi); self.prev = amps
         self.kick *= self.kick_dec; self.tick *= self.tick_dec
         gl = w[0] + w[2]; gr = w[0] + w[1] + w[2]
         return gl.astype(np.float32), gr.astype(np.float32), tl, tr
@@ -239,18 +385,29 @@ class TextureLayer:
 
     def __init__(self, amount):
         self.amount = amount
-        self.sos = butter(2, (self.LO, self.HI), 'bandpass', fs=RATE, output='sos')
-        self.z = sosfilt_zi(self.sos) * 0.0
+        self.flt = FastSOS(butter(2, (self.LO, self.HI), 'bandpass', fs=RATE, output='sos'))
         self.a, self.b = int(self.LO / BIN_HZ), max(int(self.LO / BIN_HZ) + 1, int(self.HI / BIN_HZ))
         self.gate = 0.0; self.rel = math.exp(-HOP / RATE / 0.05)
+        self._z32 = np.zeros(HOP, dtype=np.float32); self._z32.setflags(write=False)
 
-    def step(self, block, mag, perc, agc, impact):
-        y, self.z = sosfilt(self.sos, block.astype(np.float64), zi=self.z)
-        total = float(np.sum(mag[self.a:self.b] ** 2)) + 1e-12; hit = float(np.sum(perc[self.a:self.b] ** 2))
+    def settled(self):
+        return not self.flt.active and self.gate < 1e-6
+
+    def step(self, block, mag, perc, agc, impact, block_peak=None):
+        if block_peak is None:
+            block_peak = float(np.max(np.abs(block)))
+        if block_peak < 1e-8 and self.settled():
+            self.gate = 0.0
+            return self._z32 if len(block) == HOP else np.zeros(len(block), dtype=np.float32)
+        y = self.flt.step(block, block_peak)
+        m_sl = mag[self.a:self.b]; p_sl = perc[self.a:self.b]
+        total = float(np.dot(m_sl, m_sl)) + 1e-12; hit = float(np.dot(p_sl, p_sl))
         want = min(1.0, max(0.0, (hit / total - 0.25) / 0.5))           # how much of this band is above the sustain floor
         want *= min(1.0, impact / 0.2)                                  # and the bands above must agree it is a hit: a bass note is not
         start = self.gate
         self.gate = want if want > self.gate else max(want, self.gate * self.rel)
+        if start == 0.0 and self.gate == 0.0:
+            return self._z32 if len(y) == HOP else np.zeros(len(y), dtype=np.float32)
         ramp = np.linspace(start, self.gate, len(y))
         return (y * ramp * agc * self.amount).astype(np.float32)
 
@@ -277,51 +434,125 @@ class HapticEngine:
         self.duck = 1.0
         self.level = 0.0
         self.impact = 0.0
+        n = np.arange(HOP, dtype=np.float64)
+        self._frac = (n / HOP)[None, :]
+        self._phases_base = (2 * np.pi / RATE) * self.carriers[:, None] * n[None, :]
+        self._dphase = 2 * np.pi * self.carriers * HOP / RATE
+        self._z_hop = np.zeros(HOP, dtype=np.float32); self._z_hop.setflags(write=False)
+        self._zero_zeros = np.zeros(HOP, dtype=np.float64); self._zero_zeros.setflags(write=False)
+        self._idle = False
 
     def _synth(self, amps, prev):
-        n = np.arange(HOP)
-        ramp = prev[:, None] + (amps - prev)[:, None] * (n / HOP)[None, :]   # per-sample amplitude ramp
-        ph = self.phase[:, None] + 2 * np.pi * self.carriers[:, None] * n[None, :] / RATE
+        ramp = prev[:, None] + (amps - prev)[:, None] * self._frac          # per-sample amplitude ramp
+        ph = self.phase[:, None] + self._phases_base
         return ramp, ph
 
+    def _is_idle(self):
+        return (self.sl_fft._tail_hops == 0 and self.sr_fft._tail_hops == 0
+                and self.gl.settled() and self.gr.settled()
+                and self.tl.settled() and self.tr.settled()
+                and self.ml.settled() and self.mr.settled()
+                and self.tml.settled() and self.tmr.settled()
+                and float(np.max(np.abs(self.prev_amp_l))) < 1e-6
+                and float(np.max(np.abs(self.prev_amp_r))) < 1e-6
+                and (self.tex_l is None or self.tex_l.settled())
+                and (self.tex_r is None or self.tex_r.settled())
+                and self.groove.settled())
+
     def process(self, left, right, trigger_pressed=(0.0, 0.0)):
-        rms = float(np.sqrt(np.mean((left ** 2 + right ** 2) / 2)) + 1e-9)
-        g = self.agc.update(_db(rms))
-        ml, mr = self.sl_fft.step(left), self.sr_fft.step(right)
-        span = self.gl.span                                     # one broadband median per side, shared by grip + trigger
-        pl_, pr_ = median_filter(ml, size=span, mode='nearest'), median_filter(mr, size=span, mode='nearest')
-        sl, sr = self.gl.step(ml, pl_), self.gr.step(mr, pr_)
-        al, ar = self.ml.step(sl, g), self.mr.step(sr, g)
-        self.impact = float(max(np.max(al), np.max(ar)))      # before user gain/duck: drives the speaker gate
-        # grips step back while a trigger is held, so the trigger feedback reads clearly (keeps 30 %)
         press = max(trigger_pressed)
         target_duck = 1.0 - 0.7 * min(1.0, max(0.0, (press - 0.12) / 0.18))
         self.duck += (target_duck - self.duck) * 0.3
+        n = len(left)
+        if n:
+            hi_l, lo_l = float(left.max()), float(left.min())
+            hi_r, lo_r = float(right.max()), float(right.min())
+            pk_l = hi_l if hi_l >= -lo_l else -lo_l
+            pk_r = hi_r if hi_r >= -lo_r else -lo_r
+        else:
+            pk_l = pk_r = 0.0
+        peak = pk_l if pk_l >= pk_r else pk_r
+        if peak < 1e-8:
+            if self._idle or self._is_idle():
+                if not self._idle:
+                    for a in (self.gl, self.gr, self.tl, self.tr):
+                        if a.H is None:
+                            a.H = np.zeros(NFFT // 2 + 1, dtype=np.float64)
+                    self._idle = True
+                self.agc.update(-180.0)
+                self.impact = 0.0
+                self.level = 0.0
+                return self._z_hop, self._z_hop, (0.0, 0.0)
+        else:
+            self._idle = False
+        if peak < 1e-8:
+            g = self.agc.update(-180.0)
+        else:
+            rms = math.sqrt((float(np.dot(left, left)) + float(np.dot(right, right))) / (2 * len(left))) + 1e-9
+            g = self.agc.update(20.0 * math.log10(rms if rms > 1e-9 else 1e-9))
+        ml, mr = self.sl_fft.step(left, pk_l), self.sr_fft.step(right, pk_r)
+        lz, rz = (ml is self.sl_fft._zero_mag), (mr is self.sr_fft._zero_mag)
+        span = self.gl.span                                     # one broadband median per side, shared by grip + trigger
+        pl_ = ml if lz else median_filter(ml, size=span, mode='nearest')
+        pr_ = mr if rz else median_filter(mr, size=span, mode='nearest')
+        sl, sr = self.gl.step(ml, pl_, is_zero=lz), self.gr.step(mr, pr_, is_zero=rz)
+        slz, srz = (sl is self.gl._zero_spec), (sr is self.gr._zero_spec)
+        al, ar = self.ml.step(sl, g, is_zero=slz), self.mr.step(sr, g, is_zero=srz)
+        self.impact = float(max(np.max(al), np.max(ar)))      # before user gain/duck: drives the speaker gate
+        # grips step back while a trigger is held, so the trigger feedback reads clearly (keeps 30 %)
         al = al * self.grip_gain * self.duck; ar = ar * self.grip_gain * self.duck
-        rl, ph = self._synth(al, self.prev_amp_l)
-        wl = np.sum(rl * np.sin(ph), axis=0)
-        rr, _ = self._synth(ar, self.prev_amp_r)
-        wr = np.sum(rr * np.sin(ph + np.pi), axis=0)          # right coil inverted (two hands, not one centred buzz)
+        l_silent = float(np.max(al)) == 0.0 and float(np.max(self.prev_amp_l)) == 0.0
+        r_silent = float(np.max(ar)) == 0.0 and float(np.max(self.prev_amp_r)) == 0.0
+        if l_silent:
+            wl = self._zero_zeros
+            ph = self.phase[:, None] + self._phases_base if not r_silent else None
+        else:
+            rl, ph = self._synth(al, self.prev_amp_l)
+            wl = np.sum(rl * np.sin(ph), axis=0)
+        if r_silent:
+            wr = self._zero_zeros
+        else:
+            if l_silent:
+                rr, ph = self._synth(ar, self.prev_amp_r)
+            else:
+                rr = self.prev_amp_r[:, None] + (ar - self.prev_amp_r)[:, None] * self._frac
+            wr = np.sum(rr * np.sin(ph + np.pi), axis=0)          # right coil inverted (two hands, not one centred buzz)
         if self.level_scale != 1.0:
-            wl = wl * self.level_scale; wr = wr * self.level_scale
+            if not l_silent:
+                wl = wl * self.level_scale
+            if not r_silent:
+                wr = wr * self.level_scale
         if self.tex_l is not None:                             # the sound's own weight, same user gain and duck as the rest
-            wl = wl + self.tex_l.step(left, ml, sl, g, self.impact) * self.grip_gain * self.duck
-            wr = wr + self.tex_r.step(right, mr, sr, g, self.impact) * self.grip_gain * self.duck
-        self.phase = (self.phase + 2 * np.pi * self.carriers * HOP / RATE) % (2 * np.pi)
+            tl_wav = self.tex_l.step(left, ml, sl, g, self.impact, pk_l)
+            tr_wav = self.tex_r.step(right, mr, sr, g, self.impact, pk_r)
+            if tl_wav is not self.tex_l._z32:
+                wl = wl + tl_wav * (self.grip_gain * self.duck)
+            if tr_wav is not self.tex_r._z32:
+                wr = wr + tr_wav * (self.grip_gain * self.duck)
+        self.phase = (self.phase + self._dphase) % (2 * np.pi)
         self.prev_amp_l, self.prev_amp_r = al, ar
         # trigger envelopes: mostly its own side, 30 % of the centre so centred hits reach both
-        tl = float(np.max(self.tml.step(self.tl.step(ml, pl_ if self.tl.span == span else None), g)))
-        tr = float(np.max(self.tmr.step(self.tr.step(mr, pr_ if self.tr.span == span else None), g)))
-        mix = (tl + tr) / 2
-        trig = (trigger_curve((0.3 * mix + 0.7 * tl) * self.trigger_gain), trigger_curve((0.3 * mix + 0.7 * tr) * self.trigger_gain))
+        tsl = self.tl.step(ml, pl_ if self.tl.span == span else None, is_zero=lz)
+        tsr = self.tr.step(mr, pr_ if self.tr.span == span else None, is_zero=rz)
+        tl = float(np.max(self.tml.step(tsl, g, is_zero=(tsl is self.tl._zero_spec))))
+        tr = float(np.max(self.tmr.step(tsr, g, is_zero=(tsr is self.tr._zero_spec))))
+        if tl == 0.0 and tr == 0.0:
+            trig = (0.0, 0.0)
+        else:
+            mix = (tl + tr) / 2
+            trig = (trigger_curve((0.3 * mix + 0.7 * tl) * self.trigger_gain), trigger_curve((0.3 * mix + 0.7 * tr) * self.trigger_gain))
         self.level = float(max(np.max(al), np.max(ar)))
-        gv = self.groove.step(left, right)
+        gv = self.groove.step(left, right, peak)
         if gv is not None:                                     # 电影 / 音乐: rhythm + low end on top
             gl, gr, gtl, gtr = gv
-            wl = wl + gl * self.grip_gain * self.duck; wr = wr + gr * self.grip_gain * self.duck
-            trig = (max(trig[0], min(1.0, gtl * self.trigger_gain)), max(trig[1], min(1.0, gtr * self.trigger_gain)))
-            self.level = max(self.level, float(np.max(np.abs(gl))))
-        return np.tanh(wl * 1.2).astype(np.float32), np.tanh(wr * 1.2).astype(np.float32), trig
+            if gl is not self.groove._z_hop:
+                wl = wl + gl * self.grip_gain * self.duck; wr = wr + gr * self.grip_gain * self.duck
+                self.level = max(self.level, float(np.max(np.abs(gl))))
+            if gtl or gtr:
+                trig = (max(trig[0], min(1.0, gtl * self.trigger_gain)), max(trig[1], min(1.0, gtr * self.trigger_gain)))
+        out_l = self._z_hop if wl is self._zero_zeros else np.tanh(wl * 1.2).astype(np.float32)
+        out_r = self._z_hop if wr is self._zero_zeros else np.tanh(wr * 1.2).astype(np.float32)
+        return out_l, out_r, trig
 
 
 SPEAKER_MODES = ('关闭', '全部游戏声', '特殊事件')
@@ -348,29 +579,48 @@ class RawSpeaker:
 
     def __init__(self):
         def f(*a, **k):
-            sos = butter(*a, fs=RATE, output='sos', **k); return [sos, sosfilt_zi(sos) * 0.0]
+            return FastSOS(butter(*a, fs=RATE, output='sos', **k))
         self.hp = f(2, 80, 'highpass'); self.lo = f(2, (45, 160), 'bandpass'); self.h_lp = f(2, 400, 'lowpass')
         self.h_hp = f(1, 70, 'highpass'); self.pr = f(2, (2000, 4500), 'bandpass'); self.top = f(1, 6000, 'highpass')
+        self._filters = (self.hp, self.lo, self.h_lp, self.h_hp, self.pr, self.top)
+        self._z64 = np.zeros(HOP, dtype=np.float64); self._z64.setflags(write=False)
+        self._z32 = np.zeros(HOP, dtype=np.float32); self._z32.setflags(write=False)
+        self._z_parts = (self._z64, self._z64, self._z64, self._z64)
         self.parts = None; self.env = 0.05; self.lv = 0.05; self.mk = 1.0
 
     @staticmethod
     def _run(st, x):
-        y, st[1] = sosfilt(st[0], x, zi=st[1]); return y
+        return st.step(x)
 
     def analyse(self, left, right):
-        x = ((left + right) * 0.5).astype(np.float64)
-        b = self._run(self.lo, x)
-        self.env = max(abs(float(np.max(np.abs(b)))), self.env * 0.995)
-        h = self._run(self.h_hp, self._run(self.h_lp, b * b / max(self.env, 1e-3)))   # square law -> 2nd harmonic (octave up), DC removed
-        self.parts = (self._run(self.hp, x), h, self._run(self.pr, x), self._run(self.top, x))
-        rms = float(np.sqrt(np.mean(self.parts[0] ** 2))) if len(x) else 0.0
+        n = len(left)
+        pk = max(float(np.max(np.abs(left))), float(np.max(np.abs(right)))) if n else 0.0
+        if pk < 1e-8 and not any(flt.active for flt in self._filters):
+            self.parts = self._z_parts if n == HOP else (np.zeros(n, np.float64),) * 4
+            self.env *= 0.995
+            self.mk += (min(4.0, max(1.0, 0.14 / max(self.lv, 1e-4))) - self.mk) * 0.02
+            return
+        x = (left + right) * 0.5
+        b = self.lo.step(x, pk)
+        b_pk = float(np.max(np.abs(b))) if len(b) else 0.0
+        self.env = max(b_pk, self.env * 0.995)
+        h_in = (b * b) / max(self.env, 1e-3) if (b_pk > 0.0 or self.lo.active) else b
+        h_lp_out = self.h_lp.step(h_in, b_pk * b_pk / max(self.env, 1e-3) if b_pk else 0.0)
+        h = self.h_hp.step(h_lp_out)
+        self.parts = (self.hp.step(x, pk), h, self.pr.step(x, pk), self.top.step(x, pk))
+        base = self.parts[0]
+        rms = math.sqrt(float(np.dot(base, base)) / len(base)) if len(base) else 0.0
         if rms > 1e-4:                                   # silence does not count (no boost creeping up)
             self.lv = self.lv * 0.98 + rms * 0.02
         self.mk += (min(4.0, max(1.0, 0.14 / max(self.lv, 1e-4))) - self.mk) * 0.02
 
     def render(self, preset, volume, boost=1.0):
-        base, h, pr, top = self.parts; wb, wp, wt = self.PRESETS.get(preset, self.PRESETS['原味'])
-        y = base + wb * h * float(np.sqrt(np.mean(base * base)) + 1e-4) * 4 + wp * pr + wt * top
+        base, h, pr, top = self.parts
+        if base is self._z64:
+            return self._z32
+        wb, wp, wt = self.PRESETS.get(preset, self.PRESETS['原味'])
+        base_rms = math.sqrt(float(np.dot(base, base)) / len(base)) if len(base) else 0.0
+        y = base + wb * h * (base_rms + 1e-4) * 4 + wp * pr + wt * top
         return (y * np.clip(volume, 0., 1.) * boost * 1.5 * self.mk).astype(np.float32)  # final output lookahead limiter preserves waveform
 
 
@@ -394,8 +644,7 @@ class SmartSpeaker:
         self.volume = volume; self.boost = boost; self.mode = '智能增强'
         # mild (the normal 全部游戏声音 playback): hits lifted at most x1.6, steady sound kept at >= 0.7
         self.g_lo, self.g_hi, self.g_exp = (0.7, 1.6, 1.0) if mild else (0.35, 3.0, 1.3)
-        self.sos = [butter(2, b, 'bandpass', fs=RATE, output='sos') for b in self.BANDS]
-        self.zi = [sosfilt_zi(s) * 0.0 for s in self.sos]
+        self.flts = [FastSOS(butter(2, b, 'bandpass', fs=RATE, output='sos')) for b in self.BANDS]
         self.fast = [0.0] * 3; self.slow = [1e-3] * 3; self.g = [1.0] * 3
         self.f_rel = math.exp(-HOP / RATE / 0.030); self.s_k = math.exp(-HOP / RATE / 0.35)
         self.env = 0.02; self.env_rel = math.exp(-HOP / RATE / 3.0)
@@ -404,20 +653,21 @@ class SmartSpeaker:
     def process(self, left, right, impact=None):
         if self.volume <= 0:
             return None
-        x = ((left + right) * 0.5).astype(np.float64)
+        pk = max(float(np.max(np.abs(left))), float(np.max(np.abs(right)))) if len(left) else 0.0
+        x = (left + right) * 0.5
         out = np.zeros(len(x))
         target_mix = 1.0 if self.event else 0.0
         self.event_mix += (target_mix - self.event_mix) * 0.25
         preset = self.PRESETS.get(self.event, self.PRESETS[None])
-        for i, sos in enumerate(self.sos):
-            y, self.zi[i] = sosfilt(sos, x, zi=self.zi[i])
-            e = float(np.sqrt(np.mean(y * y))) if len(y) else 0.0
+        for i, flt in enumerate(self.flts):
+            y = flt.step(x, pk)
+            e = math.sqrt(float(np.dot(y, y)) / len(y)) if len(y) else 0.0
             self.fast[i] = e if e > self.fast[i] else self.fast[i] * self.f_rel
             self.slow[i] = self.slow[i] * self.s_k + e * (1 - self.s_k)
             ratio = self.fast[i] / (self.slow[i] + 1e-5)
             tg = min(self.g_hi, max(self.g_lo, ratio ** self.g_exp)) * self.BASE[i] * (1.0 + (preset[i] - 1.0) * self.event_mix)
             out += y * np.linspace(self.g[i], tg, len(y)); self.g[i] = tg
-        rms = float(np.sqrt(np.mean(out * out))) if len(out) else 0.0
+        rms = math.sqrt(float(np.dot(out, out)) / len(out)) if len(out) else 0.0
         self.env = rms if rms > self.env else max(rms, self.env * self.env_rel)
         sc0 = self.scene_now; self.scene_now += (self.scene - self.scene_now) * 0.05
         gain = min(10.0, 0.22 / max(self.env, 0.004)) * self.boost
@@ -439,10 +689,10 @@ class SpeakerShaper:
         # play it, it only costs headroom and rattles), presence lifted, hits gently brought forward
         self.smart = SmartSpeaker(volume, boost, mild=True) if self.mode == '全部游戏声音' else None
         if self.mode == '原声':       # whole mix, untouched except: virtual bass + softer top + limiter
-            self.sos_hp = butter(2, 150, 'highpass', fs=RATE, output='sos'); self.z_hp = sosfilt_zi(self.sos_hp) * 0.0
-            self.sos_b = butter(2, (45, 160), 'bandpass', fs=RATE, output='sos'); self.z_b = sosfilt_zi(self.sos_b) * 0.0
-            self.sos_h = butter(2, 90, 'highpass', fs=RATE, output='sos'); self.z_h = sosfilt_zi(self.sos_h) * 0.0
-            self.sos_t = butter(1, 6000, 'highpass', fs=RATE, output='sos'); self.z_t = sosfilt_zi(self.sos_t) * 0.0
+            self.flt_hp = FastSOS(butter(2, 150, 'highpass', fs=RATE, output='sos'))
+            self.flt_b = FastSOS(butter(2, (45, 160), 'bandpass', fs=RATE, output='sos'))
+            self.flt_h = FastSOS(butter(2, 90, 'highpass', fs=RATE, output='sos'))
+            self.flt_t = FastSOS(butter(1, 6000, 'highpass', fs=RATE, output='sos'))
         self.a = math.exp(-2 * math.pi * 300 / RATE)     # one-pole high-pass at 300 Hz
         self.zi = np.zeros(1)
         self.gate = 0.0
@@ -461,13 +711,14 @@ class SpeakerShaper:
             self.smart.scene = self.scene
             return self.smart.process(left, right)
         if self.mode == '原声':
-            x = ((left + right) * 0.5).astype(np.float64)
-            y, self.z_hp = sosfilt(self.sos_hp, x, zi=self.z_hp)
-            b, self.z_b = sosfilt(self.sos_b, x, zi=self.z_b)
+            pk = max(float(np.max(np.abs(left))), float(np.max(np.abs(right)))) if len(left) else 0.0
+            x = (left + right) * 0.5
+            y = self.flt_hp.step(x, pk)
+            b = self.flt_b.step(x, pk)
             # virtual bass: rectifying the 45-160 Hz part creates its harmonics (90-480 Hz), which the
             # small speaker can play; the ear fills the missing fundamental back in
-            h, self.z_h = sosfilt(self.sos_h, np.abs(b), zi=self.z_h)
-            t, self.z_t = sosfilt(self.sos_t, x, zi=self.z_t)
+            h = self.flt_h.step(np.abs(b))
+            t = self.flt_t.step(x, pk)
             y = y + 1.4 * h - 0.35 * t                     # bass back, top -3 dB (less harsh)
             return np.tanh(y * self.volume * 1.2).astype(np.float32)
         mono = self._hp(((left + right) * 0.5).astype(np.float64))

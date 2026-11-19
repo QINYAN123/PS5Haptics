@@ -14,12 +14,12 @@ from ctypes import wintypes as W
 import tkinter as tk
 import numpy as np
 import pyaudiowpatch as pa
-from scipy.signal import butter, sosfilt, sosfilt_zi
+from scipy.signal import butter
 from ds_audio import HapticOut, RATE, pa_new, pa_end, pa_open, rescan, close_stream
 from ds_hid import DualSenseHID, effect_vibration, effect_off, effect_zones
 import trigger_presets
 from selfcheck import TL_KEYS
-from haptic_dsp import HapticEngine, HOP, GRIP_PROFILES, TRIGGER_PROFILES, RawSpeaker, SPEAKER_MODES, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
+from haptic_dsp import FastSOS, HapticEngine, HOP, GRIP_PROFILES, TRIGGER_PROFILES, RawSpeaker, SPEAKER_MODES, SPEAKER_MODE_ALIAS, HAPTIC_STYLES
 from button_haptics import ButtonClicks
 from game_caps import GameCaps, NOT_GAMES
 from pad_input import InputFilter, ButtonMap
@@ -395,7 +395,7 @@ class Runner:
     def run(self):
         p = None; out = hid = stream = vpad = iso = None; error = None; vision = None; watcher = None; trace = None; volume = None
         music_gate = None
-        voice_gate = None; pad_tap = None; g_env = 0.05; g_gain = 1.0; g_out_pk = 0.0; spk_clip = None; gsp_z = sosfilt_zi(GSP_LOWCUT) * 0.0
+        voice_gate = None; pad_tap = None; g_env = 0.05; g_gain = 1.0; g_out_pk = 0.0; spk_clip = None; gsp_flt = FastSOS(GSP_LOWCUT)
         try:                                         # a game with its own settings already running: start with them (routing is fixed per run)
             import proc_loopback as plb
             here = foreground_exe()
@@ -556,6 +556,8 @@ class Runner:
             ep_source = self.stats['source']
             was_locked = self.capture_locked
             input_route = None
+            rum_tail = 0
+            _z_hop32 = np.zeros(HOP, dtype=np.float32); _z_hop32.setflags(write=False)
             default_id = None
             if not self.cfg.get('source_hint'):
                 try:
@@ -875,7 +877,7 @@ class Runner:
                     bl, br = pend_l[:HOP], pend_r[:HOP]; pend_l, pend_r = pend_l[HOP:], pend_r[HOP:]
                     produced += HOP
                     if not active:
-                        bl = np.zeros(HOP, np.float32); br = bl
+                        bl = _z_hop32; br = _z_hop32
                     if ep_gain != 1.0 and source_endpoint:           # haptics only: the speaker keeps following the system volume
                         bl = np.clip(bl * ep_gain, -1, 1); br = np.clip(br * ep_gain, -1, 1)
                     wl, wr, trig = eng.process(bl, br, press)
@@ -910,8 +912,12 @@ class Runner:
                         nl, nr = vpad.wave.pull(HOP)                  # game's own voice-coil waveform
                         if guard_game is not None and stuck.wave(
                                 nl, nr, fx.last_event if fx is not None else 0.0, time.monotonic()):
-                            nl = np.zeros_like(nl); nr = np.zeros_like(nr)
-                        rl, rr = rum.step(large, small, rgain)         # legacy rumble, if the game uses it
+                            nl = _z_hop32; nr = _z_hop32
+                        if large or small or rum_tail > 0:
+                            rum_tail = 12 if (large or small) else rum_tail - 1
+                            rl, rr = rum.step(large, small, rgain)         # legacy rumble, if the game uses it
+                        else:
+                            rl = rr = _z_hop32
                         nl = nl * rgain + rl; nr = nr * rgain + rr
                         if fx is not None and FUSION_ALIAS.get(fusion, fusion) != '纯用游戏':   # event tuning: grade / duck the native layer
                             g = fx.native_gain(HOP); nl = nl * g; nr = nr * g
@@ -941,7 +947,11 @@ class Runner:
                         if guard_game == PBZ_EXE:
                             large, small = stuck.motors(large, small, now, PBZ_STUCK_MOTOR_S)
                         tl_acc['mot'] = max(tl_acc['mot'], large, small)
-                        rl, rr = rum.step(large, small, rgain)
+                        if large or small or rum_tail > 0:
+                            rum_tail = 12 if (large or small) else rum_tail - 1
+                            rl, rr = rum.step(large, small, rgain)
+                        else:
+                            rl = rr = _z_hop32
                         wl, wr = fuse(wl, wr, rl, rr, max(large, small), fusion, duck)
                         if color and color != last_color and any(color):
                             try: hid.set_lightbar(*color); last_color = color
@@ -963,18 +973,20 @@ class Runner:
                         if spk_clip is not None:
                             spk_clip.feed(gsp)                         # raw, before anything below
                         # the tiny speaker cannot play below ~150 Hz: with the make-up gain it only rattles (no other EQ)
-                        gsp, gsp_z = sosfilt(GSP_LOWCUT, gsp, zi=gsp_z)
-                        gsp = gsp.astype(np.float32)
+                        gsp = gsp_flt.step(gsp).astype(np.float32)
                         # the game mixes its pad-speaker cues quietly (on PS5 the console volume lifts them):
                         # slow make-up gain to ~70 % peak, at most 10x; the speaker-volume slider applies on top
                         gpk_now = float(np.max(np.abs(gsp)))
                         g_env = max(gpk_now, g_env * 0.9995, 0.02)
                         g_target = min(10.0, 0.7 / g_env)
                         g_next = g_gain + (g_target - g_gain) * 0.1
-                        gsp = gsp * np.linspace(g_gain, g_next, len(gsp))
+                        if gpk_now > 0.0:
+                            gsp = gsp * np.linspace(g_gain, g_next, len(gsp))
                         g_gain = g_next
                     if spk is not None:
-                        spk.analyse(bl, br)
+                        need_spk = spk_eff in ('全部游戏声', '特殊事件') or spk_mix > 0.0
+                        if need_spk:
+                            spk.analyse(bl, br)
                         if spk_eff == '全部游戏声':
                             sp = spk.render(spk_eq, vol)
                         elif spk_eff == '游戏原生':

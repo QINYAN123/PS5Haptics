@@ -265,7 +265,8 @@ class PadSpeakerTap(threading.Thread):
                 with self.lock:
                     self.buf.append(mono.astype(np.float32)); self.n += len(mono)
             else:
-                self.stop_ev.wait(0.005)
+                # 10 ms aligns with WASAPI engine period while idle instead of waking 200x/s
+                self.stop_ev.wait(0.005 if self.sounding(0.5) else 0.01)
         if lb is not None:
             lb.close()
 

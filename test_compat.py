@@ -989,8 +989,40 @@ def test_button_map():
     assert direction.apply(opposed)[8] == 8
 
 
+def test_proc_loopback_multi_pid_and_stickiness():
+    import queue
+    import threading
+    from unittest.mock import patch
+    import proc_loopback as plb
+    import ps5_haptics_app as app
+
+    # Launcher stub (29 MB parent) vs real UE5 game (13 GB child): must pick real game even if stub was prefer_pid.
+    matches = [(21892, 'PBZ.exe', 100), (17036, 'PBZ.exe', 21892)]
+    ws = {21892: 29 << 20, 17036: 13000 << 20}
+    assert plb._select_best_pid(matches, mem_fn=ws.get) == (17036, 'PBZ.exe')
+    assert plb._select_best_pid(matches, mem_fn=ws.get, prefer_pid=21892) == (17036, 'PBZ.exe')
+    # Anti-cheat child where memory query is denied (None): still prefer child over unprotected stub.
+    assert plb._select_best_pid(matches, mem_fn={21892: 29 << 20, 17036: None}.get) == (17036, 'PBZ.exe')
+    # Equal-sized workers keep prefer_pid stable.
+    workers = [(10, 'w.exe', 1), (20, 'w.exe', 1)]
+    assert plb._select_best_pid(workers, mem_fn={10: 50 << 20, 20: 50 << 20}.get, prefer_pid=10) == (10, 'w.exe')
+
+    # ProcSource.select must not ping-pong between 'pbz.exe' (foreground) and 'PBZ.exe' (stub) on focus loss.
+    fg_seq = iter([(17036, 'pbz.exe'), None, (21892, 'PBZ.exe'), (17036, 'pbz.exe')])
+    src = plb.ProcSource(queue.Queue(), lambda _m: None, threading.Event(), lambda _t: next(fg_seq))
+    with patch.object(plb, '_pid_alive', side_effect=lambda p: p == 17036), \
+         patch.object(plb, '_process_ws_bytes', side_effect=lambda p: ws.get(p, 0)), \
+         patch.object(plb, 'find_pid', side_effect=AssertionError('must not rescan snapshot while current pid is alive')):
+        cur = src.select(('game', ('pbz.exe',)), None, False)
+        assert cur == (17036, 'pbz.exe')
+        assert src.select(('game', ('pbz.exe',)), cur, True) == (17036, 'pbz.exe')  # transient None
+        assert src.select(('game', ('pbz.exe',)), cur, True) == (17036, 'pbz.exe')  # small stub dialog focus
+        assert src.select(('game', ('pbz.exe',)), cur, True) == (17036, 'pbz.exe')
+
+
 if __name__ == '__main__':
     test_scene_suppression()
+    test_proc_loopback_multi_pid_and_stickiness()
     test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()

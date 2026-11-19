@@ -209,9 +209,71 @@ class _PE32(Structure):
                 ('pcPriClassBase', ctypes.c_long), ('dwFlags', W.DWORD), ('szExeFile', ctypes.c_wchar * 260)]
 
 
-def find_pid(*exe_names):
-    """First running process whose exe name matches (case-insensitive), via a Toolhelp snapshot."""
-    want = {n.lower() for n in exe_names}
+class _PMC(Structure):
+    _fields_ = [('cb', W.DWORD), ('PageFaultCount', W.DWORD), ('PeakWorkingSetSize', ctypes.c_size_t),
+                ('WorkingSetSize', ctypes.c_size_t), ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPagedPoolUsage', ctypes.c_size_t), ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaNonPagedPoolUsage', ctypes.c_size_t), ('PagefileUsage', ctypes.c_size_t), ('PeakPagefileUsage', ctypes.c_size_t)]
+
+
+def _process_ws_bytes(pid):
+    """Best-effort WorkingSetSize in bytes via limited query access, or None if unavailable."""
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = W.HANDLE
+    h = k.OpenProcess(0x1000, False, int(pid))
+    if not h:
+        return None
+    try:
+        c = _PMC(); c.cb = ctypes.sizeof(c)
+        return int(c.WorkingSetSize) if k.K32GetProcessMemoryInfo(h, byref(c), c.cb) else None
+    finally:
+        k.CloseHandle(W.HANDLE(h))
+
+
+def _pid_alive(pid):
+    """Fast O(1) liveness check without taking a system-wide Toolhelp snapshot."""
+    if not pid:
+        return False
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = W.HANDLE
+    h = k.OpenProcess(0x1000, False, int(pid))
+    if not h:
+        return False
+    try:
+        code = W.DWORD()
+        return bool(k.GetExitCodeProcess(W.HANDLE(h), byref(code)) and code.value == 259)
+    finally:
+        k.CloseHandle(W.HANDLE(h))
+
+
+def _select_best_pid(matches, mem_fn=_process_ws_bytes, prefer_pid=None):
+    """Pick the real game process when a launcher stub shares the exe name (e.g. steam\\PBZ.exe -> platform\\steam\\PBZ.exe)."""
+    if len(matches) == 1:
+        return matches[0][0], matches[0][1]
+    match_pids = {m[0] for m in matches}
+    mem_map = {m[0]: mem_fn(m[0]) for m in matches}
+    known_ws = [v for v in mem_map.values() if v is not None]
+    max_ws = max(known_ws) if known_ws else 0
+
+    def rank(item):
+        pid, _exe, ppid = item
+        ws = mem_map[pid]
+        is_child = 1 if ppid in match_pids else 0
+        eff_ws = (max_ws + 1 if is_child else 0) if ws is None else ws
+        keep_pref = 1 if (prefer_pid is not None and pid == prefer_pid and eff_ws >= max_ws * 0.5) else 0
+        return (keep_pref, eff_ws, is_child, pid)
+
+    best = max(matches, key=rank)
+    return best[0], best[1]
+
+
+def find_pid(*exe_names, prefer_pid=None):
+    """Best running process whose exe name matches (case-insensitive), via one Toolhelp snapshot."""
+    want = [n.lower() for n in exe_names if n]
+    if not want:
+        return None
+    want_set = set(want)
+    by_exe = {}
     k = ctypes.windll.kernel32
     k.CreateToolhelp32Snapshot.restype = W.HANDLE
     snap = k.CreateToolhelp32Snapshot(0x2, 0)
@@ -219,12 +281,40 @@ def find_pid(*exe_names):
         e = _PE32(); e.dwSize = ctypes.sizeof(e)
         ok = k.Process32FirstW(snap, byref(e))
         while ok:
-            if e.szExeFile.lower() in want:
-                return e.th32ProcessID, e.szExeFile
+            low = e.szExeFile.lower()
+            if low in want_set:
+                by_exe.setdefault(low, []).append((int(e.th32ProcessID), e.szExeFile, int(e.th32ParentProcessID)))
             ok = k.Process32NextW(snap, byref(e))
     finally:
         k.CloseHandle(snap)
+    for name in want:
+        if name in by_exe:
+            return _select_best_pid(by_exe[name], prefer_pid=prefer_pid)
     return None
+
+
+def find_pids(*exe_names):
+    """Set of matching lowercase exe names currently running, queried in one Toolhelp snapshot."""
+    want = {n.lower() for n in exe_names if n}
+    found = set()
+    if not want:
+        return found
+    k = ctypes.windll.kernel32
+    k.CreateToolhelp32Snapshot.restype = W.HANDLE
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)
+    try:
+        e = _PE32(); e.dwSize = ctypes.sizeof(e)
+        ok = k.Process32FirstW(snap, byref(e))
+        while ok:
+            low = e.szExeFile.lower()
+            if low in want:
+                found.add(low)
+                if len(found) == len(want):
+                    break
+            ok = k.Process32NextW(snap, byref(e))
+    finally:
+        k.CloseHandle(snap)
+    return found
 
 
 class ProcSource(threading.Thread):
@@ -232,8 +322,7 @@ class ProcSource(threading.Thread):
 
     def __init__(self, q, log, stop_ev, foreground_game):
         super().__init__(daemon=True)
-        self.q, self.log, self.stop_ev = q, log, stop_ev
-        self.foreground_game = foreground_game
+        self.q, self.log, self.stop_ev, self.foreground_game = q, log, stop_ev, foreground_game
         self.request = ('mix', None)
         self.key = None
         self.name = ''
@@ -244,91 +333,102 @@ class ProcSource(threading.Thread):
     def sounding(self):
         return self.key is not None and self.key[0] == self.request and time.monotonic() - self.last_sound < 1.0
 
-    def select(self, request, current, attached):
-        mode, target = request
+    def select(self, wanted, current, attached):
+        mode, target = wanted
         if mode == 'game':
             foreground = self.foreground_game(target)
-            return foreground or (find_pid(current[1]) if current else None)
+            if foreground:
+                if (current and current[0] != foreground[0]
+                        and current[1].lower() == foreground[1].lower() and _pid_alive(current[0])):
+                    cur_ws = _process_ws_bytes(current[0]) or 0
+                    fg_ws = _process_ws_bytes(foreground[0]) or 0
+                    if cur_ws > fg_ws * 2:
+                        return current
+                return foreground
+            if current and _pid_alive(current[0]):
+                return current
+            return find_pid(current[1]) if current else None
         if mode == 'pinned':
-            return find_pid(target) if target else None
-        if mode != 'auto':
-            return None
-        if current and attached and time.monotonic() - self.last_sound < 5.0:
-            return current
-        try:
-            import audio_sessions
-            return next(((pid, exe) for peak, pid, exe in audio_sessions.playing() if peak > 0.003), None)
-        except Exception:
-            return None
+            if not target:
+                return None
+            if current and current[1].lower() == target.lower() and _pid_alive(current[0]):
+                # Periodically ensure a launcher stub didn't hand off to a larger child process.
+                now = time.monotonic()
+                if now - getattr(self, '_pin_rescan', 0.0) < 5.0:
+                    return current
+                self._pin_rescan = now
+            return find_pid(target, prefer_pid=current[0] if current else None)
+        if mode == 'auto':
+            if current and attached and time.monotonic() - self.last_sound < 5.0:
+                return current
+            try:
+                import audio_sessions
+                return next(((pid, exe) for peak, pid, exe in audio_sessions.playing() if peak > 0.003), None)
+            except Exception:
+                return None
+        return None
 
     def run(self):
-        import queue
+        import queue as _q
         initialized = False
-        stream = current = request = None
-        retry_at = check_at = last_packet = 0.0
-        failed = None
         try:
             comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
             initialized = True
+        except OSError:
+            pass
+        stream = None; current = None; request = self.request; retry_at = 0.0; check_at = 0.0; last_packet = time.monotonic()
+        failed = set()
+        try:
             while not self.stop_ev.is_set():
                 now = time.monotonic()
                 wanted = self.request
                 if wanted != request or now >= check_at:
                     found = self.select(wanted, current if wanted == request else None, stream is not None)
-                    check_at = now + (0.35 if wanted[0] == 'game' else 1.0)
+                    check_at = now + (0.5 if wanted[0] == 'game' and found is None else 1.0)
                     if found != current or wanted != request:
-                        self.key = None
-                        self.last_sound = 0.0
-                        self.name = ''
+                        self.key = None; self.last_sound = 0.0; self.name = ''
                         if stream is not None:
-                            stream.close()
-                            stream = None
-                        current, request = found, wanted
-                        retry_at = 0.0
-                    if stream is None and current and now >= retry_at:
-                        pid, exe = current
-                        retry_at = now + 1.5
-                        try:
-                            stream = ProcessLoopback(pid)
-                            last_packet = time.monotonic()
-                            self.name = exe
-                            self.key = request, pid
-                            if self.key != getattr(self, 'logged', None):
-                                self.logged = self.key
-                                self.log(f'按进程截音：{exe}（杜比全景声 / 空间音效开着也能截到）')
-                            failed = None
-                        except Exception as exc:
-                            if current != failed:
-                                detail = '按进程截音失败，将保持静音并重试：' if request[0] in ('game', 'pinned') else '按进程截音失败，暂用系统混音，会自动重试：'
-                                self.log(detail + str(exc))
-                                failed = current
+                            stream.close(); stream = None
+                        current = found; request = wanted; retry_at = 0.0
+                if stream is None and current is not None and now >= retry_at:
+                    pid, exe = current
+                    retry_at = now + 1.5
+                    try:
+                        stream = ProcessLoopback(pid)
+                        last_packet = time.monotonic()
+                        self.name = exe
+                        self.key = (request, pid)
+                        if self.key != getattr(self, 'logged', None):     # re-attaches after alt-tab stay quiet
+                            self.logged = self.key
+                            self.log(f'按进程截音：{exe}（杜比全景声 / 空间音效开着也能截到）')
+                        failed.discard(current)
+                    except Exception as exc:           # retried every 1.5 s; logged once per target
+                        if current not in failed:
+                            detail = '按进程截音失败，将保持静音并重试：' if request[0] in ('game', 'pinned') else '按进程截音失败，暂用系统混音，会自动重试：'
+                            self.log(detail + str(exc))
+                            failed.add(current)
                 if stream is None:
-                    self.stop_ev.wait(0.15)
-                    continue
+                    self.stop_ev.wait(0.15); continue
                 try:
                     samples = stream.read(20)
-                except Exception as exc:
+                except Exception as exc:                       # game exited / session gone
                     self.log('游戏进程音频中断：' + str(exc))
-                    samples = ()
-                    last_packet = 0.0
+                    self.key = None; self.last_sound = 0.0; self.name = ''
+                    stream.close(); stream = None; current = None
+                    continue
                 now = time.monotonic()
                 if len(samples):
-                    self.max_gap = max(self.max_gap, now - last_packet)
-                    last_packet = now
-                    if np.abs(samples).max() > 1e-4:
+                    self.max_gap = max(self.max_gap, now - last_packet); last_packet = now
+                    if float(np.abs(samples).max()) > 1e-4:
                         self.last_sound = now
                     if self.request == request and (request[0] != 'auto' or self.sounding()):
-                        try:
-                            self.q.put_nowait((self.key, self.name.lower(), samples))
-                        except queue.Full:
-                            pass
+                        try: self.q.put_nowait((self.key, self.name.lower(), samples))
+                        except _q.Full: pass
                 elif now - last_packet > 1.5:
-                    self.key = None
-                    self.last_sound = 0.0
-                    stream.close()
-                    stream = None
-                    self.reattach += 1
-                    check_at = 0.0
+                    # alt-tab: the game recreates its audio stream and the capture silently stops delivering.
+                    # Re-attach (the mix path takes over meanwhile in auto mode)
+                    self.key = None; self.last_sound = 0.0
+                    stream.close(); stream = None; self.reattach += 1; check_at = 0.0
         finally:
             self.key = None
             if stream is not None:
@@ -345,4 +445,3 @@ if __name__ == '__main__':
         xs.append(pl.read())
     x = np.concatenate(xs); pl.close()
     print('pid', pid, 'samples', len(x), 'peak %.4f' % (float(np.abs(x).max()) if len(x) else 0))
-

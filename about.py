@@ -1,5 +1,5 @@
 """Version, author and project links (sidebar, update check, docs, release packaging)."""
-VERSION = '2.3.25'
+VERSION = '2.3.26'
 AUTHOR = '轻言black'
 GITHUB_USER = 'QINYAN123'
 GITHUB_REPO = 'QINYAN123/PS5Haptics'
@@ -11,4 +11,3 @@ UPDATE_ASSET_HINT = '更新包'          # local file name of the update package
 # release asset names on GitHub (ASCII: GitHub strips other characters from asset names)
 FULL_ASSET = 'PS5Haptics-v{}.zip'
 UPDATE_ASSET = 'PS5Haptics-update-v{}.zip'
-

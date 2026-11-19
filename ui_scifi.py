@@ -1912,14 +1912,17 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
         while True:
             try:
-                games_on['ww'] = plb.find_pid('Client-Win64-Shipping.exe') is not None
-                found = plb.find_pid('PBZ.exe', 'PBZ-Win64-Shipping.exe')
+                user_exes = [exe_name(g) for g in list(games()) if exe_name(g)]
+                active_exes = plb.find_pids('Client-Win64-Shipping.exe', 'PBZ.exe', 'PBZ-Win64-Shipping.exe', *user_exes)
+                games_on['ww'] = 'client-win64-shipping.exe' in active_exes
+                found = (plb.find_pid('PBZ.exe', 'PBZ-Win64-Shipping.exe')
+                         if ('pbz.exe' in active_exes or 'pbz-win64-shipping.exe' in active_exes) else None)
                 pid = found[0] if found else None
                 if pid != last_pid:
                     last_pid = pid
                     started = (process_start_time(pid) or time.time()) if pid is not None else None
                 root.after(0, update_pbz, pid is not None, started)
-                lib['running'] = {exe_name(g) for g in list(games()) if exe_name(g) and plb.find_pid(pathlib.Path(g['exe']).name) is not None}
+                lib['running'] = {exe for exe in user_exes if exe in active_exes}
                 root.after(0, redraw_cards)
             except Exception:
                 pass
