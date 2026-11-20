@@ -469,7 +469,18 @@ class Runner:
             except Exception: pass
             eng = HapticEngine(self.cfg['grip_profile'], self.cfg['trigger_profile'], self.cfg['grip_gain'], self.cfg['trigger_gain'],
                                self.cfg.get('haptic_style', '游戏'), groove_gains(self.cfg))
-            ep_gain = 1.0; source_endpoint = False; pad_session_check = 0.0; game_speaker_active = False; fg_since = time.monotonic(); last_game_trig = (None, None); trig_released = False
+            ep_gain = 1.0; source_endpoint = False; pad_session_check = 0.0; game_speaker_active = False; pad_probe_busy = False; fg_since = time.monotonic(); last_game_trig = (None, None); trig_released = False
+            def _probe_pad_speaker(exe_name):
+                nonlocal game_speaker_active, pad_probe_busy
+                try:
+                    from pad_speaker import game_on_pad
+                    res = game_on_pad(exe_name)
+                    if fg == exe_name:
+                        game_speaker_active = res
+                except Exception:
+                    pass
+                finally:
+                    pad_probe_busy = False
             rum = RumbleCoil(); clicks = ButtonClicks(); vol = self.cfg.get('speaker_volume', 0.6)
             spk_mode = SPEAKER_MODE_ALIAS.get(self.cfg.get('speaker_mode', '全部游戏声'), self.cfg.get('speaker_mode', '全部游戏声'))
             spk_eq = self.cfg.get('speaker_eq', '原味')
@@ -640,8 +651,6 @@ class Runner:
                     input_route = route
                     pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
                     rs = Resampler()
-                    if spk is not None:
-                        spk = RawSpeaker()
                 if blk is not None:
                     from_endpoint = not isinstance(blk, tuple)
                     if isinstance(blk, tuple):                      # per-process capture: stereo 48 kHz
@@ -670,8 +679,9 @@ class Runner:
                         l, r = rs.process(l, r, brate / RATE * speed)
                     last_blk = time.monotonic()
                     pend_l = np.concatenate([pend_l, l]); pend_r = np.concatenate([pend_r, r])
-                elif (needs_idle_audio and len(pend_l) < HOP and time.monotonic() - last_blk > 0.1
-                      and (time.monotonic() - clock0) * RATE - produced > 4 * HOP):
+                elif (needs_idle_audio and len(pend_l) < HOP
+                      and time.monotonic() - last_blk > (0.04 if self.capture_locked else 0.1)
+                      and (time.monotonic() - clock0) * RATE - produced > (2 * HOP if self.capture_locked else 4 * HOP)):
                     # only when the source has really stopped (0.1 s): padding inside a stream of 10 ms
                     # packets inserted gaps = the speaker crackled and stuttered
                     # game is silent (loopback delivers nothing): pad with real-time silence so the game's
@@ -735,28 +745,18 @@ class Runner:
                                 self.proc.request = request
                             pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
                             rs = Resampler()
-                            if spk is not None:
-                                spk = RawSpeaker()
                             continue
                     # 全部游戏声: the whole mix, even over a game's own pad-speaker sound.
                     # 特殊事件: a game that drives the pad speaker itself keeps it; 影之刃零 keeps its event tuning;
                     # games that don't use the pad speaker play the whole mix.
                     # grips on 纯用游戏 + 特殊事件 = nothing of ours at all: no event tuning, no whole mix as a fallback
-                    pure = FUSION_ALIAS.get(fusion, fusion) == '纯用游戏' and spk_mode == '特殊事件'
-                    adapted = fg == PBZ_EXE and self.cfg.get('pbz_fx', True) and not pure     # 特殊事件: only 影之刃零 is adapted
                     if (spk_mode == '特殊事件' and not takeover and fg not in NOT_GAMES
-                            and now - pad_session_check >= 1.0):
+                            and now - pad_session_check >= 1.0 and not pad_probe_busy):
+                        pad_probe_busy = True
                         pad_session_check = now
-                        try:
-                            from pad_speaker import game_on_pad
-                            game_speaker_active = game_on_pad(fg)
-                        except Exception:
-                            game_speaker_active = False
+                        threading.Thread(target=_probe_pad_speaker, args=(fg,), daemon=True).start()
                     if spk_mode != '特殊事件':
                         game_speaker_active = False
-                    spk_eff = speaker_route(spk_mode, pure, adapted, pad_tap is not None and pad_tap.sounding(1.0),
-                                            not takeover and fg not in NOT_GAMES and game_speaker_active)
-                    self.stats['spk_eff'] = spk_eff
                     if self.proc is not None and self.proc.key and self.proc.key[0] == self.capture:
                         self.stats['source'] = f'{self.proc.name}（按进程截音）  2声道 48000Hz'
                     elif self.capture_locked:
@@ -868,6 +868,12 @@ class Runner:
                 if fx is not None:
                     for name in fx.poll():
                         self.stats['fx_last'] = name
+                pure = FUSION_ALIAS.get(fusion, fusion) == '纯用游戏' and spk_mode == '特殊事件'
+                adapted = fg == PBZ_EXE and self.cfg.get('pbz_fx', True) and not pure
+                native_speaking = pad_tap is not None and (pad_tap.sounding(2.0) or (adapted and bool(pad_tap.last_sound)))
+                spk_eff = speaker_route(spk_mode, pure, adapted, native_speaking,
+                                        not takeover and fg not in NOT_GAMES and game_speaker_active)
+                self.stats['spk_eff'] = spk_eff
                 large = small = 0.0; gpk_l = gpk_r = 0.0; spk_peak = 0.0
                 if spk is not None and time.monotonic() - spk_assert > 5.0:   # keep the speaker routed
                     spk_assert = time.monotonic()

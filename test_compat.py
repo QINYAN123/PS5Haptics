@@ -1020,9 +1020,83 @@ def test_proc_loopback_multi_pid_and_stickiness():
         assert src.select(('game', ('pbz.exe',)), cur, True) == (17036, 'pbz.exe')
 
 
+def test_proc_hot_reattach_and_stick_coalescing():
+    import numpy as np
+    import queue
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import proc_loopback as plb
+    from xds import VirtualDualSense
+
+    # 1) Silent menu must not thrash ProcessLoopback or drop key; stalled audible stream must hot-reattach while keeping key.
+    q = queue.Queue()
+    stop = threading.Event()
+    created = []
+    closed = []
+    keys_seen = []
+    has_audio_flag = [False]
+    now_t = [100.0]
+
+    class FakePL:
+        def __init__(self, pid):
+            self.pid = pid
+            created.append(pid)
+            self.calls = 0
+
+        def read(self, _ms=20):
+            self.calls += 1
+            keys_seen.append(src.key)
+            if len(created) == 1:
+                if self.calls == 1:
+                    now_t[0] += 1.0  # > 0.8s while silent menu (has_audio=False): must NOT reattach or drop key
+                    return np.zeros(0, np.float32)
+                if self.calls == 2:
+                    has_audio_flag[0] = True
+                    now_t[0] += 1.0  # > 0.8s while game HAS audio: must hot-reattach keeping key
+                    return np.zeros(0, np.float32)
+            stop.set()
+            return np.full(10, 0.1, np.float32)
+
+        def close(self):
+            closed.append(self.pid)
+
+    src = plb.ProcSource(q, lambda _m: None, stop, lambda _t: (777, 'pbz.exe'))
+    src.request = ('game', ('pbz.exe',))
+    with patch.object(plb, 'ProcessLoopback', FakePL), \
+         patch.object(plb, '_pid_has_audio', side_effect=lambda _p: has_audio_flag[0]), \
+         patch.object(plb, '_pid_alive', return_value=True), \
+         patch.object(plb.time, 'monotonic', side_effect=lambda: now_t[0]), \
+         patch.object(plb.comtypes, 'CoInitializeEx'), patch.object(plb.comtypes, 'CoUninitialize'):
+        src.run()
+
+    assert len(created) == 2 and len(closed) == 2
+    assert src.reattach == 1
+    assert all(k == (('game', ('pbz.exe',)), 777) for k in keys_seen)
+    assert not q.empty()
+
+    # 2) VirtualDualSense: stick-only updates coalesce <2 ms, button/trigger changes flush at once.
+    sent = []
+    pad = VirtualDualSense()
+    pad.sock = SimpleNamespace(sendall=lambda d: sent.append(d))
+    rep = bytearray(64)
+    rep[0], rep[8] = 1, 8
+    rep[1] = 128
+    with patch('xds.time.perf_counter', side_effect=[1.000, 1.0005, 1.0025, 1.0028]):
+        pad.forward(bytes(rep))          # initial
+        rep[1] = 140
+        pad.forward(bytes(rep))          # stick delta at 0.5 ms -> coalesced
+        rep[1] = 160
+        pad.forward(bytes(rep))          # stick delta at 2.5 ms -> sent
+        rep[8] |= 0x20                   # button press at +0.3 ms -> sent immediately
+        pad.forward(bytes(rep))
+    assert len(sent) == 3
+
+
 if __name__ == '__main__':
     test_scene_suppression()
     test_proc_loopback_multi_pid_and_stickiness()
+    test_proc_hot_reattach_and_stick_coalescing()
     test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()

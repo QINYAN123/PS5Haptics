@@ -231,16 +231,17 @@ class PadSpeakerTap(threading.Thread):
     def run(self):
         try: comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
         except OSError: pass
-        lb = None; check = 0.0; said = False
+        lb = None; check = 0.0; said = False; self._was_connected = False
         while not self.stop_ev.is_set():
             if lb is None:
-                if time.monotonic() - check < 2.0:
-                    self.stop_ev.wait(0.2); continue
+                cooldown = 0.4 if self._was_connected else 2.0
+                if time.monotonic() - check < cooldown:
+                    self.stop_ev.wait(0.1); continue
                 check = time.monotonic()
                 try:
                     for name, dev in render_endpoints():
                         if 'DualSense' in name and name != self.real_name:
-                            lb = EndpointLoopback(dev); self.source = name
+                            lb = EndpointLoopback(dev); self.source = name; self._was_connected = True
                             if lb.ch < 2 or lb.rate != 48000:
                                 lb.close(); lb = None; continue
                             if not said:
@@ -252,7 +253,7 @@ class PadSpeakerTap(threading.Thread):
             try:
                 x = lb.read()
             except Exception:                              # virtual pad went away
-                lb.close(); lb = None; self.source = ''; self.last_sound = 0.0
+                lb.close(); lb = None; self.source = ''; self.last_sound = 0.0; check = 0.0
                 with self.lock:
                     self.buf.clear(); self.n = 0; self.primed = False
                 continue

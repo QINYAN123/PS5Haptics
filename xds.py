@@ -255,16 +255,21 @@ class VirtualDualSense:
         else:
             self._gate_pull.clear()
             self._gate_down.update(L=False, R=False)
-        key = bytes(report[1:11])
-        if key == getattr(self, '_last_key', None) and now - getattr(self, '_last_fw', 0.0) < 0.004:
-            return
+        stick_key = bytes(report[1:5])
+        ctrl_key = bytes(report[5:11])
+        dt = now - getattr(self, '_last_fw', 0.0)
+        if ctrl_key == getattr(self, '_last_ctrl', None):
+            if stick_key == getattr(self, '_last_stick', None) and dt < 0.004:
+                return
+            if dt < 0.002:
+                return
         state = asb_input(report)
         try:
             with self.send_lock:
                 self.sock.sendall(b'I' + struct.pack('<H', len(state)) + state)
         except Exception:
             return
-        self._last_key = key; self._last_fw = now
+        self._last_stick = stick_key; self._last_ctrl = ctrl_key; self._last_fw = now
         levels = (report[5] / 255, report[6] / 255)
         left = self.trigger_input[0] <= 0.5 < levels[0]
         right = self.trigger_input[1] <= 0.5 < levels[1]

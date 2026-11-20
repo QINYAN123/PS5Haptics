@@ -293,6 +293,30 @@ def find_pid(*exe_names, prefer_pid=None):
     return None
 
 
+def _pid_has_audio(pid):
+    """Best-effort check whether `pid` has a currently audible session on default output (no snapshot)."""
+    if not pid:
+        return False
+    try:
+        from audio_sessions import (CLSID_MMDeviceEnumerator, IMMDeviceEnumerator,
+                                    IAudioSessionManager2, IAudioSessionControl2, IAudioMeterInformation)
+        en = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_ALL)
+        dev = en.GetDefaultAudioEndpoint(0, 1)
+        mgr = dev.Activate(byref(IAudioSessionManager2._iid_), comtypes.CLSCTX_ALL, None).QueryInterface(IAudioSessionManager2)
+        sessions = mgr.GetSessionEnumerator()
+        for i in range(sessions.GetCount()):
+            try:
+                unk = sessions.GetSession(i)
+                spid = unk.QueryInterface(IAudioSessionControl2).GetProcessId()
+                if spid == pid and unk.QueryInterface(IAudioMeterInformation).GetPeakValue() > 1e-4:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return None
+
+
 def find_pids(*exe_names):
     """Set of matching lowercase exe names currently running, queried in one Toolhelp snapshot."""
     want = {n.lower() for n in exe_names if n}
@@ -424,11 +448,27 @@ class ProcSource(threading.Thread):
                     if self.request == request and (request[0] != 'auto' or self.sounding()):
                         try: self.q.put_nowait((self.key, self.name.lower(), samples))
                         except _q.Full: pass
-                elif now - last_packet > 1.5:
-                    # alt-tab: the game recreates its audio stream and the capture silently stops delivering.
-                    # Re-attach (the mix path takes over meanwhile in auto mode)
-                    self.key = None; self.last_sound = 0.0
-                    stream.close(); stream = None; self.reattach += 1; check_at = 0.0
+                elif now - last_packet > 0.8:
+                    # Wait longer when the game menu is genuinely silent, but reattach promptly if the game IS playing sound
+                    # (e.g. stream recreated after alt-tab or mid-combat Wwise reset) without dropping self.key/route.
+                    has_audio = _pid_has_audio(current[0]) if current else None
+                    if has_audio is False and now - last_packet < 6.0:
+                        continue
+                    old_stream, stream = stream, None
+                    old_stream.close()
+                    self.reattach += 1
+                    try:
+                        stream = ProcessLoopback(current[0])
+                        last_packet = time.monotonic()
+                    except Exception as exc:
+                        self.key = None; self.last_sound = 0.0; self.name = ''
+                        if current not in failed:
+                            detail = '按进程截音失败，将保持静音并重试：' if request[0] in ('game', 'pinned') else '按进程截音失败，暂用系统混音，会自动重试：'
+                            self.log(detail + str(exc))
+                            failed.add(current)
+                        current = current if (current and _pid_alive(current[0])) else None
+                        retry_at = time.monotonic() + 1.5
+                        check_at = 0.0
         finally:
             self.key = None
             if stream is not None:
