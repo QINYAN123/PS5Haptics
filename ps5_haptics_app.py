@@ -235,6 +235,25 @@ GSP_LOWCUT = butter(2, 150, 'highpass', fs=RATE, output='sos')
 CONTROL_HAPTICS = {'button': 'button_haptics', 'trigger': 'trigger_haptics', 'stick': 'stick_haptics', 'touch': 'touch_haptics'}
 
 
+def smooth_trigger_amp(raw_amp, prev_active, hold_until, now, hold_s=0.15):
+    """Hysteresis + release hold for audio-driven triggers to stop rapid gear-clutch clicking."""
+    out = [0, 0]
+    active = list(prev_active)
+    holds = list(hold_until)
+    for i in (0, 1):
+        a = raw_amp[i]
+        if active[i]:
+            if a >= 1:
+                out[i] = a; holds[i] = now + hold_s
+            elif now < holds[i]:
+                out[i] = 1
+            else:
+                active[i] = False; out[i] = 0
+        elif a >= 2:
+            active[i] = True; out[i] = a; holds[i] = now + hold_s
+    return (out[0], out[1]), active, holds
+
+
 def speaker_route(mode, pure, adapted, native_speaking, direct_speaking):
     if mode != '特殊事件':
         return mode
@@ -365,7 +384,7 @@ class Runner:
             raise
 
     def _open_audio(self, hint_override=None, output_name=None):
-        for attempt in range(4):
+        for attempt in range(6):
             if self.stop_ev.is_set():
                 raise RuntimeError('已取消')
             p = stream = out = None
@@ -383,9 +402,9 @@ class Runner:
             except PermissionError:
                 raise
             except (LookupError, OSError) as exc:
-                if attempt == 3:
+                if attempt == 5:
                     raise RuntimeError(f'打开{stage}失败：{exc}') from exc
-                self.log(f'{stage}暂不可用，正在重新枚举设备（{attempt + 1}/3）：{exc}')
+                self.log(f'{stage}暂不可用，正在重新枚举设备（{attempt + 1}/5）：{exc}')
             finally:
                 if p is not None and out is None:
                     close_stream(stream)
@@ -426,6 +445,19 @@ class Runner:
                 current = vision
                 if current is not None:
                     current.notify_input(report)
+
+            default_id = None; saved_default_id = None; saved_default_name = ''
+            if native or not self.cfg.get('source_hint'):
+                try:
+                    from audio_default import DefaultOutputWatcher
+                    watcher = DefaultOutputWatcher()
+                    default_id, default_name = watcher.current_info()
+                    if default_id and 'dualsense' not in default_name.lower():
+                        saved_default_id, saved_default_name = default_id, default_name
+                    elif default_name and 'dualsense' in default_name.lower() and self.capture_locked:
+                        self.log('提示：当前 Windows 默认声音输出设备是 PS5 手柄，游戏主声音会只从手柄发声、电脑音箱无声；请在 Windows 声音设置里改回音箱/耳机。')
+                except Exception as exc:
+                    self.log('无法监视默认声音输出（不影响使用）：' + str(exc))
 
             if takeover:
                 iso = Isolation(self.log)
@@ -568,23 +600,23 @@ class Runner:
             was_locked = self.capture_locked
             input_route = None
             rum_tail = 0
+            trig_active = [False, False]; trig_hold_until = [0.0, 0.0]
             _z_hop32 = np.zeros(HOP, dtype=np.float32); _z_hop32.setflags(write=False)
-            default_id = None
-            if not self.cfg.get('source_hint'):
-                try:
-                    from audio_default import DefaultOutputWatcher
-                    watcher = DefaultOutputWatcher(); default_id = watcher.current()
-                except Exception as exc:
-                    self.log('无法监视默认声音输出（不影响使用）：' + str(exc))
             while not self.stop_ev.is_set():
                 capture_changed = was_locked != self.capture_locked
                 default_changed = False
                 if time.monotonic() - alive_check > 1.0:
                     alive_check = time.monotonic()
-                    now_id = watcher.current() if watcher else None
-                    default_changed = bool(now_id and now_id != default_id)
-                    if default_changed:
+                    now_id, now_name = watcher.current_info() if watcher else (None, '')
+                    if now_id and 'dualsense' in now_name.lower() and saved_default_id and now_id != saved_default_id:
+                        if watcher.set_default(saved_default_id):
+                            self.log(f'检测到虚拟 PS5 手柄接管了系统默认音频，已自动恢复到「{saved_default_name}」。')
+                            now_id, now_name = saved_default_id, saved_default_name
+                    if now_id and now_id != default_id:
                         default_id = now_id
+                        if 'dualsense' not in now_name.lower():
+                            saved_default_id, saved_default_name = now_id, now_name
+                        default_changed = not self.capture_locked and not self.cfg.get('source_hint')
                     elif not self.capture_locked and not capture_changed:
                         stream = self._refresh_stream(stream, p, src)
                 if capture_changed or default_changed or (not self.capture_locked and stream is None) or out.failure is not None:
@@ -1027,8 +1059,9 @@ class Runner:
                 if len(pend_l) > 4 * HOP:          # never build up latency
                     pend_l, pend_r = pend_l[-HOP:], pend_r[-HOP:]
                 static = trigger_presets.effects(self.cfg)
-                amp = (int(round(min(1.0, trig[0] * self.cfg.get('trigger_left_gain', 1.0)) * 8)),
-                       int(round(min(1.0, trig[1] * self.cfg.get('trigger_right_gain', 1.0)) * 8)))
+                raw_amp = (int(round(min(1.0, trig[0] * self.cfg.get('trigger_left_gain', 1.0)) * 8)),
+                           int(round(min(1.0, trig[1] * self.cfg.get('trigger_right_gain', 1.0)) * 8)))
+                amp, trig_active, trig_hold_until = smooth_trigger_amp(raw_amp, trig_active, trig_hold_until, now)
                 game_l = game_r = None
                 if native:
                     game_l, game_r, _ = vpad.triggers()
@@ -1096,7 +1129,7 @@ class Runner:
                         rf = ov_r or ours(1)
                         hid.set_triggers(lf, rf); last_trig = (-1, -1); amp = None
                 if amp is not None and (amp != last_trig or static != last_static):
-                    if hid.set_triggers(ours(0), ours(1)):
+                    if hid.set_triggers(ours(0), ours(1), min_interval=0.05):
                         last_trig = amp; last_static = static
                 now_tl = time.monotonic()
                 if now_tl - tl_t >= 0.1:                          # self-check timeline: where the vibration came from

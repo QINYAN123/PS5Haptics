@@ -9,7 +9,9 @@ Installers are the unmodified official releases, shipped in the folder 依赖安
 a UAC prompt when it finds something missing. Nothing here runs without the user clicking.
 """
 import ctypes
+import os
 import pathlib
+import platform
 import subprocess
 import sys
 import winreg
@@ -157,9 +159,32 @@ def run_elevated(exe, args=''):
     return r > 32
 
 
+USBIP_MIN_BUILD = 19041   # Windows 10 2004 (20H1) x64+
+
+
+def usbip_supported():
+    """Return (ok, reason) for usbip-win2 OS compatibility."""
+    arch = (os.environ.get('PROCESSOR_ARCHITEW6432') or platform.machine() or '').lower()
+    if arch not in ('amd64', 'x86_64'):
+        return False, f'当前系统架构（{arch or "未知"}）不支持 64 位 usbip-win2 驱动'
+    try:
+        build = sys.getwindowsversion().build
+    except Exception:
+        return True, ''
+    if build < USBIP_MIN_BUILD:
+        return False, (f'当前 Windows 版本（Build {build}）低于 usbip-win2 要求的 Windows 10 2004（Build {USBIP_MIN_BUILD}）或 Windows 11，'
+                       '无法安装虚拟 PS5 手柄驱动（原生透传）。请升级 Windows，或在软件中改用「普通」/「接管」/「虚拟 Xbox」模式。')
+    return True, ''
+
+
 def install(key, log=print):
     """Silent install of one dependency (must already be elevated). Falls back to the normal setup UI."""
     _k, disp, svc, pattern, args, _n = next(d for d in DEPS if d[0] == key)
+    if key == 'usbip':
+        ok_os, reason = usbip_supported()
+        if not ok_os:
+            log(f'跳过 {disp}：{reason}')
+            return False
     found = sorted(installer_dir().glob(pattern))
     exe = found[-1] if found else fetch_official(key, log)
     if exe is None:

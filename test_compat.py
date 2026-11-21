@@ -1093,10 +1093,40 @@ def test_proc_hot_reattach_and_stick_coalescing():
     assert len(sent) == 3
 
 
+def test_v2328_fixes():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import deps
+    import ps5_haptics_app as app
+
+    # 1) Trigger gear-chatter hysteresis: tiny amp=1 noise doesn't engage, amp>=2 engages and holds 150 ms.
+    active, holds = [False, False], [0.0, 0.0]
+    amp, active, holds = app.smooth_trigger_amp((1, 0), active, holds, 10.0)
+    assert amp == (0, 0) and active == [False, False]
+    amp, active, holds = app.smooth_trigger_amp((3, 0), active, holds, 10.05)
+    assert amp == (3, 0) and active == [True, False]
+    amp, active, holds = app.smooth_trigger_amp((0, 0), active, holds, 10.10)
+    assert amp == (1, 0) and active == [True, False]
+    amp, active, holds = app.smooth_trigger_amp((0, 0), active, holds, 10.25)
+    assert amp == (0, 0) and active == [False, False]
+
+    # 2) usbip OS build check rejects older Win10 (< 19041) cleanly without launching incompatible setup.
+    with patch.object(deps.sys, 'getwindowsversion', return_value=SimpleNamespace(build=17763), create=True), \
+         patch.object(deps.platform, 'machine', return_value='AMD64'), \
+         patch.dict(deps.os.environ, {}, clear=False):
+        ok, msg = deps.usbip_supported()
+        assert not ok and '19041' in msg
+    with patch.object(deps.sys, 'getwindowsversion', return_value=SimpleNamespace(build=26200), create=True), \
+         patch.object(deps.platform, 'machine', return_value='AMD64'):
+        ok, _ = deps.usbip_supported()
+        assert ok
+
+
 if __name__ == '__main__':
     test_scene_suppression()
     test_proc_loopback_multi_pid_and_stickiness()
     test_proc_hot_reattach_and_stick_coalescing()
+    test_v2328_fixes()
     test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()
