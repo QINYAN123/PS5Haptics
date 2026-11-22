@@ -248,6 +248,7 @@ class DualSenseHID:
                         candidate.close()
                         return False
                     self.dev = candidate
+                    self.last = (None, None)
                     self.last_write = 0.0
                 return True
             except (OSError, ValueError):
@@ -272,7 +273,7 @@ class DualSenseHID:
 
     def set_triggers(self, left_effect, right_effect, min_interval=0.016, force=False):
         now = time.monotonic()
-        if not force and (left_effect, right_effect) == self.last and now - self.last_write < 1.0:
+        if not force and (left_effect, right_effect) == self.last:
             return False
         if not force and now - self.last_write < min_interval:
             return False

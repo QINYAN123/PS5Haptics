@@ -8,12 +8,14 @@ wins where the routing says so (原生透传 with trigger mode 自动 / 叠加 /
 Our own designs on the public DualSense trigger effect formats (0x21 feedback per zone,
 0x25 weapon, 0x26 vibration); not taken from any other product.
 """
-from ds_hid import effect_feedback, effect_vibration, effect_weapon, effect_zones
+from ds_hid import effect_feedback, effect_off, effect_vibration, effect_weapon, effect_zones
 
 SOUND = '声音震动'
+OFF = '关闭'
 # name: kind and the numbers it starts from. start / end: % of the trigger travel; strength 1..8; freq Hz
 PRESETS = {
     SOUND:      dict(kind=None),
+    OFF:        dict(kind='off'),
     '轻阻力':   dict(kind='feedback', start=0, strength=3),
     '重阻力':   dict(kind='feedback', start=0, strength=7),
     '后段阻力': dict(kind='feedback', start=50, strength=6),
@@ -55,7 +57,7 @@ def values_for(name):
 def uses(name):
     """Which sliders matter for this preset."""
     kind = PRESETS.get(name, {}).get('kind')
-    if kind is None:
+    if kind in (None, 'off'):
         return ()
     return ('start', 'strength') + (('end',) if kind == 'weapon' else ('freq',) if kind == 'vibration' else ())
 
@@ -70,6 +72,8 @@ def effect(cfg, side):
     kind = PRESETS.get(name, {}).get('kind')
     if kind is None:
         return None
+    if kind == 'off':
+        return effect_off()
     get = lambda p: cfg.get(key(p, side), values_for(name)[p])
     lo, hi = RANGES['strength']
     strength = max(lo, min(hi, int(round(float(get('strength'))))))

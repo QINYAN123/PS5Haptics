@@ -11,7 +11,9 @@ import sys
 ROOT = pathlib.Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else pathlib.Path(__file__).resolve().parent
 NOT_GAMES = {'', 'explorer.exe', 'ps5haptics.exe', 'viiperhost.exe', 'python.exe', 'pythonw.exe', 'searchhost.exe',
              'shellexperiencehost.exe', 'startmenuexperiencehost.exe', 'applicationframehost.exe',
-             'chrome.exe', 'msedge.exe', 'firefox.exe', 'steam.exe', 'steamwebhelper.exe', 'discord.exe'}   # often in front of a game
+             'chrome.exe', 'msedge.exe', 'firefox.exe', 'steam.exe', 'steamwebhelper.exe', 'discord.exe',
+             'chatgpt.exe', 'antigravity.exe', 'code.exe', 'cursor.exe', 'claude.exe', 'taskmgr.exe',
+             'cmd.exe', 'powershell.exe', 'windowsterminal.exe'}   # often in front of a game
 
 
 class GameCaps:
@@ -21,7 +23,7 @@ class GameCaps:
         try:
             loaded = json.loads(self.path.read_text('utf8'))
             if isinstance(loaded, dict):
-                self.data = {str(k): set(v) for k, v in loaded.items() if isinstance(v, list)}
+                self.data = {str(k): set(v) for k, v in loaded.items() if isinstance(v, list) and str(k).lower() not in NOT_GAMES}
         except (OSError, ValueError):
             pass                         # first run or a damaged file: simply learn again
 

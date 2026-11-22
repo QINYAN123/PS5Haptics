@@ -511,16 +511,17 @@ class TriggerGauge(tk.Canvas):
         self.tag = self.create_text(c, px(158), text='原生扳机  —', fill=FAINT, font=(ZH, 9))
         self.vp = self.vv = 0.0
 
-    def update_vals(self, press, vib, native):
-        self.vp = press; self.vv = max(vib, self.vv * 0.85)
-        key = (int(self.vp * 100), int(self.vv * 60), bool(native))
+    def update_vals(self, press, vib, native, off=False):
+        self.vp = press; self.vv = 0.0 if off else max(vib, self.vv * 0.85)
+        key = (int(self.vp * 100), int(self.vv * 60), bool(native), bool(off))
         if key == getattr(self, '_last', None):
             return
         self._last = key
         self.itemconfigure(self.press, extent=-240 * max(0.0, min(1.0, self.vp)))
         self.itemconfigure(self.vib, extent=-240 * max(0.0, min(1.0, self.vv)))
         self.itemconfigure(self.num, text=f'{key[0]}')
-        self.itemconfigure(self.tag, text='原生扳机  ON' if native else '原生扳机  —', fill=GREEN if native else FAINT)
+        self.itemconfigure(self.tag, text='扳机已关闭' if off else ('原生扳机  ON' if native else '原生扳机  —'),
+                           fill=FAINT if (off or not native) else GREEN)
 
 
 class SkillHex(tk.Canvas):
@@ -734,6 +735,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     import trigger_presets as TP
     for sc, defaults in SCENE_DEF.items():
         defaults.update(TP.scene_defaults())
+        defaults['trigger_press_gate'] = True
         defaults['suppress_background'] = suppression_enabled({}, sc)
         defaults['capture_exe'] = ''
     SCENE_DEF['游戏']['capture'] = '仅游戏进程'
@@ -1163,6 +1165,42 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
     tg_row = tk.Frame(p_trig.body, bg=PANEL); tg_row.pack(pady=px(4), expand=True)
     gl = TriggerGauge(tg_row, 'L'); gl.pack(side='left'); gr = TriggerGauge(tg_row, 'R'); gr.pack(side='left')
     tk.Label(p_trig.body, text='外圈 = 按压深度　内圈 = 扳机震动', bg=PANEL, fg=FAINT, font=(ZH, 8)).pack()
+    tb = tk.Frame(p_trig.body, bg=PANEL); tb.pack(fill='x', pady=(px(4), 0))
+    prev_trig_mode = {sc: '自动' for sc in SCENES}
+
+    def _scene_trig_off(sc=None):
+        sv = SV[sc or V['scene'].get()]
+        return sv['trigger_mode'].get() == '关闭' or (sv[TP.preset_key('L')].get() == TP.OFF and sv[TP.preset_key('R')].get() == TP.OFF)
+
+    def toggle_triggers_quick():
+        sc = V['scene'].get(); sv = SV[sc]
+        if _scene_trig_off(sc):
+            sv['trigger_mode'].set(prev_trig_mode.get(sc, '自动'))
+            if sv[TP.preset_key('L')].get() == TP.OFF and sv[TP.preset_key('R')].get() == TP.OFF:
+                sv[TP.preset_key('L')].set(TP.SOUND); sv[TP.preset_key('R')].set(TP.SOUND)
+            msgs.put('已重新开启自适应扳机。')
+        else:
+            cur_m = sv['trigger_mode'].get()
+            if cur_m != '关闭':
+                prev_trig_mode[sc] = cur_m
+            sv['trigger_mode'].set('关闭')
+            msgs.put('已关闭自适应扳机：L2 / R2 扳机电机已完全停用，不再产生任何齿轮咔咔声。')
+
+    trig_quick_btn = NeonButton(tb, '关闭自适应扳机', toggle_triggers_quick, w=150, h=30, size=10, color=MAG)
+    trig_quick_btn.pack(expand=True)
+
+    def _upd_trig_quick(*_a):
+        sc = V['scene'].get(); sv = SV[sc]; cur_m = sv['trigger_mode'].get()
+        if cur_m != '关闭':
+            prev_trig_mode[sc] = cur_m
+        off_now = _scene_trig_off(sc)
+        trig_quick_btn.config_look(text='开启自适应扳机' if off_now else '关闭自适应扳机', color=GREEN if off_now else MAG)
+
+    V['scene'].trace_add('write', _upd_trig_quick)
+    for _sc in SCENES:
+        for _k in ('trigger_mode', TP.preset_key('L'), TP.preset_key('R')):
+            SV[_sc][_k].trace_add('write', _upd_trig_quick)
+    _upd_trig_quick()
 
     row2 = tk.Frame(pg, bg=BG); row2.pack(fill='x', pady=(px(10), px(10)))
     p_ev = Panel(row2, '事件特调', 'EVENT FX', accent=AMBER); p_ev.pack(side='right', fill='both', padx=(px(10), 0))
@@ -1470,8 +1508,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
 
     def trigger_panel(f, sv):
         pnl = Panel(f, '扳机手感', 'TRIGGER FEEL', accent=MAG); pnl.pack(fill='x', pady=(0, px(10)))
-        tk.Label(pnl.body, text='每个扳机先选一个手感预设，再用滑块微调。「声音震动」就是扳机跟着声音震（默认）。原生透传下游戏自己用扳机时，'
-                 '按「连接方式」里扳机来源的设置，游戏的效果优先。', bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left',
+        tk.Label(pnl.body, text='每个扳机先选一个手感预设，再用滑块微调。「声音震动」就是扳机跟着声音震（默认），不想用某一侧扳机可选「关闭」。原生透传下游戏自己用扳机时，'
+                 '按「连接方式」里扳机来源的设置，游戏的效果优先（选「关闭」则始终停用该侧扳机）。', bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left',
                  wraplength=px(900)).pack(fill='x', pady=(0, px(6)))
         grid = tk.Frame(pnl.body, bg=PANEL); grid.pack(fill='x')
         labels = dict(start=('起点', '%', '扳机按到这里开始起作用'), strength=('强度', '', ''), end=('断开点', '%', '阻力在这里“咔”地断开'),
@@ -1481,7 +1519,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             col = tk.Frame(grid, bg=PANEL); col.grid(row=0, column=i, sticky='new', padx=(0, px(16)) if i == 0 else 0)
             tk.Label(col, text=title, bg=PANEL, fg=MAG, font=(ZH, 10, 'bold'), anchor='w').pack(fill='x')
             pv = sv[TP.preset_key(side)]
-            Segmented(col, pv, TP.NAMES, cell=92, cols=3 if i18n.LANG == 'zh' else 2, color=MAG, rec=TP.SOUND).pack(anchor='w', pady=(px(4), px(4)))
+            Segmented(col, pv, TP.NAMES, cell=92, cols=4 if i18n.LANG == 'zh' else 2, color=MAG, rec=TP.SOUND).pack(anchor='w', pady=(px(4), px(4)))
             sliders = {}
             for p in TP.PARAMS:
                 lo, hi = TP.RANGES[p]; text, unit, hint = labels[p]
@@ -1489,7 +1527,8 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             note = tk.Label(col, text='跟着声音震动，强度在「触感」的扳机强度里调。', bg=PANEL, fg=FAINT, font=(ZH, 9), anchor='w')
 
             def layout(*_a, pv=pv, sliders=sliders, note=note):
-                use = TP.uses(pv.get())
+                cur_p = pv.get()
+                use = TP.uses(cur_p)
                 for s in sliders.values():
                     s.pack_forget()
                 note.pack_forget()
@@ -1497,6 +1536,7 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                     if p in use:
                         sliders[p].pack(fill='x', pady=px(1))
                 if not use:
+                    note.configure(text='已关闭这一侧的自适应扳机效果。' if cur_p == TP.OFF else '跟着声音震动，强度在「触感」的扳机强度里调。')
                     note.pack(fill='x', pady=px(6))
 
             def load(*_a, pv=pv, side=side):                  # a preset is a starting point: its numbers go into the sliders
@@ -1509,7 +1549,14 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             for p in TP.PARAMS:
                 sv[TP.key(p, 'R')].set(sv[TP.key(p, 'L')].get())
             msgs.put('右扳机已改成和左扳机一样的手感。')
-        NeonButton(pnl.body, '右扳机用左边的设置', copy_lr, w=170, h=30, size=10, color=MAG).pack(anchor='w', pady=(px(6), 0))
+
+        def off_both():
+            sv[TP.preset_key('L')].set(TP.OFF); sv[TP.preset_key('R')].set(TP.OFF)
+            msgs.put('已将左右扳机全部设为关闭。')
+
+        btn_row = tk.Frame(pnl.body, bg=PANEL); btn_row.pack(fill='x', pady=(px(6), 0))
+        NeonButton(btn_row, '右扳机用左边的设置', copy_lr, w=170, h=30, size=10, color=MAG).pack(side='left')
+        NeonButton(btn_row, '左右扳机全部关闭', off_both, w=160, h=30, size=10, color=FAINT).pack(side='left', padx=px(8))
 
     def settings_body(f, sv, sc, acc, game=None):
         pnl = Panel(f, '连接方式', 'ROUTING', accent=acc); pnl.pack(fill='x', pady=(0, px(10)))
@@ -1521,11 +1568,11 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
                      bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(0, px(8)))
         if sc == '游戏':
             for label, key, values, rec_v, col in (('握把', 'fusion', ('叠加', '替换', '纯用游戏'), '叠加', CYAN),
-                                                   ('扳机', 'trigger_mode', ('自动', '叠加', '替换', '纯用游戏'), '自动', MAG)):
+                                                   ('扳机', 'trigger_mode', ('自动', '叠加', '替换', '纯用游戏', '关闭'), '自动', MAG)):
                 fr = tk.Frame(pnl.body, bg=PANEL); fr.pack(fill='x', pady=(0, px(6)))
                 tk.Label(fr, text=label, bg=PANEL, fg=TEXT, font=(ZH, 10), width=6 if i18n.LANG == 'zh' else 10, anchor='w').pack(side='left')
-                Segmented(fr, sv[key], values, cell=124, color=col, rec=rec_v).pack(side='left')
-            tk.Label(pnl.body, text='叠加 = 游戏效果和本软件效果一起；替换 = 只用本软件的；纯用游戏 = 关掉本软件的，只用游戏自己的。握把选纯用游戏时，事件特调也一起关掉；扬声器选特殊事件时，游戏不发声手柄就安静。\n'
+                Segmented(fr, sv[key], values, cell=116, color=col, rec=rec_v).pack(side='left')
+            tk.Label(pnl.body, text='叠加 = 游戏效果和本软件效果一起；替换 = 只用本软件的；纯用游戏 = 关掉本软件的，只用游戏自己的；关闭 = 彻底停用左右自适应扳机电机（完全消除扳机齿轮声）。握把选纯用游戏时，事件特调也一起关掉；扬声器选特殊事件时，游戏不发声手柄就安静。\n'
                      '扳机同一时间只能跑一个效果，所以叠加时，游戏在用的那一侧归游戏，另一侧归本软件。自动 = 游戏发过扳机效果就交给游戏并记住，没发过就用本软件的。',
                      bg=PANEL, fg=DIM, font=(ZH, 9), anchor='w', justify='left', wraplength=px(900)).pack(fill='x', pady=(px(2), px(8)))
             NeonButton(pnl.body, '重置让位记录', reset_caps, w=150, h=32, size=10).pack(anchor='w')
@@ -1549,6 +1596,45 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             Slider(pnl.body, '鼓点（双手握把）', V['music_kick'], color=MAG).pack(fill='x', pady=px(2))
             Slider(pnl.body, '踩镲点触（右手轻快）', V['music_tick'], color=MAG).pack(fill='x', pady=px(2))
             Slider(pnl.body, '扳机律动（手指压着扳机才感觉得到）', V['music_trigger'], color=MAG).pack(fill='x', pady=px(2))
+        trig_on_v = tk.BooleanVar(value=True)
+        _sync_trig = {'busy': False, 'prev': '自动'}
+
+        def _on_trig_toggle(*_a):
+            if _sync_trig['busy']:
+                return
+            _sync_trig['busy'] = True
+            if trig_on_v.get():
+                if sv['trigger_mode'].get() == '关闭':
+                    sv['trigger_mode'].set(_sync_trig['prev'] if _sync_trig['prev'] != '关闭' else '自动')
+                if sv[TP.preset_key('L')].get() == TP.OFF and sv[TP.preset_key('R')].get() == TP.OFF:
+                    sv[TP.preset_key('L')].set(TP.SOUND); sv[TP.preset_key('R')].set(TP.SOUND)
+            else:
+                if sv['trigger_mode'].get() != '关闭':
+                    _sync_trig['prev'] = sv['trigger_mode'].get()
+                sv['trigger_mode'].set('关闭')
+            _sync_trig['busy'] = False
+
+        def _on_mode_change(*_a):
+            if _sync_trig['busy']:
+                return
+            _sync_trig['busy'] = True
+            cur_m = sv['trigger_mode'].get()
+            if cur_m != '关闭':
+                _sync_trig['prev'] = cur_m
+            off_now = cur_m == '关闭' or (sv[TP.preset_key('L')].get() == TP.OFF and sv[TP.preset_key('R')].get() == TP.OFF)
+            trig_on_v.set(not off_now)
+            _sync_trig['busy'] = False
+
+        trig_on_v.trace_add('write', _on_trig_toggle)
+        for _k in ('trigger_mode', TP.preset_key('L'), TP.preset_key('R')):
+            sv[_k].trace_add('write', _on_mode_change)
+        _on_mode_change()
+        Toggle(pnl.body, '启用自适应扳机', trig_on_v,
+               '关闭后彻底停用 L2 / R2 自适应扳机电机（包括游戏原生和本软件效果），完全消除扳机齿轮咔咔声',
+               wrap=420, color=MAG).pack(fill='x', pady=(px(6), px(2)))
+        Toggle(pnl.body, '仅按住扳机时震动（防齿轮咔咔声）', sv['trigger_press_gate'],
+               '默认开启：手指未按压 L2 / R2 时不发送扳机震动、不反复伸缩齿轮，消除手柄静止和握把震动时的咔咔声',
+               wrap=420, color=GREEN).pack(fill='x', pady=px(2))
         pnl = style_pnl
         tk.Label(pnl.body, text='握把风格', bg=PANEL, fg=TEXT, font=(ZH, 10), anchor='w').pack(fill='x')
         Segmented(pnl.body, sv['grip_profile'], GRIP_PROFILES, cell=116, rec='均衡').pack(anchor='w', pady=(px(4), px(10)))
@@ -2242,7 +2328,10 @@ def run_ui(cfg, runner_cls, save_cfg, test_fn, log_path=None):
             rum = s.get('rumble', (0.0, 0.0))
             scope.push(s.get('level', 0.0) if run else 0.0, max(rum) if run else 0.0, idle=not run)
             pr = s.get('press', (0.0, 0.0)); tr = s.get('trigger', (0.0, 0.0)); nt = s.get('native_trig', (False, False))
-            gl.update_vals(pr[0], tr[0], nt[0]); gr.update_vals(pr[1], tr[1], nt[1])
+            sc_now = V['scene'].get(); sv_now = SV[sc_now]
+            all_off = sv_now['trigger_mode'].get() == '关闭'
+            gl.update_vals(pr[0], tr[0], nt[0], off=all_off or sv_now[TP.preset_key('L')].get() == TP.OFF)
+            gr.update_vals(pr[1], tr[1], nt[1], off=all_off or sv_now[TP.preset_key('R')].get() == TP.OFF)
         if reschedule:
             schedule()
 

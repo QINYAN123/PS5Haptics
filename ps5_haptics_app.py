@@ -37,6 +37,7 @@ DEFAULTS = {'grip_profile': '均衡', 'trigger_profile': '均衡冲击', 'grip_g
             'skip_center': True, 'foreground_exe': '', 'source_hint': '',
             'mode': '原生透传', 'fusion': '叠加', 'trigger_mode': '自动', 'rumble_gain': 1.0, 'speaker_mode': '特殊事件', 'speaker_eq': '原味', 'speaker_volume': 0.8, 'haptic_style': '游戏', 'pbz_fx': True, 'ww_fx': True, 'ww_enabled': True,
             'cinema_rumble': 1.0, 'cinema_kick': 1.0, 'cinema_trigger': 1.0, 'music_kick': 1.0, 'music_tick': 1.0, 'music_trigger': 1.0, 'record_native': True, 'event_fx': True,
+            'trigger_press_gate': True,
             **trigger_presets.scene_defaults(), 'user_games': [],
             'ww_vision': True, 'ww_skill_icons': False, 'ww_skill_shadow': False, 'ww_click_gate': True, 'ww_bike_swap': True, 'ww_bike_audio': True, 'game_profiles': True, 'capture': '自动', 'speaker_scene': True, 'pbz_log_dir': ''}
 
@@ -235,12 +236,15 @@ GSP_LOWCUT = butter(2, 150, 'highpass', fs=RATE, output='sos')
 CONTROL_HAPTICS = {'button': 'button_haptics', 'trigger': 'trigger_haptics', 'stick': 'stick_haptics', 'touch': 'touch_haptics'}
 
 
-def smooth_trigger_amp(raw_amp, prev_active, hold_until, now, hold_s=0.15):
+def smooth_trigger_amp(raw_amp, prev_active, hold_until, now, hold_s=0.15, pressed=(True, True)):
     """Hysteresis + release hold for audio-driven triggers to stop rapid gear-clutch clicking."""
     out = [0, 0]
     active = list(prev_active)
     holds = list(hold_until)
     for i in (0, 1):
+        if not pressed[i]:
+            active[i] = False; holds[i] = 0.0; out[i] = 0
+            continue
         a = raw_amp[i]
         if active[i]:
             if a >= 1:
@@ -252,6 +256,19 @@ def smooth_trigger_amp(raw_amp, prev_active, hold_until, now, hold_s=0.15):
         elif a >= 2:
             active[i] = True; out[i] = a; holds[i] = now + hold_s
     return (out[0], out[1]), active, holds
+
+
+def stabilize_native_trigger(eff, last_phys, pressed, press_gate=True):
+    """Stop idle/combat native trigger gear chatter (e.g. 0x22 <-> 0x05 pulses while triggers are unpressed)."""
+    is_off = eff is None or eff[0] in (0x00, 0x05)
+    eff = effect_off() if is_off else eff
+    if not press_gate:
+        return eff
+    if eff[0] == 0x26 and not pressed:
+        return last_phys if (last_phys is not None and last_phys[0] in (0x21, 0x22, 0x25)) else effect_off()
+    if is_off and not pressed and last_phys is not None and last_phys[0] in (0x21, 0x22, 0x25):
+        return last_phys
+    return eff
 
 
 def speaker_route(mode, pure, adapted, native_speaking, direct_speaking):
@@ -587,7 +604,7 @@ class Runner:
             def ours(i):                          # this side's own effect: a trigger-feel preset, else follow the sound
                 if static[i] is not None:
                     return static[i]
-                return effect_vibration(amp[i], 30 + 25 * trig[i]) if amp[i] else effect_off()
+                return effect_vibration(amp[i], 27 + 3 * amp[i]) if amp[i] else effect_off()
             try:
                 from proc_loopback import ProcSource
                 self.proc = ProcSource(self.q, self.log, self.stop_ev, self._foreground_game)
@@ -601,6 +618,7 @@ class Runner:
             input_route = None
             rum_tail = 0
             trig_active = [False, False]; trig_hold_until = [0.0, 0.0]
+            trig_pressed = [False, False]; native_phys = [effect_off(), effect_off()]
             _z_hop32 = np.zeros(HOP, dtype=np.float32); _z_hop32.setflags(write=False)
             while not self.stop_ev.is_set():
                 capture_changed = was_locked != self.capture_locked
@@ -732,6 +750,7 @@ class Runner:
                         stuck.reset_wave()
                         game_speaker_active = False
                         pad_session_check = 0.0
+                        native_phys = [effect_off(), effect_off()]
                     fg = new_fg
                     g_now = self.profile_for(fg)
                     g_name = g_now.get('name') if g_now else None
@@ -888,14 +907,20 @@ class Runner:
                             name = fx.feed(*ev)
                             if name: self.stats['fx_last'] = name
                     st = vision.states() if bike_mode == 'other' else dict.fromkeys(vision.final)
+                    trig_off_mode = self.cfg.get('trigger_mode', '自动') == '关闭'
                     for side, (skill, eff, gate) in STATE_TRIGGERS.items():
-                        on = bool(st.get(skill))
+                        side_disabled = trig_off_mode or self.cfg.get(trigger_presets.preset_key(side)) == trigger_presets.OFF
+                        on = bool(st.get(skill)) and not side_disabled
                         fx.set_state_trigger(side, eff if on else None)
                         if native and vpad is not None:            # game sees the press only past the click
                             vpad.gate[side] = self.cfg.get('ww_gate_' + side, gate) if on and self.cfg.get('ww_click_gate', True) and self.cfg.get('trigger_mode') != '纯用游戏' else None
                     if vision.skills and not vision.skill_icons and bike_mode in ('other', 'unknown'):
-                        control_triggers = tuple(STATE_TRIGGERS[side][1] if st.get(STATE_TRIGGERS[side][0])
-                                                 else effect_off() for side in ('L', 'R'))
+                        control_triggers = tuple(
+                            STATE_TRIGGERS[side][1]
+                            if st.get(STATE_TRIGGERS[side][0]) and not trig_off_mode and self.cfg.get(trigger_presets.preset_key(side)) != trigger_presets.OFF
+                            else effect_off()
+                            for side in ('L', 'R')
+                        )
                     self.stats['ww'] = (st, vision.frames, str(vision.error) if vision.error else '')
                 if fx is not None:
                     for name in fx.poll():
@@ -1058,10 +1083,32 @@ class Runner:
                     gpk_l = max(gpk_l, float(np.max(np.abs(wl)))); gpk_r = max(gpk_r, float(np.max(np.abs(wr))))
                 if len(pend_l) > 4 * HOP:          # never build up latency
                     pend_l, pend_r = pend_l[-HOP:], pend_r[-HOP:]
+                for i in (0, 1):
+                    trig_pressed[i] = press[i] >= (0.02 if trig_pressed[i] else 0.05)
+                press_gate = bool(self.cfg.get('trigger_press_gate', True))
                 static = trigger_presets.effects(self.cfg)
-                raw_amp = (int(round(min(1.0, trig[0] * self.cfg.get('trigger_left_gain', 1.0)) * 8)),
-                           int(round(min(1.0, trig[1] * self.cfg.get('trigger_right_gain', 1.0)) * 8)))
-                amp, trig_active, trig_hold_until = smooth_trigger_amp(raw_amp, trig_active, trig_hold_until, now)
+                side_off = (self.cfg.get(trigger_presets.preset_key('L')) == trigger_presets.OFF,
+                            self.cfg.get(trigger_presets.preset_key('R')) == trigger_presets.OFF)
+                raw_amp = (0 if static[0] is not None else int(round(min(1.0, trig[0] * self.cfg.get('trigger_left_gain', 1.0)) * 8)),
+                           0 if static[1] is not None else int(round(min(1.0, trig[1] * self.cfg.get('trigger_right_gain', 1.0)) * 8)))
+                gate_open = ((trig_pressed[0] if press_gate else True) and static[0] is None,
+                             (trig_pressed[1] if press_gate else True) and static[1] is None)
+                amp, trig_active, trig_hold_until = smooth_trigger_amp(raw_amp, trig_active, trig_hold_until, now, pressed=gate_open)
+
+                def filter_ov(ov_l, ov_r):
+                    out_ov = [ov_l, ov_r]
+                    tg = self.cfg.get('trigger_gain', 1.0)
+                    for idx, gk in ((0, 'trigger_left_gain'), (1, 'trigger_right_gain')):
+                        e = out_ov[idx]
+                        if e is None:
+                            continue
+                        if side_off[idx]:
+                            out_ov[idx] = None
+                        elif e[0] == 0x26 and (tg <= 0 or self.cfg.get(gk, 1.0) <= 0 or (press_gate and not trig_pressed[idx])):
+                            out_ov[idx] = None
+                    return out_ov[0], out_ov[1]
+
+                trig_mode = self.cfg.get('trigger_mode', '自动')
                 game_l = game_r = None
                 if native:
                     game_l, game_r, _ = vpad.triggers()
@@ -1073,48 +1120,62 @@ class Runner:
                         trace.write(f"{int(time.time() * 1000)}\ttrigger\t{game_l.hex() if game_l else '-'}\t{game_r.hex() if game_r else '-'}\n")
                     off = lambda e: e is None or e[0] in (0x00, 0x05)
                     game_trig = not (off(game_l) and off(game_r))
-                    trig_mode = self.cfg.get('trigger_mode', '自动')
                     # a fresh command while this program has been in front for a while: a background game's
                     # latched effect must not be blamed on the browser in front
+                    same_proc = not (self.proc and self.proc.name and self.proc.name.casefold() != fg.casefold())
                     if (game_trig and (game_l, game_r) != last_game_trig and time.monotonic() - fg_since > 3.0
-                            and self.caps.note(fg, 'trigger') and trig_mode == '自动'):
+                            and same_proc and self.caps.note(fg, 'trigger') and trig_mode == '自动'):
                         self.log(f'检测到 {fg} 自己在用自适应扳机，之后这款游戏不再叠加扳机震动')
                     last_game_trig = (game_l, game_r)
                     game_l, game_r = button_map.trigger_effects(game_l, game_r)
+                if trig_mode == '关闭':
+                    if native and vpad is not None:
+                        vpad.gate['L'] = vpad.gate['R'] = None
+                    if not trig_released:
+                        hid.set_triggers(effect_off(), effect_off(), force=True)
+                        trig_released = True; last_trig = (-1, -1); last_static = (None, None)
+                        native_phys = [effect_off(), effect_off()]
+                    trig_active = [False, False]; trig_hold_until = [0.0, 0.0]; amp = None
+                elif native:
+                    trig_released = False
+                    stab_l = effect_off() if (side_off[0] and trig_mode != '纯用游戏') else stabilize_native_trigger(game_l, native_phys[0], trig_pressed[0], press_gate)
+                    stab_r = effect_off() if (side_off[1] and trig_mode != '纯用游戏') else stabilize_native_trigger(game_r, native_phys[1], trig_pressed[1], press_gate)
+                    native_phys = [stab_l, stab_r]
                     if trig_mode == '纯用游戏':                       # ours is off: exactly what the game sends
-                        hid.set_triggers(game_l or effect_off(), game_r or effect_off())
+                        hid.set_triggers(stab_l, stab_r)
                         last_trig = (-1, -1); amp = None
                     elif control_triggers is not None:
                         hid.set_triggers(*button_map.trigger_effects(*control_triggers, off=effect_off()))
                         last_trig = (-1, -1); amp = None
                     elif bike_mode != 'other':
-                        left = game_l or effect_off()
-                        right = game_r or effect_off()
+                        left = stab_l
+                        right = stab_r
                         if bike_mode in ('air', 'boost'):
                             # The game receives R1 from physical R2. Its R2 effect
                             # belongs to the pitch action now on the physical shoulder.
                             right_gain = self.cfg.get('trigger_gain', 1.0) * self.cfg.get('trigger_right_gain', 1.0)
-                            right = boost.effect(vpad.bike_input.boost_pressed, now, right_gain)
+                            right = effect_off() if side_off[1] else boost.effect(vpad.bike_input.boost_pressed, now, right_gain)
                             if bike_mode == 'air' and 'L2' not in button_map.bindings and off(game_l):
                                 gain = min(1.0, max(0.0, self.cfg.get('trigger_gain', 1.0) * self.cfg.get('trigger_left_gain', 1.0)))
-                                left = effect_zones(round(force * gain) for force in DIVE_EFFECT) if hid.l2 > 8 else effect_off()
+                                left = effect_off() if side_off[0] else (effect_zones(round(force * gain) for force in DIVE_EFFECT) if hid.l2 > 8 else effect_off())
                         hid.set_triggers(left, right)
                         last_trig = (-1, -1); amp = None
                     elif trig_mode == '自动' and (game_trig or self.caps.has(fg, 'trigger')):
                         # the game drives the triggers: pass its effects through untouched
-                        ov_l, ov_r = button_map.trigger_effects(*fx.triggers()) if fx is not None else (None, None)
-                        hid.set_triggers(ov_l or game_l or effect_off(), ov_r or game_r or effect_off())
+                        ov_l, ov_r = filter_ov(*button_map.trigger_effects(*fx.triggers())) if fx is not None else (None, None)
+                        hid.set_triggers(effect_off() if side_off[0] else (ov_l or stab_l),
+                                         effect_off() if side_off[1] else (ov_r or stab_r))
                         last_trig = (-1, -1); amp = None
                     elif trig_mode == '叠加' and game_trig:
                         # a trigger runs one effect at a time: a side the game is using stays the game's, the other is ours
-                        ov_l, ov_r = button_map.trigger_effects(*fx.triggers()) if fx is not None else (None, None)
-                        lf = ov_l or (game_l if not off(game_l) else ours(0))
-                        rf = ov_r or (game_r if not off(game_r) else ours(1))
+                        ov_l, ov_r = filter_ov(*button_map.trigger_effects(*fx.triggers())) if fx is not None else (None, None)
+                        lf = effect_off() if side_off[0] else (ov_l or (stab_l if not off(game_l) else ours(0)))
+                        rf = effect_off() if side_off[1] else (ov_r or (stab_r if not off(game_r) else ours(1)))
                         hid.set_triggers(lf, rf); last_trig = (-1, -1); amp = None
-                elif self.cfg.get('trigger_mode', '自动') == '纯用游戏':
+                elif trig_mode == '纯用游戏':
                     # no game commands reach us here; in overlay mode the game writes to the pad itself, so stay off it
                     if not trig_released:
-                        hid.set_triggers(effect_off(), effect_off(), force=True); trig_released = True; last_trig = (-1, -1)
+                        hid.set_triggers(effect_off(), effect_off(), force=True); trig_released = True; last_trig = (-1, -1); last_static = (None, None)
                     amp = None
                 elif control_triggers is not None:
                     hid.set_triggers(*button_map.trigger_effects(*control_triggers, off=effect_off()))
@@ -1123,7 +1184,7 @@ class Runner:
                 else:
                     trig_released = False
                 if amp is not None and fx is not None:
-                    ov_l, ov_r = button_map.trigger_effects(*fx.triggers())
+                    ov_l, ov_r = filter_ov(*button_map.trigger_effects(*fx.triggers()))
                     if ov_l or ov_r:                                 # event trigger effect wins for its duration
                         lf = ov_l or ours(0)
                         rf = ov_r or ours(1)

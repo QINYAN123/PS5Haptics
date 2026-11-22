@@ -442,7 +442,7 @@ def test_trigger_presets():
     for name in TP.NAMES[1:]:
         c = dict(cfg); c['trig_preset_L'] = name; c.update({TP.key(k, 'L'): v for k, v in TP.values_for(name).items()})
         e = TP.effect(c, 'L')
-        assert e is not None and len(e) == 11 and e[0] in (0x21, 0x25, 0x26), name
+        assert e is not None and len(e) == 11 and e[0] in ((0x05,) if name == TP.OFF else (0x21, 0x25, 0x26)), name
         assert TP.effect(c, 'R') is None
         assert set(TP.uses(name)) <= set(TP.PARAMS)
     c = dict(cfg, trig_preset_R='重阻力', trig_start_R=50, trig_strength_R=7)
@@ -660,9 +660,9 @@ def test_silent_source_releases_audio_triggers(scene="游戏", suppress=False):
     hid, engine, output = Mock(), Mock(), Mock()
     hid.firmware_info.return_value = None
     hid.read_error = None
-    hid.l2 = hid.r2 = 0
+    hid.l2 = hid.r2 = 128
     hid.last = (None, None)
-    hid.poll_input.return_value = (0., 0.)
+    hid.poll_input.return_value = (0.5, 0.5)
     hid.buttons.last_action = -100.
     hid.buttons.drain.return_value = ()
     engine.process.side_effect = lambda l, r, _: (l, r, (float(l.max()), float(r.max())))
@@ -1122,11 +1122,63 @@ def test_v2328_fixes():
         assert ok
 
 
+def test_v2329_trigger_fixes():
+    import ps5_haptics_app as app
+    from ds_hid import DualSenseHID, effect_off, effect_vibration
+    import trigger_presets as TP
+
+    # 1) Unpressed trigger with press gate enabled never engages audio vibration, and releasing trigger drops immediately.
+    active, holds = [False, False], [0.0, 0.0]
+    amp, active, holds = app.smooth_trigger_amp((6, 6), active, holds, 10.0, pressed=(False, False))
+    assert amp == (0, 0) and active == [False, False]
+    amp, active, holds = app.smooth_trigger_amp((6, 0), active, holds, 10.05, pressed=(True, False))
+    assert amp == (6, 0) and active == [True, False]
+    amp, active, holds = app.smooth_trigger_amp((6, 0), active, holds, 10.08, pressed=(False, False))
+    assert amp == (0, 0) and active == [False, False]
+
+    # 2) Native trigger stabilizer: stops 0x22 <-> 0x05 idle/combat gear thrashing while unpressed, releases at once when pressed.
+    bow = bytes.fromhex('2205002400000000000000')
+    vib = effect_vibration(6, 40)
+    off = effect_off()
+    phys = off
+    phys = app.stabilize_native_trigger(bow, phys, pressed=False, press_gate=True)
+    assert phys == bow
+    # Game briefly sends 0x05 during sword swing / idle while finger is off trigger -> stays parked at bow (zero gear movement).
+    phys = app.stabilize_native_trigger(off, phys, pressed=False, press_gate=True)
+    assert phys == bow
+    # Game sends 0x26 vibration while finger is off trigger -> ignored, stays parked at bow.
+    phys = app.stabilize_native_trigger(vib, phys, pressed=False, press_gate=True)
+    assert phys == bow
+    # User presses trigger while game wants 0x05 -> releases immediately.
+    phys = app.stabilize_native_trigger(off, phys, pressed=True, press_gate=True)
+    assert phys == off
+    # While at off, game sends 0x26 while unpressed -> stays off.
+    assert app.stabilize_native_trigger(vib, phys, pressed=False, press_gate=True) == off
+    assert app.stabilize_native_trigger(vib, phys, pressed=True, press_gate=True) == vib
+
+    # 3) trigger_presets '关闭' preset outputs effect_off() with no sliders.
+    assert TP.OFF == '关闭' and TP.uses(TP.OFF) == ()
+    assert TP.effect({TP.preset_key('L'): TP.OFF}, 'L') == off
+
+    # 4) DualSenseHID.set_triggers never re-sends identical trigger reports even after >1.0 s unless forced.
+    h = DualSenseHID.__new__(DualSenseHID)
+    h.dev = FakeDev(); h.lock = threading.Lock(); h.recovering = threading.Event()
+    h.last = (None, None); h.last_write = 0.0; h.reader = None
+    assert h.set_triggers(off, off) is True
+    assert len(h.dev.sent) == 1
+    h.last_write -= 5.0
+    assert h.set_triggers(off, off) is False
+    assert len(h.dev.sent) == 1
+    assert h.set_triggers(off, off, force=True) is True
+    assert len(h.dev.sent) == 2
+
+
 if __name__ == '__main__':
     test_scene_suppression()
     test_proc_loopback_multi_pid_and_stickiness()
     test_proc_hot_reattach_and_stick_coalescing()
     test_v2328_fixes()
+    test_v2329_trigger_fixes()
     test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()
