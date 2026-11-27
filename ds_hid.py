@@ -154,6 +154,7 @@ class DualSenseHID:
         self.pid = pid; self.path = path
         self.l2 = 0; self.r2 = 0
         self.last = (None, None); self.last_write = 0.0
+        self.reopen_count = 0
         self.lock = threading.Lock()
         self.recovering = threading.Event()
         self.reader = None; self.reader_stop = threading.Event(); self.reports = 0; self.read_error = None
@@ -250,6 +251,7 @@ class DualSenseHID:
                     self.dev = candidate
                     self.last = (None, None)
                     self.last_write = 0.0
+                    self.reopen_count += 1
                 return True
             except (OSError, ValueError):
                 candidate.close()

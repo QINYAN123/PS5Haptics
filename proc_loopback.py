@@ -173,7 +173,7 @@ class ProcessLoopback:
                                        CHANNEL_MASKS[ch], KSDATAFORMAT_SUBTYPE_PCM)
         self.client.Initialize(0, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
                                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                               200000, 0, ctypes.cast(ctypes.pointer(fmt), POINTER(WAVEFORMATEX)), None)                # 20 ms buffer
+                               1000000, 0, ctypes.cast(ctypes.pointer(fmt), POINTER(WAVEFORMATEX)), None)              # 100 ms buffer
         self.event = ctypes.windll.kernel32.CreateEventW(None, False, False, None)
         self.client.SetEventHandle(self.event)
         self.capture = self.client.GetService(byref(IAudioCaptureClient._iid_)).QueryInterface(IAudioCaptureClient)

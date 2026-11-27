@@ -186,25 +186,72 @@ def proc_mem_mb():
 
 
 class Resampler:
-    """Stream resampler with phase carried across blocks (per-block np.interp restarted at every block
-    edge and clicked on the speaker). ratio = input samples consumed per output sample."""
+    """Stream resampler with 4-point Catmull-Rom cubic interpolation and phase carried across blocks.
+
+    Keeps a 3-sample history and exact continuity across unity (1.0) and fractional drift ratios.
+    ratio = input samples consumed per output sample.
+    """
 
     def __init__(self):
-        self.pos = 0.0; self.prev = None
+        self.pos = 1.0
+        self.hist_l = None
+        self.hist_r = None
 
     def process(self, l, r, ratio):
-        if len(l) == 0:
+        m = len(l)
+        if m == 0:
             return l, r
-        if self.prev is None:
-            self.prev = (l[0], r[0])
-        xl = np.concatenate([[self.prev[0]], l]); xr = np.concatenate([[self.prev[1]], r])
-        last = len(xl) - 1
-        n = int(np.floor((last - self.pos) / ratio)) + 1 if self.pos <= last else 0
-        p = self.pos + np.arange(n) * ratio
-        self.pos = (self.pos + n * ratio) - last
-        self.prev = (xl[-1], xr[-1])
-        idx = np.arange(len(xl))
-        return np.interp(p, idx, xl).astype(np.float32), np.interp(p, idx, xr).astype(np.float32)
+        if self.hist_l is None:
+            self.hist_l = np.full(3, l[0], np.float32)
+            self.hist_r = np.full(3, r[0], np.float32)
+            self.pos = 1.0
+        xl = np.concatenate((self.hist_l, l))
+        xr = np.concatenate((self.hist_r, r))
+        self.hist_l = xl[-3:].copy()
+        self.hist_r = xr[-3:].copy()
+        if abs(ratio - 1.0) < 1e-9 and abs(self.pos - 1.0) < 1e-9:
+            self.pos = 1.0
+            return xl[1:1 + m].astype(np.float32), xr[1:1 + m].astype(np.float32)
+        limit = len(xl) - 2.0
+        if self.pos >= limit - 1e-9:
+            self.pos = max(1.0, self.pos - m)
+            return np.zeros(0, np.float32), np.zeros(0, np.float32)
+        n = int((limit - 1e-9 - self.pos) / ratio) + 1
+        p = self.pos + np.arange(n, dtype=np.float64) * ratio
+        p = p[p < limit - 1e-9]
+        if not len(p):
+            self.pos = max(1.0, self.pos - m)
+            return np.zeros(0, np.float32), np.zeros(0, np.float32)
+        self.pos = max(1.0, (self.pos + len(p) * ratio) - m)
+        idx = np.clip(np.floor(p).astype(np.intp), 1, len(xl) - 3)
+        t = p - idx
+
+        def interp(x):
+            y0 = x[idx - 1].astype(np.float64)
+            y1 = x[idx].astype(np.float64)
+            y2 = x[idx + 1].astype(np.float64)
+            y3 = x[idx + 2].astype(np.float64)
+            c0 = y1
+            c1 = 0.5 * (y2 - y0)
+            c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3
+            c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2)
+            return (((c3 * t + c2) * t + c1) * t + c0).astype(np.float32)
+
+        return interp(xl), interp(xr)
+
+
+def drift_speed(total_buf, prev_speed=1.0, has_ring=True):
+    """Smooth bidirectional clock-drift compensation targeting ~30 ms total buffering."""
+    if total_buf > 0.040:
+        target = 1.0 + min(0.025, (total_buf - 0.040) * 0.5)
+    elif has_ring and total_buf < 0.020:
+        target = 1.0 - min(0.015, (0.020 - total_buf) * 0.8)
+    else:
+        target = 1.0
+    speed = prev_speed + (target - prev_speed) * 0.05
+    if target == 1.0 and abs(speed - 1.0) < 0.0005:
+        return 1.0
+    return speed
 
 
 def downmix(frames, ch, skip_center):
@@ -598,6 +645,9 @@ class Runner:
             trig = (0.0, 0.0)                     # a block shorter than one hop (resampled) must not leave it unset
             tl_acc = dict.fromkeys(TL_KEYS, 0.0); tl_t = 0.0; static = (None, None); last_static = static
             mode_warned = set(); stuck = StuckGuard(self.log); guard_game = None
+            speed_smooth = 1.0; last_spk_eff = spk_eff; spk_fade_in = False
+            hid_reopens = getattr(hid, 'reopen_count', 0)
+            last_spk_cfg = (spk_mode != '关闭', self.cfg.get('speaker_output') == '耳机孔')
 
             suppress_background = suppression_enabled(self.base)
 
@@ -657,6 +707,7 @@ class Runner:
                         except queue.Empty: break
                     pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
                     clock0 = time.monotonic(); produced = 0; rs = Resampler()
+                    speed_smooth = 1.0; spk_fade_in = True
                     spk_assert = 0.0
                     self.log('音频设备已重新连接：' + self.stats['source'])
                     continue
@@ -667,6 +718,7 @@ class Runner:
                 needs_idle_audio = (self.capture_locked or takeover or spk is not None or vision is not None or max(last_trig) > 0
                                     or any(self.cfg.get(k) for k in CONTROL_HAPTICS.values())
                                     or (fx is not None and (fx.voices or any(fx.triggers()))))
+                use_ring = isinstance(getattr(out, '_use_ring', False), bool) and out._use_ring
                 try:
                     blk = self.q.get(timeout=0.01 if needs_idle_audio or spk is not None else 0.2)
                     tnow = time.monotonic()
@@ -677,6 +729,7 @@ class Runner:
                                  f'积压清空 {self.stats.get("resync", 0)} 次，丢块 {self.stats["late"]}'
                                  + (f'，游戏原生扬声器峰值 {self.stats.get("game_spk", 0)}（断续 {pad_tap.underruns if pad_tap else 0} 次）（{vpad.spk_frames} 帧有声）' if native and vpad is not None else '')
                                  + (f'，转到真手柄峰值 {g_out_pk:.2f}（当前增益 {g_gain:.1f}x）' if pad_tap is not None else '')
+                                 + (f'，缓冲 {out.buffered_s() * 1000:.0f} ms，输出溢出 {getattr(out, "overruns", 0)} 次' if use_ring else '')
                                  + f'，输出欠载 {out.xruns} 次，扬声器限幅 {out.speaker_safety.limited_samples} 采样，异常采样 {out.speaker_safety.invalid_samples}')
                         g_out_pk = 0.0
                         self.stats['game_spk'] = 0
@@ -701,6 +754,7 @@ class Runner:
                     input_route = route
                     pend_l = np.zeros(0, np.float32); pend_r = np.zeros(0, np.float32)
                     rs = Resampler()
+                    speed_smooth = 1.0; spk_fade_in = True
                 if blk is not None:
                     from_endpoint = not isinstance(blk, tuple)
                     if isinstance(blk, tuple):                      # per-process capture: stereo 48 kHz
@@ -716,26 +770,34 @@ class Runner:
                     if np.any(blk):
                         heard = time.monotonic()
                     l, r = downmix(blk, bch, self.cfg['skip_center'])
-                    lag = self.q.qsize() * len(l) / brate + len(pend_l) / RATE      # seconds waiting
-                    self.stats['lag_ms'] = int(lag * 1000)
-                    if lag > 0.3:                                   # far behind: drop the backlog once
+                    in_lag = self.q.qsize() * len(l) / brate + len(pend_l) / RATE      # seconds waiting
+                    out_buf = out.buffered_s() if use_ring else 0.0
+                    total_buf = in_lag + out_buf
+                    self.stats['lag_ms'] = int(total_buf * 1000)
+                    if in_lag > 0.3:                                   # far behind: drop the backlog once
                         while not self.q.empty():
                             try: self.q.get_nowait()
                             except queue.Empty: break
                         pend_l = pend_l[-HOP:]; pend_r = pend_r[-HOP:]
+                        speed_smooth = 1.0; rs = Resampler(); spk_fade_in = True
                         self.stats['resync'] = self.stats.get('resync', 0) + 1
-                    speed = 1.0 + min(0.04, max(0.0, lag - 0.008) * 1.5)   # <=4 % faster while behind
-                    if brate != RATE or speed != 1.0 or rs.pos:
-                        l, r = rs.process(l, r, brate / RATE * speed)
+                    speed_smooth = drift_speed(total_buf, speed_smooth, has_ring=use_ring)
+                    l, r = rs.process(l, r, brate / RATE * speed_smooth)
+                    if last_blk and time.monotonic() - last_blk > 0.12:
+                        spk_fade_in = True
                     last_blk = time.monotonic()
                     pend_l = np.concatenate([pend_l, l]); pend_r = np.concatenate([pend_r, r])
                 elif (needs_idle_audio and len(pend_l) < HOP
-                      and time.monotonic() - last_blk > (0.04 if self.capture_locked else 0.1)
-                      and (time.monotonic() - clock0) * RATE - produced > (2 * HOP if self.capture_locked else 4 * HOP)):
-                    # only when the source has really stopped (0.1 s): padding inside a stream of 10 ms
+                      and time.monotonic() - last_blk > 0.12
+                      and (time.monotonic() - clock0) * RATE - produced > 4 * HOP):
+                    # only when the source has really stopped (0.12 s): padding inside a stream of 10-80 ms
                     # packets inserted gaps = the speaker crackled and stuttered
                     # game is silent (loopback delivers nothing): pad with real-time silence so the game's
                     # own haptics keep flowing; only when genuinely behind the clock, never ahead of it
+                    if len(pend_l) > 0:
+                        k_end = min(len(pend_l), 48)
+                        ramp = np.linspace(1.0, 0.0, k_end, dtype=np.float32)
+                        pend_l[-k_end:] *= ramp; pend_r[-k_end:] *= ramp
                     z = np.zeros(2 * HOP, np.float32)
                     pend_l = np.concatenate([pend_l, z]); pend_r = np.concatenate([pend_r, z])
                 else:
@@ -895,7 +957,7 @@ class Runner:
                     if not self.cfg.get('ww_bike_audio', True):
                         boost.reset()
                     elif blk is not None:
-                        if audio_exe == WW_EXE and lag <= 0.3:
+                        if audio_exe == WW_EXE and in_lag <= 0.3:
                             boost.feed(l, r, now)
                         else:
                             boost.reset()
@@ -930,11 +992,24 @@ class Runner:
                 native_speaking = pad_tap is not None and (pad_tap.sounding(2.0) or (adapted and bool(pad_tap.last_sound)))
                 spk_eff = speaker_route(spk_mode, pure, adapted, native_speaking,
                                         not takeover and fg not in NOT_GAMES and game_speaker_active)
+                if spk_eff != last_spk_eff:
+                    last_spk_eff = spk_eff
+                    spk_fade_in = True
                 self.stats['spk_eff'] = spk_eff
                 large = small = 0.0; gpk_l = gpk_r = 0.0; spk_peak = 0.0
-                if spk is not None and time.monotonic() - spk_assert > 5.0:   # keep the speaker routed
+                spk_cfg_now = (spk is not None, self.cfg.get('speaker_output') == '耳机孔')
+                cur_hid_reopens = getattr(hid, 'reopen_count', 0)
+                need_spk_assert = False
+                if spk is not None:
+                    if spk_cfg_now != last_spk_cfg or spk_assert == 0.0 or cur_hid_reopens != hid_reopens:
+                        need_spk_assert = True
+                    elif not takeover and time.monotonic() - spk_assert > 30.0:
+                        need_spk_assert = True
+                last_spk_cfg = spk_cfg_now
+                hid_reopens = cur_hid_reopens
+                if need_spk_assert:   # route on change, HID reconnect, or periodically in 普通 mode only
                     spk_assert = time.monotonic()
-                    try: hid.enable_speaker(volume=0x64, headset=self.cfg.get('speaker_output') == '耳机孔')
+                    try: hid.enable_speaker(volume=0x64, headset=spk_cfg_now[1])
                     except Exception: pass
                 while len(pend_l) >= HOP and out.failure is None:
                     bl, br = pend_l[:HOP], pend_r[:HOP]; pend_l, pend_r = pend_l[HOP:], pend_r[HOP:]
@@ -1068,6 +1143,12 @@ class Runner:
                             base = sp if sp is not None else np.zeros(HOP, np.float32)
                             sp = (base * (1 - ramp) + se * ramp).astype(np.float32)
                     if sp is not None:
+                        if spk_fade_in:
+                            k_fade = min(144, len(sp))
+                            if k_fade:
+                                sp = sp.copy()
+                                sp[:k_fade] *= np.linspace(0.0, 1.0, k_fade, dtype=np.float32)
+                            spk_fade_in = False
                         spk_peak = max(spk_peak, float(np.max(np.abs(sp))))
                     if self.cfg.get('swap_grips'):
                         wl, wr = wr, wl

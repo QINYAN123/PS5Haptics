@@ -587,6 +587,7 @@ class RawSpeaker:
         self._z32 = np.zeros(HOP, dtype=np.float32); self._z32.setflags(write=False)
         self._z_parts = (self._z64, self._z64, self._z64, self._z64)
         self.parts = None; self.env = 0.05; self.lv = 0.05; self.mk = 1.0
+        self.prev_mk = 1.0; self.prev_base_rms = 0.0
 
     @staticmethod
     def _run(st, x):
@@ -594,6 +595,7 @@ class RawSpeaker:
 
     def analyse(self, left, right):
         n = len(left)
+        self.prev_mk = self.mk
         pk = max(float(np.max(np.abs(left))), float(np.max(np.abs(right)))) if n else 0.0
         if pk < 1e-8 and not any(flt.active for flt in self._filters):
             self.parts = self._z_parts if n == HOP else (np.zeros(n, np.float64),) * 4
@@ -617,11 +619,21 @@ class RawSpeaker:
     def render(self, preset, volume, boost=1.0):
         base, h, pr, top = self.parts
         if base is self._z64:
+            self.prev_base_rms = 0.0
             return self._z32
         wb, wp, wt = self.PRESETS.get(preset, self.PRESETS['原味'])
-        base_rms = math.sqrt(float(np.dot(base, base)) / len(base)) if len(base) else 0.0
-        y = base + wb * h * (base_rms + 1e-4) * 4 + wp * pr + wt * top
-        return (y * np.clip(volume, 0., 1.) * boost * 1.5 * self.mk).astype(np.float32)  # final output lookahead limiter preserves waveform
+        n = len(base)
+        base_rms = math.sqrt(float(np.dot(base, base)) / n) if n else 0.0
+        if n and wb != 0.0:
+            rms_ramp = (np.linspace(self.prev_base_rms, base_rms, n, dtype=np.float64)
+                        if abs(base_rms - self.prev_base_rms) > 1e-6 else base_rms)
+            y = base + wb * h * (rms_ramp + 1e-4) * 4 + wp * pr + wt * top
+        else:
+            y = base + wp * pr + wt * top
+        self.prev_base_rms = base_rms
+        mk = (np.linspace(self.prev_mk, self.mk, n, dtype=np.float64)
+              if n and abs(self.mk - self.prev_mk) > 1e-6 else self.mk)
+        return (y * np.clip(volume, 0., 1.) * boost * 1.5 * mk).astype(np.float32)  # final output lookahead limiter preserves waveform
 
 
 class SmartSpeaker:

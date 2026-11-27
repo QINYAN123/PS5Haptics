@@ -75,6 +75,85 @@ class SpeakerTests(unittest.TestCase):
         np.testing.assert_array_equal(out.stream.buf[:, 3], r)
         np.testing.assert_array_equal(out.stream.buf[:, 0], out.stream.buf[:, 1])
 
+    def test_haptic_out_ring_buffer_prebuffer_wrap_underrun_and_overrun(self):
+        import threading
+        import time
+        from ds_audio import HapticOut
+
+        out = HapticOut.__new__(HapticOut)
+        out.lock = threading.Lock()
+        out.xruns = 0
+        out.overruns = 0
+        out.failure = None
+        out.stream = None
+        out.speaker_safety = SpeakerSafety(headset=True)
+        out._use_ring = True
+        out._buf = np.zeros((HapticOut.RING_CAPACITY, 4), np.float32)
+        out._rpos = 0
+        out._wpos = 0
+        out._count = 0
+        out._primed = False
+        out._last_spk = 0.0
+        out._started_at = out._last_cb = time.monotonic()
+
+        tone = lambda start, n: (0.4 * np.sin(2 * np.pi * 1000 * (np.arange(n) + start) / 48000)).astype(np.float32)
+        z480 = np.zeros(480, np.float32)
+
+        # Below PRIME_FRAMES (1440): stays silent and unprimed without counting underruns.
+        out.feed(z480, z480, tone(0, 480), headset=True)
+        out.feed(z480, z480, tone(480, 480), headset=True)
+        self.assertEqual(float(np.max(np.abs(out._pull_frames(480)[:, 0]))), 0.0)
+        self.assertFalse(out._primed)
+        self.assertEqual(out.xruns, 0)
+
+        # Reaching PRIME_FRAMES primes playback with a 3 ms fade-in from 0.
+        out.feed(z480, z480, tone(960, 480), headset=True)
+        first = out._pull_frames(480)[:, 0]
+        self.assertTrue(out._primed)
+        self.assertEqual(float(first[0]), 0.0)
+        self.assertGreater(float(np.max(np.abs(first))), 0.25)
+
+        # Push and pull past RING_CAPACITY to verify wrap-around continuity.
+        idx = 1440
+        played = [first]
+        for _ in range(25):
+            out.feed(z480, z480, tone(idx, 480), headset=True)
+            idx += 480
+            played.append(out._pull_frames(480)[:, 0])
+        tail = np.concatenate(played[-6:])
+        expected_step = 0.4 * 2 * np.pi * 1000 / 48000
+        self.assertLess(float(np.max(np.abs(np.diff(tail)))), expected_step * 1.15)
+        self.assertEqual(out.xruns, 0)
+
+        # Drain down to a partial block to verify underrun fade-out and re-prime gate.
+        while out.buffered_frames() >= 480:
+            out._pull_frames(480)
+        out.feed(z480[:100], z480[:100], np.full(100, 0.3, np.float32), headset=True)
+        self.assertGreater(out.buffered_frames(), 0)
+        if out.buffered_frames() >= 480:
+            out._pull_frames(480)
+        if out.buffered_frames() == 0:
+            out.feed(z480[:100], z480[:100], np.full(100, 0.3, np.float32), headset=True)
+        rem = out.buffered_frames()
+        self.assertGreater(rem, 0)
+        self.assertLess(rem, 480)
+        last_pull = out._pull_frames(480)[:, 0]
+        self.assertEqual(out.xruns, 1)
+        self.assertFalse(out._primed)
+        self.assertLess(abs(float(last_pull[rem - 1])), 0.02)
+        self.assertEqual(float(np.max(np.abs(last_pull[rem:]))), 0.0)
+
+        # A single 480-frame chunk must wait until 1440 frames accumulate again.
+        out.feed(z480, z480, tone(0, 480), headset=True)
+        self.assertEqual(float(np.max(np.abs(out._pull_frames(480)[:, 0]))), 0.0)
+        self.assertFalse(out._primed)
+
+        # Overrun trims safely without exceeding MAX_FRAMES.
+        for _ in range(15):
+            out.feed(z480, z480, tone(0, 480), headset=True)
+        self.assertGreaterEqual(out.overruns, 1)
+        self.assertLessEqual(out.buffered_frames(), HapticOut.MAX_FRAMES)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

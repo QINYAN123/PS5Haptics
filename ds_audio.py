@@ -5,6 +5,7 @@ ch3/ch4 = left/right grip voice-coil actuators. Writing waveforms to ch3/ch4 pla
 on the actuators (wired only).
 """
 import threading
+import time
 import numpy as np
 import pyaudiowpatch as pa
 from speaker_safety import SpeakerSafety
@@ -95,7 +96,16 @@ def find_loopback(p, name_hint=None):
 
 
 class HapticOut:
-    """Push-model writer: feed(left, right) float32 arrays (-1..1) at 48 kHz."""
+    """Push-model writer: feed(left, right) float32 arrays (-1..1) at 48 kHz.
+
+    Feeds a lock-protected ring buffer drained by a WASAPI callback so scheduler jitter
+    and 48 kHz clock drift never stall on the portaudio write boundary or clip without fades.
+    """
+    RING_CAPACITY = 9600
+    PRIME_FRAMES = 1440
+    TARGET_FRAMES = 1440
+    MAX_FRAMES = 4800
+    FADE_FRAMES = 144
 
     def __init__(self, p=None, name=None):
         # Own the PortAudio instance when none is passed, and always terminate it in close():
@@ -106,16 +116,130 @@ class HapticOut:
             self.dev = find_dualsense_output(self.p, name)
             if self.dev is None:
                 raise LookupError('没有找到 DualSense 音频设备（需要 USB 线或 DS5Dongle 接收器，普通蓝牙不行）')
-            self.lock = threading.Lock(); self.xruns = 0; self.failure = None
+            self.lock = threading.Lock(); self.xruns = 0; self.overruns = 0; self.failure = None
             self.speaker_safety = SpeakerSafety()
+            self._use_ring = True
+            self._buf = np.zeros((self.RING_CAPACITY, 4), np.float32)
+            self._rpos = 0
+            self._wpos = 0
+            self._count = 0
+            self._primed = False
+            self._last_spk = 0.0
+            self._started_at = time.monotonic()
+            self._last_cb = self._started_at
             self.stream = pa_open(self.p, format=pa.paFloat32, channels=4, rate=RATE, output=True,
-                                  output_device_index=self.dev['index'], frames_per_buffer=960)
+                                  output_device_index=self.dev['index'], frames_per_buffer=480,
+                                  stream_callback=self._callback)
         except Exception:
             if self.own:
                 pa_end(self.p)
             raise
 
-    def feed(self, left, right, speaker=None, headset=False):
+    def buffered_frames(self):
+        if not getattr(self, '_use_ring', False):
+            return 0
+        with self.lock:
+            return self._count
+
+    def buffered_s(self):
+        return self.buffered_frames() / RATE
+
+    def _pull_frames(self, frame_count):
+        out = np.zeros((frame_count, 4), np.float32)
+        now = time.monotonic()
+        with self.lock:
+            self._last_cb = now
+            fade_in = False
+            if not self._primed:
+                if self._count < max(frame_count, self.PRIME_FRAMES):
+                    return out
+                self._primed = True
+                fade_in = True
+            if self._count >= frame_count:
+                first = min(frame_count, self.RING_CAPACITY - self._rpos)
+                out[:first] = self._buf[self._rpos:self._rpos + first]
+                if first < frame_count:
+                    rem = frame_count - first
+                    out[first:] = self._buf[:rem]
+                    self._rpos = rem
+                else:
+                    self._rpos = (self._rpos + first) % self.RING_CAPACITY
+                self._count -= frame_count
+                if fade_in:
+                    k = min(self.FADE_FRAMES, frame_count)
+                    ramp = np.linspace(0.0, 1.0, k, dtype=np.float32)[:, None]
+                    out[:k, :2] *= ramp
+                self._last_spk = float(out[-1, 0])
+                return out
+            # True underrun: drain remaining samples with a smooth fade-out and require re-priming.
+            self.xruns += 1
+            self._primed = False
+            avail = self._count
+            if avail > 0:
+                first = min(avail, self.RING_CAPACITY - self._rpos)
+                out[:first] = self._buf[self._rpos:self._rpos + first]
+                if first < avail:
+                    out[first:avail] = self._buf[:avail - first]
+                self._rpos = (self._rpos + avail) % self.RING_CAPACITY
+                self._count = 0
+                k = min(avail, self.FADE_FRAMES)
+                ramp = np.linspace(1.0, 0.0, k, dtype=np.float32)[:, None]
+                out[avail - k:avail, :2] *= ramp
+            elif abs(self._last_spk) > 1e-5:
+                k = min(64, frame_count)
+                ramp = np.linspace(self._last_spk, 0.0, k, dtype=np.float32)
+                out[:k, 0] = ramp
+                out[:k, 1] = ramp
+            self._last_spk = 0.0
+            return out
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        try:
+            out = self._pull_frames(frame_count)
+            return (out.tobytes(), pa.paContinue)
+        except Exception as exc:
+            self.failure = exc
+            return (np.zeros((frame_count, 4), np.float32).tobytes(), pa.paContinue)
+
+    def _push_frames(self, buf):
+        n = len(buf)
+        if not n:
+            return
+        with self.lock:
+            if self._count + n > self.MAX_FRAMES:
+                self.overruns += 1
+                keep = max(0, 2400 - n)
+                drop = max(0, self._count - keep)
+                if drop:
+                    self._rpos = (self._rpos + drop) % self.RING_CAPACITY
+                    self._count -= drop
+                    if self._count > 0:
+                        k = min(self.FADE_FRAMES, self._count)
+                        ramp = np.linspace(0.0, 1.0, k, dtype=np.float32)
+                        idx = (self._rpos + np.arange(k)) % self.RING_CAPACITY
+                        self._buf[idx, 0] *= ramp
+                        self._buf[idx, 1] *= ramp
+            if n >= self.MAX_FRAMES:
+                buf = buf[-2400:]
+                n = len(buf)
+            first = min(n, self.RING_CAPACITY - self._wpos)
+            self._buf[self._wpos:self._wpos + first] = buf[:first]
+            if first < n:
+                rem = n - first
+                self._buf[:rem] = buf[first:]
+                self._wpos = rem
+            else:
+                self._wpos = (self._wpos + first) % self.RING_CAPACITY
+            self._count += n
+
+    def drain(self, timeout=1.0):
+        if not getattr(self, '_use_ring', False):
+            return
+        deadline = time.monotonic() + timeout
+        while self.buffered_frames() > 0 and time.monotonic() < deadline and self.failure is None:
+            time.sleep(0.005)
+
+    def feed(self, left, right, speaker=None, headset=False, block=False):
         n = len(left)
         buf = np.zeros((n, 4), np.float32)
         if headset != self.speaker_safety.headset:
@@ -125,19 +249,35 @@ class HapticOut:
         buf[:, 0] = clean; buf[:, 1] = clean
         buf[:, 2] = np.clip(left, -1, 1)
         buf[:, 3] = np.clip(right, -1, 1)
-        try:
-            self.stream.write(buf.tobytes(), exception_on_underflow=True)
-        except OSError as exc:
-            if exc.errno == pa.paOutputUnderflowed:
-                self.xruns += 1
-            else:
-                self.failure = exc
+        if not getattr(self, '_use_ring', False):
+            try:
+                self.stream.write(buf.tobytes(), exception_on_underflow=True)
+            except OSError as exc:
+                if exc.errno == pa.paOutputUnderflowed:
+                    self.xruns += 1
+                else:
+                    self.failure = exc
+            return
+        if self.stream is not None and self.failure is None:
+            if time.monotonic() - self._last_cb > 1.0:
+                try:
+                    if not self.stream.is_active():
+                        self.failure = OSError('DualSense audio stream stopped')
+                except OSError as exc:
+                    self.failure = exc
+        if block:
+            deadline = time.monotonic() + 1.0
+            while self.buffered_frames() > self.TARGET_FRAMES and time.monotonic() < deadline and self.failure is None:
+                time.sleep(0.005)
+        self._push_frames(buf)
 
     def close(self):
         if self.stream is not None:
             try:
                 if self.failure is None:
-                    self.feed(np.zeros(2400, np.float32), np.zeros(2400, np.float32))
+                    self.feed(np.zeros(1440, np.float32), np.zeros(1440, np.float32))
+                    if getattr(self, '_use_ring', False):
+                        self.drain(0.06)
             except Exception:
                 pass
             close_stream(self.stream)
@@ -167,7 +307,8 @@ def test_burst():
     seq.append((z(.3), z(.3)))
     for l, r in seq:
         for i in range(0, len(l), 2400):
-            out.feed(l[i:i + 2400], r[i:i + 2400])
+            out.feed(l[i:i + 2400], r[i:i + 2400], block=True)
+    out.drain(1.5)
     out.close()
     return out.dev['name']
 

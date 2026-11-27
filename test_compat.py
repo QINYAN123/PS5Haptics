@@ -1173,12 +1173,112 @@ def test_v2329_trigger_fixes():
     assert len(h.dev.sent) == 2
 
 
+def test_v2330_speaker_stability():
+    from contextlib import ExitStack
+    from tempfile import TemporaryDirectory
+    from unittest.mock import Mock, patch
+    import ps5_haptics_app as app
+    from speaker_safety import SpeakerSafety
+
+    # 1) Catmull-Rom Resampler keeps clean continuity across unity (1.0) and fractional drift ratios.
+    rs = app.Resampler()
+    t = np.arange(app.RATE * 2) / app.RATE
+    sig = (0.4 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    ratios = [1.0, 1.0, 0.992, 0.988, 1.0, 1.015, 1.02, 1.0]
+    outs = []
+    for k in range(80):
+        blk = sig[k * app.HOP:(k + 1) * app.HOP]
+        l, _ = rs.process(blk, blk, ratios[(k // 10) % len(ratios)])
+        outs.append(l)
+    joined = np.concatenate(outs)
+    expected_step = 0.4 * 2 * np.pi * 1000 / app.RATE
+    max_step = float(np.max(np.abs(np.diff(joined[10:]))))
+    assert max_step < expected_step * 1.35, (max_step, expected_step)
+    # Short single-sample block under 2x ratio must not raise or go out of bounds.
+    rs_short = app.Resampler()
+    s1, _ = rs_short.process(np.array([0.25], np.float32), np.array([0.25], np.float32), 2.0)
+    assert len(s1) <= 1
+
+    # 2) Bidirectional drift_speed controller pulls back < 20 ms, speeds up > 40 ms, and snaps cleanly in deadband.
+    s = 1.0
+    for _ in range(100):
+        s = app.drift_speed(0.005, s, has_ring=True)
+    assert 0.984 <= s <= 0.990, s
+    assert app.drift_speed(0.005, 1.0, has_ring=False) == 1.0
+    for _ in range(100):
+        s = app.drift_speed(0.070, s, has_ring=True)
+    assert 1.010 <= s <= 1.026, s
+    s = 1.002
+    for _ in range(60):
+        s = app.drift_speed(0.030, s, has_ring=True)
+    assert s == 1.0, s
+
+    # 3) Runner in 原生透传 does NOT spam hid.enable_speaker every 5 s, but re-asserts on HID reopen.
+    logs = []
+    cfg = dict(app.DEFAULTS, mode='原生透传', capture='系统', speaker_mode='全部游戏声', source_hint='loop',
+               pbz_fx=False, ww_fx=False, ww_vision=False, record_native=False)
+    runner = app.Runner(cfg, logs.append)
+    clock = [100.0]
+
+    hid, engine, vpad, iso = Mock(), Mock(), Mock(), Mock()
+    hid.firmware_info.return_value = None
+    hid.read_error = None
+    hid.l2 = hid.r2 = 0
+    hid.last = (None, None)
+    hid.reopen_count = 0
+    hid.poll_input.return_value = (0.0, 0.0)
+    hid.buttons.last_action = -100.0
+    hid.buttons.drain.return_value = ()
+    engine.process.side_effect = lambda l, r, _: (l, r, (0.0, 0.0))
+    vpad.feedback.return_value = ((0, 0), False, None)
+    vpad.wave.pull.return_value = (np.zeros(app.HOP, np.float32), np.zeros(app.HOP, np.float32))
+    vpad.triggers.return_value = (None, None, 0)
+    vpad.spk_peak = 0
+    vpad.frames = {'in': 0, 1: 0, 3: 0}
+    vpad.trigger_press_times = (None, None)
+
+    class FakeOut:
+        dev = {'name': 'test pad'}
+        failure = None
+        xruns = 0
+        overruns = 0
+        _use_ring = True
+        speaker_safety = SpeakerSafety()
+        def buffered_s(self): return 0.030
+        def feed(self, *a, **kw): pass
+        def close(self): pass
+
+    def get(timeout):
+        clock[0] += 0.2
+        if clock[0] >= 107.0 and hid.reopen_count == 0:
+            hid.reopen_count = 1
+        if clock[0] >= 112.0:
+            runner.stop_ev.set()
+        return np.zeros(2 * app.HOP, np.float32)
+
+    src = {'name': 'loop', 'defaultSampleRate': app.RATE, 'maxInputChannels': 2}
+    with TemporaryDirectory() as tmp, ExitStack() as ctx:
+        for name, value in [('rescan', Mock()), ('foreground_window', lambda: 1), ('foreground_exe', lambda *_: ''),
+                            ('HapticOut', Mock(return_value=FakeOut())), ('DualSenseHID', Mock(return_value=hid)),
+                            ('VirtualDualSense', Mock(return_value=vpad)), ('Isolation', Mock(return_value=iso)),
+                            ('pa_end', Mock()), ('HapticEngine', Mock(return_value=engine)), ('ROOT', pathlib.Path(tmp))]:
+            ctx.enter_context(patch.object(app, name, value))
+        ctx.enter_context(patch.object(runner, '_open_loopback', return_value=(Mock(), src, Mock())))
+        ctx.enter_context(patch.object(runner.q, 'get', side_effect=get))
+        ctx.enter_context(patch.object(app.time, 'monotonic', side_effect=lambda: clock[0]))
+        runner.run()
+        assert not (pathlib.Path(tmp) / 'last-error.txt').exists(), logs
+    # Expect: 1 on startup + 1 when HID reopens at 7 s (112s-100s=12s would be 3-4 times under old 5s loop).
+    assert hid.enable_speaker.call_count == 2, hid.enable_speaker.call_count
+
+
 if __name__ == '__main__':
     test_scene_suppression()
     test_proc_loopback_multi_pid_and_stickiness()
     test_proc_hot_reattach_and_stick_coalescing()
     test_v2328_fixes()
     test_v2329_trigger_fixes()
+    test_v2330_speaker_stability()
     test_button_map()
     test_game_music_gate()
     test_silent_source_releases_audio_triggers()
